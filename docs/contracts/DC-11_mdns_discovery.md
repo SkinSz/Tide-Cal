@@ -1,6 +1,6 @@
 # TIDE DESIGN CONTRACT DC-11
 # mDNS/Bonjour Service Discovery
-Status: DRAFT — pending project owner approval
+Status: APPROVED by project owner (2026-08-25)
 Depends on: Architecture Spec v0.3 §16, §18, §20, §23, §31; frozen decisions
             [06], [08], [09]; DC-05; DC-08
 Unblocks: network-layer implementation (Spec §20 transport flow entry point)

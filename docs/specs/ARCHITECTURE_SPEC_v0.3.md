@@ -26,12 +26,20 @@ Tide must:
 
 Initial platform:
 
-1. Windows desktop
+1. Linux desktop
 
 Future platforms:
 
-2. Android
-3. Linux
+2. Windows
+3. Android
+
+[AMENDMENT 2026-08-25, authorized by project owner: the original v0.3 text
+named Windows as initial platform. The owner explicitly reopened this
+frozen decision and reordered it: Linux is now the FIRST target platform
+(the development machine runs Linux), with Windows and Android following.
+This amendment changes ONLY platform ordering; all other frozen decisions
+remain in force. Tauri 2's cross-platform nature makes this a scheduling
+change, not an architectural one.]
 
 The architecture must avoid unnecessary platform lock-in.
 
@@ -959,7 +967,9 @@ The following decisions are FROZEN:
 
 [06] Native/platform-specific functionality is isolated behind interfaces.
 
-[07] Windows is the initial target platform.
+[07] Linux is the first target platform (owner amendment 2026-08-25;
+     originally Windows — see §1 amendment note). Windows follows,
+     then Android.
 
 [08] mDNS/Bonjour is the primary local discovery mechanism.
 

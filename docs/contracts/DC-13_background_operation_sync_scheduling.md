@@ -1,6 +1,6 @@
 # TIDE DESIGN CONTRACT DC-13
 # Background Operation and Synchronization Scheduling
-Status: DRAFT (pending project owner approval)
+Status: APPROVED by project owner (2026-08-25)
 Depends on: Architecture Spec v0.3 §4, §22, §30 (#13, #14), §31;
             DC-05; DC-07; DC-08; DC-09
 Unblocks: Windows implementation of the background/tray component,
@@ -14,7 +14,10 @@ Resolves: deferred decisions #13 from Spec §30
 ==================================================
 
 Decides the MINIMUM set of binding facts needed to implement the
-background component and the sync scheduler on Windows:
+background component and the sync scheduler on LINUX (first target
+platform per Spec §1 owner amendment 2026-08-25; originally written for
+Windows — all decisions below are platform-portable via Tauri 2, with
+Linux-specific notes where they differ):
 
   - which process model hosts background operation (Spec §4 leaves it
     as an implementation decision; deferred decision #13 requires a

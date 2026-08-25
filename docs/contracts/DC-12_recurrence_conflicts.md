@@ -1,6 +1,6 @@
 # TIDE DESIGN CONTRACT DC-12
 # Recurrence-Specific Conflict Handling
-Status: DRAFT (pending project owner approval)
+Status: APPROVED by project owner (2026-08-25)
 Depends on: Architecture Spec v0.3 §7, §8, §30 (#5), §31 (INVARIANT 9);
             DC-01 §3.1, §6; DC-02 (concurrency); DC-03 §2.1, §6.6;
             DC-07 (series/occurrence_overrides schema)

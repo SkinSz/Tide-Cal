@@ -1,6 +1,6 @@
 # TIDE DESIGN CONTRACT DC-10
 # Trust-Revocation Propagation
-Status: DRAFT — awaiting project owner approval
+Status: APPROVED by project owner (2026-08-25)
 Depends on: Architecture Spec v0.3 §19, §21, §30 (#8), §31; DC-05 §7; DC-06 §2.6;
             DC-08 §3.7, §4
 Unblocks: complete revocation lifecycle (create -> propagate -> enforce);
