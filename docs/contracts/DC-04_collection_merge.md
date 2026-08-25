@@ -1,6 +1,6 @@
 # TIDE DESIGN CONTRACT DC-04
 # Collection Merge Semantics
-Status: DRAFT (pending project owner approval)
+Status: APPROVED by project owner (2026-08-25)
 Depends on: Architecture Spec v0.3 §13, §14, §30, §31; DC-01; DC-02; DC-03
 Unblocks: sync protocol (deferred #11), conflict-resolution UI (deferred #12)
 Resolves: deferred decision #4 from Spec §30
