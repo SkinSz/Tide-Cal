@@ -67,12 +67,22 @@ describe("DC-06 compaction", () => {
       entity_id: "e-c", entity_type: "event", field_path: "title",
       operation: "set", payload: { value: "Dentist" }, hlc_now: () => 1,
     });
-    // incoming concurrent change creates conflict record + participant rows
+    // incoming concurrent change: seed producer history 1..8 so seq 9 applies
+    for (let s = 1; s <= 8; s++) {
+      applyRemoteChange(
+        db,
+        makeChange({
+          device_id: "d-other", local_seq: s, entity_id: `e-seed-${s}`,
+          clock: { "d-other": s }, value: `seed${s}`,
+        }),
+        k,
+      );
+    }
     const incoming = makeChange({
       device_id: "d-other", local_seq: 9, entity_id: "e-c",
       clock: { "d-other": 9 }, value: "Doctor",
     });
-    applyRemoteChange(db, incoming, k);
+    expect(applyRemoteChange(db, incoming, k)).toBe("applied");
 
     // insert conflict + participants (simulating detection output)
     db.prepare(
@@ -97,7 +107,8 @@ describe("DC-06 compaction", () => {
     const ids = new Set(remaining.map((r) => r.change_id));
     expect(ids.has(localRec.change_id)).toBe(true);   // protected
     expect(ids.has(incoming.change_id)).toBe(true);   // protected
-    expect(stats.deletedChanges).toBe(0);
+    // seed records 1..8 are NOT conflict participants -> compactable & swept
+    expect(stats.deletedChanges).toBe(8);
     db.close();
   });
 
