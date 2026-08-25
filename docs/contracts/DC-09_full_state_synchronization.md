@@ -1,6 +1,10 @@
 # TIDE DESIGN CONTRACT DC-09
 # Full-State Synchronization Triggers and Algorithm
-Status: DRAFT (pending project owner approval)
+Status: APPROVED by project owner (2026-08-25), with amendment:
+MAX_INCREMENTAL_BACKLOG default lowered from 10,000 to 1,000 records, and
+per owner decision it is a USER-ADJUSTABLE SETTING: the value is exposed in
+the program settings (bounds below) rather than being a hard-coded constant.
+All other triggers/constants unchanged.
 Depends on: Architecture Spec v0.3 §11, §12, §30 (#7), §31; DC-02 §4; DC-06 §2.5,
 §3.4; DC-07 (transactional apply); DC-08 §3.6, §5, §6.3
 Unblocks: GUARANTEED_FULL_RESYNC(P) evaluation (DC-06 §2.5); recovery from
@@ -55,7 +59,18 @@ failed_round       One CHANGES_REQUEST -> CHANGES_BATCH cycle in which the
                    range the sender cannot serve because lo < retained_lo(D)
                    for some producer D (DC-08 §3.3 gap reporting).
 
-MAX_INCREMENTAL_BACKLOG   = 10,000 records (constant; see TR-3).
+MAX_INCREMENTAL_BACKLOG   = 1,000 records by DEFAULT (owner-amended
+                          2026-08-25; was 10,000). This is a
+                          USER-ADJUSTABLE SETTING exposed in program
+                          settings. Bounds: minimum 100, maximum 100,000;
+                          values outside these bounds are clamped/rejected.
+                          The setting is local to each device (no need for
+                          mesh agreement — it only decides when THIS device
+                          offers full state). Default chosen so a typical
+                          personal calendar switches to snapshot transfer
+                          early; full snapshots are small for calendar-
+                          scale data, so the lower threshold carries no
+                          practical cost.
 
 GAP_ROUND_LIMIT    = 2 consecutive failed rounds (constant; see TR-1).
 
@@ -133,7 +148,8 @@ ranges = everything retained), and it inherits tombstones carried in normal
 batches, preserving INVARIANT 8 the ordinary way (DC-06 §2.4).
 
 EXCEPTION — bounded work: if the estimated missing change count exceeds
-MAX_INCREMENTAL_BACKLOG = 10,000 records, the established side offers full
+MAX_INCREMENTAL_BACKLOG (default 1,000; user-adjustable setting, see
+section 2), the established side offers full
 state instead. Estimation procedure computeIncrementalCost():
 
     function computeIncrementalCost(peer_clock):      // integer, conservative
@@ -468,9 +484,13 @@ TR-2  TRIGGER B ALWAYS WORKS: a user resync command emits an offer to every
       results in no offer while a peer is connected.
 
 TR-3  BACKLOG THRESHOLD: first-sync behavior flips to full-state offer
-      exactly when computeIncrementalCost() > 10,000 and stays incremental
-      at <= 10,000; boundary values tested (10,000 / 10,001). Estimate is
-      deterministic: same tables + peer_clock => same integer.
+      exactly when computeIncrementalCost() exceeds the configured
+      MAX_INCREMENTAL_BACKLOG (default 1,000) and stays incremental at
+      or below it; boundary values tested (e.g. default: 1,000 / 1,001).
+      The user-adjustable setting is honored within bounds [100, 100,000]
+      and clamped/rejected outside them; with the setting at its minimum,
+      the flip occurs at >100. Estimate is deterministic: same tables +
+      peer_clock + setting => same integer.
 
 TR-4  ROUND-TRIP FIDELITY: construct a snapshot from a source DB; apply it
       to an empty receiver; the receiver's semantic state (live entities,
