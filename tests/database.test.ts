@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
-import { openDatabase, createLocalChange, applyRemoteChange } from "../src/persistence/database.ts";
+import { openDatabase, createLocalChange, applyRemoteChange, quarantineRecord, countQuarantined } from "../src/persistence/database.ts";
 import { SCHEMA_VERSION } from "../src/persistence/schema.ts";
 import { makeChange } from "./change_record.test.ts";
 import { emptyKnowledge } from "../src/sync/knowledge_state.ts";
@@ -175,6 +175,68 @@ describe("DC-07 §7 T2 remote apply", () => {
     expect(out).toBe("duplicate");
     expect((db.prepare("SELECT COUNT(*) c FROM changes").get() as { c: number }).c).toBe(before);
     expect((db.prepare("SELECT max_seq m FROM device_clock WHERE peer_device_id='d-q'").get() as { m: number }).m).toBe(42);
+    db.close();
+  });
+});
+
+describe("DC-04 §4.3 / DC-08 §5 Stage 2 durable quarantine (H-3)", () => {
+  test("TR-10: quarantined record persists across close/reopen", () => {
+    let db = openDatabase({ path });
+    quarantineRecord(db, {
+      reason: "invalid_member_id",
+      senderDeviceId: "d-rogue",
+      rawRecord: { change_id: "d-rogue:9", bogus: true },
+    });
+    db.close();
+
+    // Reopen (schema init must be idempotent; quarantine row survives WAL).
+    db = openDatabase({ path });
+    expect(countQuarantined(db)).toBe(1);
+    const row = db
+      .prepare<[], { quarantine_reason: string; sender_device_id: string }>(
+        "SELECT quarantine_reason, sender_device_id FROM quarantine",
+      )
+      .get();
+    expect(row?.quarantine_reason).toBe("invalid_member_id");
+    expect(row?.sender_device_id).toBe("d-rogue");
+    db.close();
+  });
+
+  test("countQuarantined filters by reason (DC-04 §4.3c countable surface)", () => {
+    const db = openDatabase({ path });
+    quarantineRecord(db, { reason: "invalid_member_id", senderDeviceId: "d-a", rawRecord: { i: 1 } });
+    quarantineRecord(db, { reason: "invalid_member_id", senderDeviceId: "d-b", rawRecord: { i: 2 } });
+    quarantineRecord(db, { reason: "whole_collection_replacement", senderDeviceId: "d-c", rawRecord: { i: 3 } });
+
+    expect(countQuarantined(db)).toBe(3);
+    expect(countQuarantined(db, "invalid_member_id")).toBe(2);
+    expect(countQuarantined(db, "whole_collection_replacement")).toBe(1);
+    expect(countQuarantined(db, "nonexistent_reason")).toBe(0);
+    db.close();
+  });
+
+  test("raw_record round-trips byte-identical JSON", () => {
+    const db = openDatabase({ path });
+    // Key order + unicode + numbers chosen so any re-serialization drift shows.
+    const record = {
+      zeta: 1,
+      alpha: [1, 2.5, 1e21],
+      text: "üñïçøde ✓ \"quoted\"",
+      nested: { b: null, a: true },
+    };
+    const expected = JSON.stringify(record);
+    quarantineRecord(db, {
+      reason: "member_id_mismatch",
+      senderDeviceId: "d-x",
+      rawRecord: record,
+    });
+
+    const stored = (
+      db.prepare("SELECT raw_record FROM quarantine").get() as { raw_record: string }
+    ).raw_record;
+    expect(stored).toBe(expected); // byte-identical on disk
+    expect(JSON.parse(stored)).toEqual(record); // parses back to same value
+    expect(JSON.stringify(JSON.parse(stored))).toBe(expected); // stable re-encode
     db.close();
   });
 });

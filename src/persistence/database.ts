@@ -256,6 +256,58 @@ export function applyRemoteChange(
   return "applied";
 }
 
+// ---------------------------------------------------------------------------
+// DC-04 §4.3 / DC-08 §5 Stage 2 — DURABLE QUARANTINE
+// ---------------------------------------------------------------------------
+
+export interface QuarantineOptions {
+  /** Machine-readable reason code, e.g. "invalid_member_id" (DC-04 §4.3b). */
+  reason: string;
+  /** Noise peer that sent the record (DC-08 §5 Stage 2). */
+  senderDeviceId: string;
+  /** The offending record, stored JSON.stringify-verbatim for inspection. */
+  rawRecord: unknown;
+}
+
+/**
+ * H-3: persist an invalid incoming record durably before dropping it from
+ * processing. Quarantine is a diagnostic surface (DC-04 §4.3c): countable,
+ * inspectable, never user-resolvable, never blocking the session.
+ */
+export function quarantineRecord(
+  db: Database.Database,
+  opts: QuarantineOptions,
+): void {
+  db.prepare(`
+    INSERT INTO quarantine
+      (quarantine_reason, received_at_hlc, sender_device_id, raw_record)
+    VALUES (?, ?, ?, ?)`).run(
+    opts.reason,
+    Date.now(),
+    opts.senderDeviceId,
+    JSON.stringify(opts.rawRecord),
+  );
+}
+
+/**
+ * Count quarantined records — all, or filtered by reason code so a test can
+ * assert "exactly one record quarantined with reason X" (DC-04 §4.3c).
+ */
+export function countQuarantined(db: Database.Database, reason?: string): number {
+  if (reason === undefined) {
+    const row = db
+      .prepare<[], { c: number }>("SELECT COUNT(*) AS c FROM quarantine")
+      .get();
+    return row?.c ?? 0;
+  }
+  const row = db
+    .prepare<[string], { c: number }>(
+      "SELECT COUNT(*) AS c FROM quarantine WHERE quarantine_reason = ?",
+    )
+    .get(reason);
+  return row?.c ?? 0;
+}
+
 function getStoredMax(db: Database.Database, deviceId: string): number {
   const row = db
     .prepare<[string], { max_seq: number }>(
