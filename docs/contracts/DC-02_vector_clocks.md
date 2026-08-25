@@ -1,6 +1,6 @@
 # TIDE DESIGN CONTRACT DC-02
 # Vector Clocks: Comparison, Merge, Advancement
-Status: DRAFT (pending project owner approval)
+Status: APPROVED by project owner (2026-08-25)
 Depends on: Architecture Spec v0.3 §9, §10, §13, §14, §31; DC-01
 Unblocks: DC-03 (scalar conflict detection), DC-04 (collection merge),
           missing-change detection in the sync protocol
