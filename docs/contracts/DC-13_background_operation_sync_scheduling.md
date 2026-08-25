@@ -1,6 +1,6 @@
 # TIDE DESIGN CONTRACT DC-13
 # Background Operation and Synchronization Scheduling
-Status: PROPOSED (pending owner approval)
+Status: DRAFT (pending project owner approval)
 Depends on: Architecture Spec v0.3 §4, §22, §30 (#13, #14), §31;
             DC-05; DC-07; DC-08; DC-09
 Unblocks: Windows implementation of the background/tray component,
