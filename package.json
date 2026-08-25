@@ -8,8 +8,12 @@
     "test": "vitest run"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^24.3.1",
     "typescript": "^5.9.2",
     "vitest": "^3.2.4"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3"
   }
 }
