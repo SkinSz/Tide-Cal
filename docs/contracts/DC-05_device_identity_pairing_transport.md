@@ -1,6 +1,6 @@
 # TIDE DESIGN CONTRACT DC-05
 # Device Identity, Pairing Ceremony, and Secure Transport
-Status: DRAFT (pending project owner approval)
+Status: APPROVED by project owner (2026-08-25)
 Depends on: Architecture Spec v0.3 §15–§20, §25, §29, §30, §31; DC-01 §7;
             DC-02 §4
 Unblocks: sync protocol implementation, network/transport layer,
