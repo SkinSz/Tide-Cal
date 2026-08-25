@@ -1,6 +1,6 @@
 # TIDE DESIGN CONTRACT DC-14
 # Conflict Resolution UI — Semantics and Flows
-Status: DRAFT for project owner approval (2026-08-25)
+Status: DRAFT (pending project owner approval)
 Depends on: Architecture Spec v0.3 §13, §30 (#12), §31; DC-03; DC-04; DC-06;
             DC-07; DC-08
 Unblocks: implementation of all conflict UI surfaces
