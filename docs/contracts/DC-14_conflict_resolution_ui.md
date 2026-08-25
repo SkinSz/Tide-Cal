@@ -1,8 +1,13 @@
 # TIDE DESIGN CONTRACT DC-14
 # Conflict Resolution UI — Semantics and Flows
 Status: APPROVED by project owner (2026-08-25)
+
+OWNER AMENDMENTS (2026-08-25):
+- A dedicated "Conflicts" GUI button/entry point opening the conflict
+  list view (§5.2), with sequential one-after-another resolution, is
+  NORMATIVE (not optional).
 Depends on: Architecture Spec v0.3 §13, §30 (#12), §31; DC-03; DC-04; DC-06;
-            DC-07; DC-08
+             DC-07; DC-08
 Unblocks: implementation of all conflict UI surfaces
 Resolves: deferred decision #12 from Spec §30
 

@@ -5,6 +5,11 @@ MAX_INCREMENTAL_BACKLOG default lowered from 10,000 to 1,000 records, and
 per owner decision it is a USER-ADJUSTABLE SETTING: the value is exposed in
 the program settings (bounds below) rather than being a hard-coded constant.
 All other triggers/constants unchanged.
+
+OWNER AMENDMENT 2 (2026-08-25): DC-13 approved with tuned defaults —
+debounce 10s (was 5), sweep interval 10 min (was 15). Rationale: keep data
+fresher without meaningful network cost; see DC-13 §3.5 for the updated
+normative values and bounds.
 Depends on: Architecture Spec v0.3 §11, §12, §30 (#7), §31; DC-02 §4; DC-06 §2.5,
 §3.4; DC-07 (transactional apply); DC-08 §3.6, §5, §6.3
 Unblocks: GUARANTEED_FULL_RESYNC(P) evaluation (DC-06 §2.5); recovery from

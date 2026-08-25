@@ -1,9 +1,14 @@
 # TIDE DESIGN CONTRACT DC-13
 # Background Operation and Synchronization Scheduling
 Status: APPROVED by project owner (2026-08-25)
+
+OWNER AMENDMENTS (2026-08-25):
+- Defaults tuned: sync.debounce_seconds 10 (was 5), sync.sweep_minutes
+  10 (was 15) — fresher data without meaningful network load; see §3.1
+  and §3.5.
 Depends on: Architecture Spec v0.3 §4, §22, §30 (#13, #14), §31;
-            DC-05; DC-07; DC-08; DC-09
-Unblocks: Windows implementation of the background/tray component,
+             DC-05; DC-07; DC-08; DC-09
+Unblocks: Linux implementation of the background/tray component,
           sync scheduler implementation
 Resolves: deferred decisions #13 from Spec §30
           (exact Windows background-process architecture) and #14
@@ -143,14 +148,20 @@ next successful session (INVARIANT 14 via DC-08).
 
      Local change       DEBOUNCE: start/restart a timer on every
      (any applied       local write; fire once after the debounce
-     local commit)      interval, default 5 seconds after the LAST
-                        change. On fire, attempt push to all
+     local commit)      interval, default 10 seconds after the LAST
+                        change (owner-tuned 2026-08-25; was 5 — slightly
+                        stronger batching while still feeling instant).
+                        On fire, attempt push to all
                         known-available trusted peers. DC-08 batch
                         limits apply unchanged regardless of how
                         many edits coalesced.
 
-     Periodic           Every 15 minutes while background operation
-     background sweep   is active: discovery sweep + sync attempt
+     Periodic           Every 10 minutes while background operation
+     background sweep   is active (owner-tuned 2026-08-25; was 15 —
+                        fresher data at negligible cost: an idle-mesh
+                        periodic exchange is two small HELLOs plus any
+                        piggyback records, typically under ~2 KB per
+                        round): discovery sweep + sync attempt
                         with discovered trusted peers (including
                         previously unknown ones — this is how a
                         peer returning from absence gets found).
@@ -192,8 +203,8 @@ next successful session (INVARIANT 14 via DC-08).
      amendment (settings persist in local configuration, take effect
      live without restart, and revert to defaults when unset):
 
-       sync.debounce_seconds   default 5    bounds [1 .. 300]
-       sync.sweep_minutes      default 15   bounds [5 .. 1440]
+       sync.debounce_seconds   default 10   bounds [1 .. 300]
+       sync.sweep_minutes      default 10   bounds [5 .. 1440]
        sync.max_concurrent_sessions  default 3  bounds [1 .. 10]
 
      Backoff parameters (section 5) are NOT settings; they are fixed

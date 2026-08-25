@@ -1,6 +1,14 @@
 # TIDE DESIGN CONTRACT DC-11
 # mDNS/Bonjour Service Discovery
 Status: APPROVED by project owner (2026-08-25)
+
+OWNER Q&A AMENDMENT (2026-08-25): pairing of two brand-new clients does
+NOT depend on discovery — the QR ceremony (DC-05 §5) IS the initial
+identification channel. Implementation note: for camera-less platforms
+(desktop-to-desktop), the same QR payload MUST also be expressible as a
+copy/paste text block or short alphanumeric code; semantics identical,
+transport different. Discovery remains a convenience for already-paired
+devices only.
 Depends on: Architecture Spec v0.3 §16, §18, §20, §23, §31; frozen decisions
             [06], [08], [09]; DC-05; DC-08
 Unblocks: network-layer implementation (Spec §20 transport flow entry point)
