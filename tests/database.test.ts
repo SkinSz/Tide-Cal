@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
-import { openDatabase, createLocalChange, applyRemoteChange, quarantineRecord, countQuarantined } from "../src/persistence/database.ts";
+import { openDatabase, createLocalChange, applyRemoteChange, loadKnowledgeFromDb, quarantineRecord, countQuarantined } from "../src/persistence/database.ts";
 import { SCHEMA_VERSION } from "../src/persistence/schema.ts";
 import { makeChange } from "./change_record.test.ts";
 import { emptyKnowledge } from "../src/sync/knowledge_state.ts";
@@ -240,3 +240,140 @@ describe("DC-04 §4.3 / DC-08 §5 Stage 2 durable quarantine (H-3)", () => {
     db.close();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Review 2 criticals C1/C2/C3 — persistence durability & atomicity
+// ---------------------------------------------------------------------------
+
+describe("C1 restart durability (loadKnowledgeFromDb + idempotent redelivery)", () => {
+  test("rebuilds appliedUpto from DB; redelivery after reopen is duplicate", () => {
+    let db = openDatabase({ path });
+    const k = emptyKnowledge();
+    for (let seq = 1; seq <= 3; seq++) {
+      expect(
+        applyRemoteChange(db, makeChange({ device_id: "d-p", local_seq: seq }), k),
+      ).toBe("applied");
+    }
+    db.close();
+
+    // Simulate process restart: reopen and rebuild knowledge purely from disk.
+    db = openDatabase({ path });
+    const k2 = loadKnowledgeFromDb(db);
+    expect(k2.appliedUpto["d-p"]).toBe(3);
+
+    // Redelivering an already-applied record must be a clean no-op duplicate,
+    // not a UNIQUE-constraint crash (DC-02 §7.1 / DC-03 TR-8).
+    const before = (db.prepare("SELECT COUNT(*) c FROM changes").get() as { c: number }).c;
+    const out = applyRemoteChange(db, makeChange({ device_id: "d-p", local_seq: 2 }), k2);
+    expect(out).toBe("duplicate");
+    expect((db.prepare("SELECT COUNT(*) c FROM changes").get() as { c: number }).c).toBe(before);
+    db.close();
+  });
+});
+
+describe("C1 pending survives restart", () => {
+  test("buffered gap fills correctly from DB-rebuilt state after reopen", () => {
+    let db = openDatabase({ path });
+    const k = emptyKnowledge();
+    expect(applyRemoteChange(db, makeChange({ device_id: "d-p", local_seq: 1 }), k)).toBe("applied");
+    expect(applyRemoteChange(db, makeChange({ device_id: "d-p", local_seq: 2 }), k)).toBe("applied");
+    expect(applyRemoteChange(db, makeChange({ device_id: "d-p", local_seq: 4 }), k)).toBe("buffered");
+    expect((db.prepare("SELECT COUNT(*) c FROM pending_changes").get() as { c: number }).c).toBe(1);
+    db.close();
+
+    // Restart: pending_changes table is the only memory of seq 4.
+    db = openDatabase({ path });
+    const k2 = loadKnowledgeFromDb(db);
+    expect(k2.appliedUpto["d-p"]).toBe(2);
+    expect(k2.pending.get("d-p")?.has(4)).toBe(true);
+
+    // Deliver the missing seq 3 -> drains 3 AND the buffered 4.
+    const out = applyRemoteChange(db, makeChange({ device_id: "d-p", local_seq: 3 }), k2);
+    expect(out).toBe("applied");
+    const rows = db
+      .prepare<[], { local_seq: number }>(
+        "SELECT local_seq FROM changes WHERE device_id = 'd-p' ORDER BY local_seq",
+      )
+      .all()
+      .map((r) => r.local_seq);
+    expect(rows).toEqual([1, 2, 3, 4]);
+    expect((db.prepare("SELECT COUNT(*) c FROM pending_changes").get() as { c: number }).c).toBe(0);
+    db.close();
+  });
+});
+
+describe("C2 T2 atomicity on mutate failure", () => {
+  test("throwing mutate leaves no partial state; retry applies exactly once", () => {
+    const db = openDatabase({ path });
+    const k = emptyKnowledge();
+    let attempts = 0;
+    const failingMutate = () => {
+      attempts += 1;
+      throw new Error("mutate boom");
+    };
+
+    const rec = makeChange({ device_id: "d-p", local_seq: 1 });
+    expect(() => applyRemoteChange(db, rec, k, failingMutate as never)).toThrowError(/mutate boom/);
+    expect(attempts).toBe(1);
+
+    // Nothing may have leaked into the DB mid-failure...
+    expect((db.prepare("SELECT COUNT(*) c FROM changes").get() as { c: number }).c).toBe(0);
+    expect((db.prepare("SELECT COUNT(*) c FROM pending_changes").get() as { c: number }).c).toBe(0);
+    // ...and caller-visible knowledge stays at pre-call values (no phantom advance).
+    expect(k.appliedUpto["d-p"] ?? 0).toBeLessThan(1);
+
+    // Retry with a working mutate: must classify "applied" (not silent-loss
+    // "duplicate") and produce exactly ONE row.
+    const out = applyRemoteChange(db, makeChange(rec), k);
+    expect(out).toBe("applied");
+    expect((db.prepare("SELECT COUNT(*) c FROM changes").get() as { c: number }).c).toBe(1);
+    expect(k.appliedUpto["d-p"]).toBe(1);
+    db.close();
+  });
+});
+
+describe("C3 sequence allocation survives compaction of own rows", () => {
+  test("seq never reused after manual delete; device_clock never regresses", () => {
+    const db = openDatabase({ path });
+    const input = () => ({
+      entity_id: "e-1",
+      entity_type: "event" as const,
+      field_path: "title",
+      operation: "set" as const,
+      payload: { value: "v" },
+      hlc_now: () => Date.now(),
+    });
+    createLocalChange(db, "d-self", input()); // seq 1
+    createLocalChange(db, "d-self", input()); // seq 2
+
+    // Simulate post-compaction removal of own old rows while device_clock row
+    // remains at 2.
+    db.prepare("DELETE FROM changes WHERE device_id = 'd-self' AND local_seq <= 2").run();
+    expect((db.prepare("SELECT MAX(local_seq) m FROM changes WHERE device_id='d-self'").get() as { m: number | null }).m).toBeNull();
+
+    const r3 = createLocalChange(db, "d-self", input());
+    expect(r3.local_seq).toBe(3); // NOT 1 — clock, not table max, is authoritative floor
+    expect(r3.causality_clock["d-self"]).toBe(3);
+    expect(r3.change_id).toBe("d-self:3");
+
+    const storedClock = (
+      db.prepare("SELECT max_seq m FROM device_clock WHERE peer_device_id = 'd-self'").get() as { m: number }
+    ).m;
+    expect(storedClock).toBeGreaterThanOrEqual(3);
+    db.close();
+  });
+
+  test("device_clock upserts are element-wise MAX (stale writer cannot regress)", () => {
+    const db = openDatabase({ path });
+    db.prepare("INSERT INTO device_clock (peer_device_id, max_seq) VALUES ('d-p', 9)").run();
+    // A stale peer advertises causality with d-p:4 — merge must keep 9.
+    applyRemoteChange(
+      db,
+      makeChange({ device_id: "d-q", local_seq: 1, clock: { "d-q": 1, "d-p": 4 } }),
+      emptyKnowledge(),
+    );
+    expect((db.prepare("SELECT max_seq m FROM device_clock WHERE peer_device_id='d-p'").get() as { m: number }).m).toBe(9);
+    db.close();
+  });
+});
+

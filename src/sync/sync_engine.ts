@@ -71,6 +71,33 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
   const holder: KnowledgeHolder = { knowledge };
   const maxBatch = deps.maxBatchRecords ?? 256;
 
+  /**
+   * H-4: one cached pending receive per session/transport. Calling this
+   * never starts a second overlapping transport.receive() while one is
+   * already in flight; when it resolves (or rejects), the slot clears so
+   * the next call starts a fresh receive.
+   */
+  function nextMessage(
+    transport: SyncTransport,
+  ): () => Promise<SyncMessage | null> {
+    let pending: Promise<SyncMessage | null> | null = null;
+    return (): Promise<SyncMessage | null> => {
+      if (pending === null) {
+        pending = transport.receive().then(
+          (msg) => {
+            pending = null;
+            return msg;
+          },
+          (err) => {
+            pending = null;
+            throw err;
+          },
+        );
+      }
+      return pending;
+    };
+  }
+
   function getDeviceClockDb(): VC {
     const rows = deps.db
       .prepare("SELECT peer_device_id AS d, max_seq AS s FROM device_clock")
@@ -97,16 +124,25 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     await transport.send(hello);
     stats.sent++;
 
-    const peerHello = await expectType(transport, "HELLO");
+    const peerHello = await expectType(nextMessage(transport), "HELLO");
     advancePeerKnowledge(peerHello.device_clock);
 
     // --- pull what we need ---
     let ranges = neededRanges(holder.knowledge, peerHello.device_clock);
     let gapRetries = 0;
-    while (ranges.length > 0 && gapRetries < 2) {
+    // M-5: absolute cap on total pull iterations. A peer that keeps changing
+    // its advertised ranges must not extend the loop forever; gapRetries
+    // still bounds consecutive no-progress rounds on top of this.
+    let pullIterations = 0;
+    while (
+      ranges.length > 0 &&
+      gapRetries < 2 &&
+      pullIterations < 10
+    ) {
+      pullIterations++;
       await transport.send({ v: 1, type: "CHANGES_REQUEST", ranges });
       stats.sent++;
-      const batch = await expectBatchOrPeerRequest(transport);
+      const batch = await expectBatchOrPeerRequest(nextMessage(transport), transport);
       if (batch === null) break; // peer sent a request instead; serve loop follows
       applyBatch(batch.changes, stats);
       const before = JSON.stringify(ranges);
@@ -121,7 +157,7 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     }
 
     // --- serve the peer's pull ---
-    await serveRequests(transport, peerHello.device_clock, stats);
+    await serveRequests(nextMessage(transport), transport, peerHello.device_clock, stats);
 
     // --- ACK our applied frontier ---
     const ack: SyncMessage = {
@@ -136,6 +172,7 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
   }
 
   async function serveRequests(
+    nextMessage: (t: SyncTransport) => Promise<SyncMessage | null>,
     transport: SyncTransport,
     peerClock: VC,
     stats: SessionStats,
@@ -144,7 +181,7 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
   ): Promise<void> {
     let quiet = 0;
     while (quiet < quietTicks) {
-      const msg = await receiveWithTimeout(transport, 5);
+      const msg = await receiveWithTimeout(() => nextMessage(transport), 5);
       if (msg === null) {
         quiet++;
         continue;
@@ -177,14 +214,15 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
 
   /** Expect a CHANGES_BATCH; tolerate the interleaved peer request. */
   async function expectBatchOrPeerRequest(
+    nextMessage: () => Promise<SyncMessage | null>,
     transport: SyncTransport,
   ): Promise<Extract<SyncMessage, { type: "CHANGES_BATCH" }> | null> {
-    const msg = await transport.receive();
+    const msg = await nextMessage();
     if (msg !== null && msg.type !== "CHANGES_BATCH") {
       // Interleaved peer traffic (e.g., their CHANGES_REQUEST): stash and
       // keep waiting for our batch.
       stashed.push(msg);
-      return expectBatch(transport);
+      return expectBatch(nextMessage, transport);
     }
     if (msg === null) return null;
     return msg;
@@ -197,10 +235,11 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
   }
 
   async function expectBatch(
+    nextMessage: () => Promise<SyncMessage | null>,
     transport: SyncTransport,
   ): Promise<Extract<SyncMessage, { type: "CHANGES_BATCH" }> | null> {
     for (;;) {
-      const msg = stashed.length > 0 ? drainStashed() : await transport.receive();
+      const msg = stashed.length > 0 ? drainStashed() : await nextMessage();
       if (msg === null) return null;
       if (msg.type === "CHANGES_BATCH" && msg.v === 1) return msg;
       // any other message type while pulling: handle inline
@@ -226,16 +265,24 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     return out;
   }
 
+  /**
+   * H-4: poll the cached pending receive with a timeout race, but when the
+   * timeout wins the pending promise is KEPT — the next call awaits the very
+   * same promise, so a message that arrives late is delivered on a later
+   * poll instead of being swallowed by Promise.race against receive().
+   */
   async function receiveWithTimeout(
-    transport: SyncTransport,
+    nextMessage: () => Promise<SyncMessage | null>,
     maxPolls: number,
   ): Promise<SyncMessage | null> {
     for (let i = 0; i < maxPolls; i++) {
       const msg = await Promise.race([
-        transport.receive(),
-        new Promise<null>((r) => setTimeout(() => r(null), 2)),
+        nextMessage(),
+        new Promise<"timeout">((resolve) =>
+          setTimeout(() => resolve("timeout"), 2),
+        ),
       ]);
-      if (msg !== null) return msg;
+      if (msg !== "timeout") return msg;
     }
     return null;
   }
@@ -312,10 +359,10 @@ function sameAs(a: { device_id: string }, b: { device_id: string }): boolean {
 }
 
 async function expectType<T extends SyncMessage["type"]>(
-  transport: SyncTransport,
+  nextMessage: () => Promise<SyncMessage | null>,
   type: T,
 ): Promise<Extract<SyncMessage, { type: T }>> {
-  const msg = await transport.receive();
+  const msg = await nextMessage();
   if (msg === null || msg.type !== type || (msg as { v?: number }).v !== 1) {
     throw new Error(`protocol violation: expected ${type}, got ${msg?.type ?? "closed"}`);
   }

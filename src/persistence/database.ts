@@ -9,8 +9,8 @@ import {
 } from "../sync/change_record.ts";
 import {
   classifyArrival,
-  bufferPending,
   advanceApplied,
+  emptyKnowledge,
   type KnowledgeState,
 } from "../sync/knowledge_state.ts";
 
@@ -80,24 +80,6 @@ export function createLocalChange(
   input: LocalChangeInput,
   mutate?: (db: Database.Database, record: ChangeRecord) => void,
 ): ChangeRecord {
-  const nextSeq = getNextLocalSeq(db, selfDeviceId) + 1;
-  const clock = getDeviceClock(db);
-  clock[selfDeviceId] = nextSeq;
-
-  const record: ChangeRecord = {
-    change_id: changeId(selfDeviceId, nextSeq),
-    device_id: selfDeviceId,
-    local_seq: nextSeq,
-    entity_id: input.entity_id,
-    entity_type: input.entity_type,
-    field_path: input.field_path,
-    operation: input.operation,
-    payload: input.payload as ChangeRecord["payload"],
-    hlc_timestamp: input.hlc_now(),
-    causality_clock: clock,
-    schema_version: 1,
-  };
-
   const insertChange = db.prepare(`
     INSERT INTO changes (change_id, device_id, local_seq, entity_id,
       entity_type, field_path, operation, payload, hlc_timestamp,
@@ -106,11 +88,37 @@ export function createLocalChange(
       @field_path, @operation, @payload, @hlc_timestamp, @causality_clock,
       @schema_version)`);
 
+  // C3 (Review 2): element-wise MAX on conflict so a stale/compacted view
+  // can never lower another writer's clock entry.
   const upsertClock = db.prepare(`
     INSERT INTO device_clock (peer_device_id, max_seq) VALUES (@d, @s)
-    ON CONFLICT(peer_device_id) DO UPDATE SET max_seq = excluded.max_seq`);
+    ON CONFLICT(peer_device_id) DO UPDATE SET
+      max_seq = MAX(max_seq, excluded.max_seq)`);
 
+  let record!: ChangeRecord;
   const tx = db.transaction(() => {
+    // C3 (Review 2): allocate from BOTH sources of truth. MAX(changes.local_seq)
+    // alone regresses after compaction deletes own old rows; device_clock alone
+    // could drift if rows exist above it. Take the max of both.
+    const storedClock = getDeviceClock(db);
+    const nextSeq =
+      Math.max(storedClock[selfDeviceId] ?? 0, getNextLocalSeq(db, selfDeviceId)) + 1;
+    const clock: VectorClock = { ...storedClock, [selfDeviceId]: nextSeq };
+
+    record = {
+      change_id: changeId(selfDeviceId, nextSeq),
+      device_id: selfDeviceId,
+      local_seq: nextSeq,
+      entity_id: input.entity_id,
+      entity_type: input.entity_type,
+      field_path: input.field_path,
+      operation: input.operation,
+      payload: input.payload as ChangeRecord["payload"],
+      hlc_timestamp: input.hlc_now(),
+      causality_clock: clock,
+      schema_version: 1,
+    };
+
     mutate?.(db, record);
     insertChange.run(serializeChange(record));
     upsertClock.run({ d: selfDeviceId, s: nextSeq });
@@ -166,8 +174,6 @@ export function applyRemoteChange(
   knowledge: KnowledgeState,
   mutate?: (db: Database.Database, record: ChangeRecord) => void,
 ): ApplyOutcome {
-  const cls = classifyArrival(knowledge, incoming.device_id, incoming.local_seq);
-
   const insertPending = db.prepare(`
     INSERT INTO pending_changes (device_id, local_seq, record_payload, received_at_hlc)
     VALUES (?, ?, ?, ?)`);
@@ -180,9 +186,12 @@ export function applyRemoteChange(
       @field_path, @operation, @payload, @hlc_timestamp, @causality_clock,
       @schema_version)`);
 
+  // C1 (Review 2): applied_upto is monotone per producer; still use MAX so a
+  // stale caller can never lower the stored frontier.
   const setAppliedUpto = db.prepare(`
     INSERT INTO applied_upto (producer_device_id, applied_through) VALUES (?, ?)
-    ON CONFLICT(producer_device_id) DO UPDATE SET applied_through = excluded.applied_through`);
+    ON CONFLICT(producer_device_id) DO UPDATE SET
+      applied_through = MAX(applied_through, excluded.applied_through)`);
 
   const deletePending = db.prepare(
     "DELETE FROM pending_changes WHERE device_id = ? AND local_seq = ?",
@@ -195,65 +204,135 @@ export function applyRemoteChange(
     "SELECT device_id, local_seq, record_payload FROM pending_changes WHERE device_id = ?",
   );
 
+  // C3 (Review 2): element-wise MAX upsert — clock merge is a join, never an
+  // overwrite.
   const upsertClockStmt = db.prepare(`
     INSERT INTO device_clock (peer_device_id, max_seq) VALUES (?, ?)
-    ON CONFLICT(peer_device_id) DO UPDATE SET max_seq = excluded.max_seq`);
+    ON CONFLICT(peer_device_id) DO UPDATE SET
+      max_seq = MAX(max_seq, excluded.max_seq)`);
 
   function mergeClocks(clock: VectorClock): void {
     for (const [d, s] of Object.entries(clock)) {
-      upsertClockStmt.run(d, Math.max(s, getStoredMax(db, d)));
+      upsertClockStmt.run(d, s);
     }
   }
 
-  if (cls === "duplicate") {
-    db.transaction(() => mergeClocks(incoming.causality_clock))();
-    return "duplicate";
-  }
-
-  if (cls === "buffer") {
-    db.transaction(() => {
-      insertPending.run(
+  let dbKnowledge!: KnowledgeState;
+  try {
+    const outcome = db.transaction(() => {
+      // C2/C1 (Review 2): classification is derived from DB state INSIDE the
+      // transaction (DB is source of truth). A stale in-memory knowledge
+      // object can no longer misclassify (e.g. after restart).
+      dbKnowledge = loadKnowledgeFromDb(db);
+      const cls = classifyArrival(
+        dbKnowledge,
         incoming.device_id,
         incoming.local_seq,
-        JSON.stringify(incoming),
-        Date.now(),
+      );
+
+      if (cls === "duplicate") {
+        mergeClocks(incoming.causality_clock);
+        return "duplicate" as const;
+      }
+
+      if (cls === "buffer") {
+        insertPending.run(
+          incoming.device_id,
+          incoming.local_seq,
+          JSON.stringify(incoming),
+          Date.now(),
+        );
+        mergeClocks(incoming.causality_clock);
+        return "buffered" as const;
+      }
+
+      // apply + drain consecutive pending in order
+      const drained = advanceApplied(
+        dbKnowledge,
+        incoming.device_id,
+        incoming.local_seq,
+      );
+      for (const step of drained) {
+        let record: ChangeRecord;
+        if (
+          step.device_id === incoming.device_id &&
+          step.local_seq === incoming.local_seq
+        ) {
+          record = incoming;
+        } else {
+          const rows = loadAllPending.all(step.device_id);
+          const match = rows.find((r) => r.local_seq === step.local_seq);
+          if (!match) {
+            throw new Error(
+              `pending payload missing for ${step.device_id}:${step.local_seq}`,
+            );
+          }
+          record = JSON.parse(match.record_payload) as ChangeRecord;
+        }
+        mutate?.(db, record);
+        insertChange.run(serializeChange(record));
+        deletePending.run(step.device_id, step.local_seq);
+      }
+      setAppliedUpto.run(
+        incoming.device_id,
+        drained[drained.length - 1]!.local_seq,
       );
       mergeClocks(incoming.causality_clock);
+      return "applied" as const;
     })();
-    bufferPending(knowledge, incoming.device_id, incoming.local_seq);
-    return "buffered";
-  }
 
-  // apply + drain consecutive pending in order
-  const drained = advanceApplied(knowledge, incoming.device_id, incoming.local_seq);
-
-  db.transaction(() => {
-    for (const step of drained) {
-      let record: ChangeRecord;
-      if (
-        step.device_id === incoming.device_id &&
-        step.local_seq === incoming.local_seq
-      ) {
-        record = incoming;
-      } else {
-        const rows = loadAllPending.all(step.device_id);
-        const match = rows.find((r) => r.local_seq === step.local_seq);
-        if (!match) {
-          throw new Error(
-            `pending payload missing for ${step.device_id}:${step.local_seq}`,
-          );
-        }
-        record = JSON.parse(match.record_payload) as ChangeRecord;
-      }
-      mutate?.(db, record);
-      insertChange.run(serializeChange(record));
-      deletePending.run(step.device_id, step.local_seq);
+    // C2 (Review 2): transaction committed -> now mirror the DB-derived state
+    // onto the caller's object. If anything above threw, we never get here and
+    // the caller-visible knowledge stays at pre-call values.
+    knowledge.appliedUpto = dbKnowledge.appliedUpto;
+    knowledge.pending = dbKnowledge.pending;
+    return outcome;
+  } catch (err) {
+    // C1 safety net (DC-02 §7.1 / DC-03 TR-8): a UNIQUE violation from the
+    // changes/pending_changes inserts means this is a redelivery our in-memory
+    // view missed — idempotently reclassify as duplicate instead of crashing.
+    if (isUniqueViolation(err)) {
+      db.transaction(() => mergeClocks(incoming.causality_clock))();
+      const fresh = loadKnowledgeFromDb(db);
+      knowledge.appliedUpto = fresh.appliedUpto;
+      knowledge.pending = fresh.pending;
+      return "duplicate";
     }
-    setAppliedUpto.run(incoming.device_id, drained[drained.length - 1]!.local_seq);
-    mergeClocks(incoming.causality_clock);
-  })();
+    throw err;
+  }
+}
 
-  return "applied";
+/**
+ * C1 (Review 2): rebuild KnowledgeState from durable tables after restart.
+ * appliedUpto comes from applied_upto; pending from pending_changes.
+ */
+export function loadKnowledgeFromDb(db: Database.Database): KnowledgeState {
+  const k = emptyKnowledge();
+  for (const r of db
+    .prepare<[], { producer_device_id: string; applied_through: number }>(
+      "SELECT producer_device_id, applied_through FROM applied_upto",
+    )
+    .all()) {
+    k.appliedUpto[r.producer_device_id] = r.applied_through;
+  }
+  for (const r of db
+    .prepare<[], { device_id: string; local_seq: number }>(
+      "SELECT device_id, local_seq FROM pending_changes",
+    )
+    .all()) {
+    let set = k.pending.get(r.device_id);
+    if (!set) {
+      set = new Set();
+      k.pending.set(r.device_id, set);
+    }
+    set.add(r.local_seq);
+  }
+  return k;
+}
+
+function isUniqueViolation(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.includes("UNIQUE constraint failed");
 }
 
 // ---------------------------------------------------------------------------
@@ -306,13 +385,4 @@ export function countQuarantined(db: Database.Database, reason?: string): number
     )
     .get(reason);
   return row?.c ?? 0;
-}
-
-function getStoredMax(db: Database.Database, deviceId: string): number {
-  const row = db
-    .prepare<[string], { max_seq: number }>(
-      "SELECT max_seq FROM device_clock WHERE peer_device_id = ?",
-    )
-    .get(deviceId);
-  return row?.max_seq ?? 0;
 }
