@@ -1,6 +1,17 @@
 # TIDE DESIGN CONTRACT DC-07
 # Exact SQLite Schema
-Status: DRAFT — awaiting project owner approval
+Status: APPROVED by project owner (2026-08-25)
+
+OWNER DECISION (2026-08-25), resolves the §12 encryption-at-rest open item:
+The calendar database MUST be encrypted at rest using SQLCipher-style
+AES-256 page-level encryption on all platforms (Windows, Android, Linux).
+The database key is generated locally, held in OS-protected credential
+storage with the same custody rules as the identity private key (DC-05
+§2.3: never synchronized, never backed up, never leaves the device), and
+is provided to SQLCipher at connection open. The accepted performance
+overhead (~5-15% on this workload) is approved by the owner. Threat-model
+note unchanged: this protects the dormant file, not a compromised running
+session (DC-05 §8 N1).
 Depends on: Architecture Spec v0.3 §5, §6, §7, §8, §15, §30, §31;
             DC-01; DC-02; DC-03; DC-04; DC-05; DC-06
 Unblocks: persistence layer implementation, sync protocol (deferred #11),
@@ -621,11 +632,10 @@ TR-11 IDENTITY PRIVACY: static assertion/test that the identity table
 - UI concerns, Tauri command surface exposing
   these tables                                  -> separate contracts /
                                                    implementation tasks
-- Encryption-at-rest: OPEN ITEM, see section 12.
-  Disk encryption availability is platform-dependent (Windows BitLocker,
-  Linux LUKS, Android FBE) and cannot be assumed; whether Tide adds
-  SQLCipher-style at-rest encryption on top must be decided explicitly
-  by the project owner before shipping, not invented here (INVARIANT 13).
+- Encryption-at-rest: RESOLVED by owner decision 2026-08-25 — SQLCipher-
+  style AES-256 page encryption is MANDATORY on all platforms; key custody
+  per DC-05 §2.3. Recorded in the status block above and in section 2.4a
+  below.
 - Query planner tuning beyond the indexes mandated here (profiling-driven,
   additive migrations only).
 - Backup-file format (Spec §25 mechanics) beyond stating the private key
@@ -636,10 +646,11 @@ TR-11 IDENTITY PRIVACY: static assertion/test that the identity table
 ==================================================
 
 - Encryption-at-rest choice (plaintext SQLite relying on platform disk
-  encryption vs SQLCipher vs OS-level DPAPI container) -> PROJECT OWNER
-  decision; recommend deferring until threat-model review, since the
-  guarantee differs per platform (DC-05 §8 N3 already documents the
-  weak-fallback case).
+  encryption vs SQLCipher vs OS-level DPAPI container) -> RESOLVED by
+  owner decision 2026-08-25: SQLCipher-style AES-256 page-level
+  encryption is mandatory on all platforms; DB key custody per DC-05
+  §2.3 (OS keystore, never synced, never backed up). See the owner
+  decision block in the status header.
 - Whether a materialized per-producer min-uncompacted-seq table is
   warranted (section 5 note) -> profiling follow-up, additive migration.
 - Whether attendee records need a distinct entity_type enum value on the
