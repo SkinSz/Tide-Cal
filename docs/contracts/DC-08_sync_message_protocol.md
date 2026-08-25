@@ -1,6 +1,6 @@
 # TIDE DESIGN CONTRACT DC-08
 # Synchronization Message Protocol
-Status: DRAFT (pending project owner approval)
+Status: APPROVED by project owner (2026-08-25)
 Depends on: Architecture Spec v0.3 §20, §21, §22, §23, §24, §30, §31;
             DC-01; DC-02; DC-03; DC-04; DC-05; DC-06; DC-07
 Unblocks: sync engine implementation, revocation propagation (#8),
