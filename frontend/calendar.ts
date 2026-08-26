@@ -177,9 +177,12 @@ function endOfDay(d: Date): Date {
   return c;
 }
 
+let renderSeq = 0;
+
 export async function render(): Promise<void> {
   const root = document.getElementById("calendar-grid");
   if (!root) return;
+  const seq = ++renderSeq;
   root.replaceChildren();
 
   // weekday header
@@ -195,7 +198,7 @@ export async function render(): Promise<void> {
   const rangeEnd = addDays(cells[cells.length - 1]!.date, 1);
   const events = await eventsForRange(rangeStart, rangeEnd);
   // Re-check: async gap may mean the user navigated meanwhile.
-  if ((document.getElementById("cal-label")?.textContent ?? "") !== label()) {
+  if (seq !== renderSeq) {
     return;
   }
 
