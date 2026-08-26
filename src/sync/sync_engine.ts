@@ -24,6 +24,24 @@ import {
   offerSessionKey,
   resolveOfferRace,
 } from "./full_state_triggers.ts";
+// DC-10: revocation propagation rides every sync session as piggyback
+// traffic (§2.2) with per-peer ACK bookkeeping (§2.5/§3).
+import type {
+  RevocationTriple,
+  SignedRevocation,
+} from "../security/revocation.ts";
+
+function sigToHex(sig: Uint8Array): string {
+  return Array.from(sig, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function sigFromHex(hex: string): Uint8Array {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+}
 
 export type SyncMessage =
   | { v: 1; type: "HELLO"; device_clock: VC }
@@ -62,7 +80,31 @@ export type SyncMessage =
       tombstones?: Snapshot["tombstones"];
       /** Engine extension: marks the last message of the snapshot stream. */
       final?: boolean;
-    };
+    }
+  // --- DC-08 §3.7 / DC-10 §2.2–§3 revocation piggyback carriers ---
+  | {
+      v: 1;
+      type: "REVOCATION_RECORDS";
+      /** Hex-encoded detached signatures over canonical record bytes. */
+      records: Array<{ record: SignedRevocation["record"]; signature_hex: string }>;
+    }
+  | { v: 1; type: "REVOCATIONS_ACK"; accepted: RevocationTriple[] };
+
+/**
+ * DC-10 boundary adapter handed to the engine by the composition root.
+ * The engine calls it at the right points in the session flow; all trust
+ * decisions stay inside the security layer (DC-10 §4).
+ */
+export interface RevocationChannel {
+  /** §2.2: ALL accepted records not yet ACKed by this peer. */
+  queueFor(peerDeviceId: string): SignedRevocation[];
+  /** DC-05 §7.2 verify + store-once acceptance of one inbound record. */
+  acceptInbound(signed: SignedRevocation, fromPeer: string): Promise<boolean>;
+  /** Triples this device has ACCEPTED (sent as REVOCATIONS_ACK, §3). */
+  acceptedTriples(): RevocationTriple[];
+  /** §2.5: mark the peer's ack claims; stops re-sending to them. */
+  recordAck(fromPeer: string, triples: RevocationTriple[]): void;
+}
 
 export interface SyncTransport {
   /** Send one message to the peer; resolves when handed off. */
@@ -85,6 +127,11 @@ export interface SyncEngineDeps {
   triggers?: TriggerStateTracker;
   /** Stable identity of the connected peer, when known at session level. */
   peerDeviceId?: string;
+  /**
+   * DC-10 revocation propagation adapter (§2.2/§2.5). When provided,
+   * REVOCATION_RECORDS / REVOCATIONS_ACK piggyback on every session.
+   */
+  revocations?: RevocationChannel;
 }
 
 export interface SyncEngine {
@@ -178,6 +225,9 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     const peerKey =
       deps.peerDeviceId ?? derivePeerKey(peerHello.device_clock);
     triggers.resetStreak(peerKey); // §3.1: streak resets at session start
+
+    // --- DC-10 §2.2: push our full revocation queue for this peer ---
+    await pushRevocationQueue(transport, stats);
 
     // --- pull what we need ---
     let ranges = neededRanges(holder.knowledge, peerHello.device_clock);
@@ -277,6 +327,10 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
         mergeAckIntoLastKnownClock(msg.applied_upto);
       } else if (msg.type === "HELLO") {
         advancePeerKnowledge(msg.device_clock);
+      } else if (msg.type === "REVOCATION_RECORDS") {
+        await handleRevocationRecords(msg, transport, stats);
+      } else if (msg.type === "REVOCATIONS_ACK") {
+        handleRevocationsAck(msg);
       }
     }
   }
@@ -330,8 +384,75 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
         await handleIncomingOffer(msg, nextMessage, transport, stats);
       } else if (msg.type === "FULL_STATE_SNAPSHOT") {
         applyIncomingSnapshot(msg, stats);
+      } else if (msg.type === "REVOCATION_RECORDS") {
+        await handleRevocationRecords(msg, transport, stats);
+      } else if (msg.type === "REVOCATIONS_ACK") {
+        handleRevocationsAck(msg);
       }
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // DC-10 revocation piggyback (§2.2 push, §2.5 ack bookkeeping, §3 acks)
+  // -------------------------------------------------------------------------
+
+  function revocations(): RevocationChannel | undefined {
+    return deps.revocations;
+  }
+
+  /** Send every record queued for the current peer (AT-LEAST-ONCE, §3). */
+  async function pushRevocationQueue(
+    transport: SyncTransport,
+    stats: SessionStats,
+  ): Promise<void> {
+    const ch = revocations();
+    if (ch === undefined) return;
+    const peer = deps.peerDeviceId ?? "unknown";
+    const queued = ch.queueFor(peer);
+    if (queued.length === 0) return; // nothing to send — no message at all
+    await transport.send({
+      v: 1,
+      type: "REVOCATION_RECORDS",
+      records: queued.map((s) => ({
+        record: s.record,
+        signature_hex: sigToHex(s.signature),
+      })),
+    });
+    stats.sent++;
+  }
+
+  /**
+   * Accept each inbound record (DC-05 §7.2 verify + store-once), then ACK
+   * everything we hold in the same session (§3 delivery discipline).
+   */
+  async function handleRevocationRecords(
+    msg: Extract<SyncMessage, { type: "REVOCATION_RECORDS" }>,
+    transport: SyncTransport,
+    stats: SessionStats,
+  ): Promise<void> {
+    const ch = revocations();
+    if (ch === undefined) return;
+    const peer = deps.peerDeviceId ?? "unknown";
+    for (const wire of msg.records) {
+      await ch.acceptInbound(
+        { record: wire.record, signature: sigFromHex(wire.signature_hex) },
+        peer,
+      );
+    }
+    await transport.send({
+      v: 1,
+      type: "REVOCATIONS_ACK",
+      accepted: ch.acceptedTriples(),
+    });
+    stats.sent++;
+  }
+
+  function handleRevocationsAck(
+    msg: Extract<SyncMessage, { type: "REVOCATIONS_ACK" }>,
+  ): void {
+    const ch = revocations();
+    if (ch === undefined) return;
+    ch.recordAck(deps.peerDeviceId ?? "unknown", msg.accepted);
   }
 
   // -------------------------------------------------------------------------
