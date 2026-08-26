@@ -21,3 +21,10 @@ made from work via Telegram. Format: [timestamp] DECISION/QUESTION/PREF: text.
 - 12h/24h format toggle: acknowledged as future option, not a priority.
 - UX fixes landed (commit 4876889): date-picker OK button + Enter commits,
   hourly ruler labels for all 24h, hour guide lines through day columns.
+
+## 2026-08-26 (CLI session, UI sign-off)
+- Owner approves current UI/UX (week view time-grid, dialog flow, dropdowns).
+- Options menu (settings): LOW priority, deferred. Candidate contents when
+  built: 12h/24h format, time-input style (type vs dropdown vs both),
+  default event duration, first day of week. Sits after the sync/pairing
+  milestone in the queue.
