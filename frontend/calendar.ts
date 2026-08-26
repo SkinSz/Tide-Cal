@@ -61,6 +61,11 @@ export function getViewMode(): ViewMode {
   return mode;
 }
 
+/** Currently selected day (source of truth for the event dialog). */
+export function getSelectedDate(): Date {
+  return new Date(selectedDate);
+}
+
 export function setViewMode(m: ViewMode): void {
   mode = m;
   render();
@@ -184,8 +189,14 @@ export async function render(): Promise<void> {
   if (!root) return;
   const seq = ++renderSeq;
   root.replaceChildren();
+  root.classList.toggle("week", mode === "week");
 
   // weekday header
+  if (mode === "week") {
+    const corner = document.createElement("div");
+    corner.className = "weekday-head hour-corner";
+    root.appendChild(corner);
+  }
   for (const wd of WEEKDAYS) {
     const h = document.createElement("div");
     h.className = "weekday-head";
@@ -202,10 +213,116 @@ export async function render(): Promise<void> {
     return;
   }
 
-  for (const cell of cells) {
-    root.appendChild(dayColumn(cell, events, onEventClick));
+  if (mode === "week") {
+    renderHourRuler(root);
+    for (const cell of cells) {
+      root.appendChild(
+        weekDayColumn(cell, events, onEventClick),
+      );
+    }
+  } else {
+    for (const cell of cells) {
+      root.appendChild(dayColumn(cell, events, onEventClick));
+    }
   }
   document.getElementById("cal-label")!.textContent = label();
+}
+
+// --- Week view: time-grid ---------------------------------------------------
+// Blocks are absolutely positioned per-day; top/height track start time and
+// DURATION so an appointment's length is visible at a glance.
+
+const MINUTES_PER_DAY = 24 * 60;
+
+function fmtHour(h: number): string {
+  return `${pad(h)}:00`;
+}
+
+function pad(n: number): string {
+  return String(n).padStart(2, "0");
+}
+
+function renderHourRuler(root: HTMLElement): void {
+  const ruler = document.createElement("div");
+  ruler.className = "hour-ruler";
+  for (let h = 0; h < 24; h++) {
+    const lbl = document.createElement("div");
+    lbl.className = "hour-label";
+    lbl.textContent = h % 3 === 0 ? fmtHour(h) : "";
+    ruler.appendChild(lbl);
+  }
+  root.appendChild(ruler);
+}
+
+function minutesOfDay(d: Date): number {
+  return d.getHours() * 60 + d.getMinutes();
+}
+
+function weekDayColumn(
+  cell: DayCell,
+  events: CalendarEvent[],
+  onEventClick: (ev: CalendarEvent) => void,
+): HTMLElement {
+  const col = document.createElement("div");
+  col.className =
+    "day-col week-col" +
+    (sameDay(cell.date, new Date()) ? " day-today" : "") +
+    (sameDay(cell.date, selectedDate) ? " day-selected" : "");
+  col.dataset.date = cell.date.toISOString().slice(0, 10);
+
+  // All-day lane on top.
+  for (const ev of events.filter(
+    (e) =>
+      e.allDay &&
+      new Date(e.startMs) <= endOfDay(cell.date) &&
+      new Date(e.endMs - 1) >= startOfDay(cell.date),
+  )) {
+    const chip = eventChip(ev, true);
+    chip.addEventListener("click", (e) => {
+      e.stopPropagation();
+      onEventClick(ev);
+    });
+    chip.classList.add("lane-chip");
+    col.appendChild(chip);
+  }
+
+  // Timed blocks: absolute positioning from clock times.
+  for (const ev of events.filter(
+    (e) => !e.allDay && e.startMs < cell.date.getTime() + DAY_MS &&
+           e.endMs > cell.date.getTime(),
+  )) {
+    const s = Math.max(ev.startMs, cell.date.getTime());
+    const en = Math.min(ev.endMs, cell.date.getTime() + DAY_MS);
+    const startMin =
+      s > cell.date.getTime() ? minutesOfDay(new Date(s)) : 0;
+    const durMin = Math.max(
+      (en - s) / 60000,
+      30, // minimum visual block
+    );
+    const topPct = (startMin / MINUTES_PER_DAY) * 100;
+    const heightPct = Math.min((durMin / MINUTES_PER_DAY) * 100, 100 - topPct);
+
+    const chip = eventChip(ev, false);
+    chip.classList.add("chip-timed");
+    chip.style.top = `${topPct}%`;
+    chip.style.height = `${heightPct}%`;
+    chip.textContent = `${fmtTime(ev.startMs)} ${ev.title}`;
+    chip.addEventListener("click", (e) => {
+      e.stopPropagation();
+      onEventClick(ev);
+    });
+    col.appendChild(chip);
+  }
+  void onEventClick;
+
+  col.addEventListener("click", () => {
+    selectedDate = startOfDay(cell.date);
+    render();
+    document.dispatchEvent(
+      new CustomEvent("tide:dayclick", { detail: cell.date.toISOString() }),
+    );
+  });
+  return col;
 }
 
 function weekCells(): DayCell[] {

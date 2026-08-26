@@ -12,6 +12,7 @@ import {
   type CalendarEvent,
   type EventInput,
 } from "./store.ts";
+import { getSelectedDate } from "./calendar.ts";
 
 const dlg = () => document.getElementById("event-dialog") as HTMLDialogElement;
 
@@ -127,12 +128,7 @@ function readInput(): EventInput | null {
 export function initDialog(): void {
   // New-event button: uses the currently selected day.
   document.getElementById("btn-new")?.addEventListener("click", () => {
-    document.dispatchEvent(new CustomEvent("tide:getselectedday"));
-    const sel = document.querySelector<HTMLElement>(".day-selected");
-    const date = sel?.dataset.date
-      ? new Date(sel.dataset.date + "T00:00:00")
-      : new Date();
-    openFor(date);
+    openFor(getSelectedDate());
   });
 
   document.addEventListener("tide:eventclick", (e) => {
