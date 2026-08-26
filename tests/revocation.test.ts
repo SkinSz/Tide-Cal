@@ -16,7 +16,7 @@ import {
   type SignedRevocation,
   type TrustStoreEntry,
 } from "../src/security/revocation.ts";
-import { generateIdentity, type DeviceIdentity } from "../src/security/identity.ts";
+import { generateIdentity, deriveDeviceId, type DeviceIdentity } from "../src/security/identity.ts";
 
 /** Simple in-memory trust store: deviceId -> entry. */
 function makeTrustStore(...entries: Array<[DeviceIdentity, "trusted" | "revoked"]>) {
@@ -553,5 +553,58 @@ describe("DC-05 §7.3 enforcement gate: canSynchronize", () => {
       valid: true,
     });
     expect(canSynchronize(map, x.deviceId)).toBe("DENY_REVOKED");
+  });
+});
+
+describe("Review-3 M-5 / DC-05 §3.3: DENY_KEY_MISMATCH via claimed public key", () => {
+  test("matching claim (hashes to peerId AND equals stored key) => ALLOW", () => {
+    const a = generateIdentity();
+    const store = makeTrustStore([a, "trusted"]);
+    expect(canSynchronize(store.map, a.deviceId, a.publicKey)).toBe("ALLOW");
+  });
+
+  test("claim whose SHA-256 digest does NOT reproduce peerId => DENY_KEY_MISMATCH", () => {
+    const a = generateIdentity();
+    const impostor = generateIdentity(); // different key -> different device_id
+    const store = makeTrustStore([a, "trusted"]);
+    // Impostor presents its own (valid) key while claiming A's device_id.
+    expect(canSynchronize(store.map, a.deviceId, impostor.publicKey)).toBe(
+      "DENY_KEY_MISMATCH",
+    );
+  });
+
+  test("claim hashes to peerId but differs from the STORED entry key => DENY_KEY_MISMATCH", () => {
+    // Pathological store inconsistency: entry keyed by B's device_id but
+    // holding someone else's key. The byte-equality clause catches it.
+    const b = generateIdentity();
+    const other = generateIdentity();
+    const map = new Map<string, TrustStoreEntry>([
+      [b.deviceId, { publicKey: other.publicKey, status: "trusted" }],
+    ]);
+    expect(canSynchronize(map, b.deviceId, b.publicKey)).toBe("DENY_KEY_MISMATCH");
+  });
+
+  test("key-mismatch check precedes status: mismatch on a REVOKED peer reports DENY_KEY_MISMATCH", () => {
+    const a = generateIdentity();
+    const impostor = generateIdentity();
+    const store = makeTrustStore([a, "revoked"]);
+    expect(canSynchronize(store.map, a.deviceId, impostor.publicKey)).toBe(
+      "DENY_KEY_MISMATCH",
+    );
+    // Matching claim against a revoked peer still yields DENY_REVOKED.
+    expect(canSynchronize(store.map, a.deviceId, a.publicKey)).toBe("DENY_REVOKED");
+  });
+
+  test("unpaired peer with a claimed key remains DENY_UNPAIRED; two-arg calls unchanged", () => {
+    const stranger = generateIdentity();
+    const store = makeTrustStore();
+    expect(canSynchronize(store.map, stranger.deviceId, stranger.publicKey)).toBe(
+      "DENY_UNPAIRED",
+    );
+    // Backward-compatible two-argument form still works everywhere.
+    const known = generateIdentity();
+    const store2 = makeTrustStore([known, "trusted"]);
+    expect(canSynchronize(store2.map, known.deviceId)).toBe("ALLOW");
+    expect(deriveDeviceId(known.publicKey)).toBe(known.deviceId); // sanity
   });
 });

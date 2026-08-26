@@ -24,7 +24,10 @@
 
 import { createRequire } from "node:module";
 import { hkdf } from "@noble/hashes/hkdf.js";
-import { sha256 } from "@noble/hashes/sha2.js";
+import { sha256, sha512 } from "@noble/hashes/sha2.js";
+// Established, audited library for the Ed25519 -> X25519 montgomery map
+// (DC-05 §4; Spec §17: no custom cryptographic primitives).
+import { ed25519, x25519 } from "@noble/curves/ed25519.js";
 import type { SyncMessage, SyncTransport } from "../sync/sync_engine.ts";
 
 /** Frozen v1 cipher suite name (DC-05 §4). */
@@ -136,6 +139,67 @@ function generateStaticKeys(lib: NoiseApi): NoiseStaticKeyPair {
     lib.constants.NOISE_DH_CURVE25519,
   );
   return { privateKey, publicKey };
+}
+
+// ---------------------------------------------------------------------------
+// Ed25519 -> X25519 identity binding (DC-05 §4)
+// ---------------------------------------------------------------------------
+
+/**
+ * Deterministic Ed25519 -> X25519 PRIVATE key conversion (DC-05 §4):
+ * SHA-512 of the 32-byte Ed25519 seed, first 32 bytes of the digest clamped
+ * per the X25519 scalar rules (b[0] &= 248; b[31] &= 127; b[31] |= 64).
+ * This is byte-for-byte the construction libsodium performs inside
+ * `crypto_sign_ed25519_sk_to_curve25519` and that @noble/curves applies via
+ * its own `toMontgomerySecret` — the scalar arithmetic itself is done by the
+ * established libraries, never hand-rolled beyond the published clamp.
+ *
+ * Throws SessionError on any key that is not exactly 32 bytes.
+ */
+export function ed25519ToX25519PrivateKey(edPrivateKey: Uint8Array): Uint8Array {
+  if (edPrivateKey.length !== 32) {
+    throw new SessionError(
+      `ed25519 private key must be 32 bytes (got ${edPrivateKey.length})`,
+    );
+  }
+  const digest = sha512(edPrivateKey);
+  const scalar = digest.slice(0, 32);
+  scalar[0]! &= 248;
+  scalar[31]! &= 127;
+  scalar[31]! |= 64;
+  return scalar;
+}
+
+/**
+ * Deterministic Ed25519 -> X25519 PUBLIC key conversion (DC-05 §4): the
+ * standard birational montgomery map u = (1 + y) / (1 - y), performed by
+ * @noble/curves (`ed25519.utils.toMontgomery`, the current name of the
+ * historical `edwardsToMontgomeryPub`; equivalent to libsodium's
+ * `crypto_sign_ed25519_pk_to_curve25519`). Satisfies the §4 invariant:
+ * X25519(edToX25519Priv(seed)) == edToX25519Pub(edPub(seed)).
+ *
+ * Throws SessionError on any key that is not exactly 32 bytes.
+ */
+export function ed25519ToX25519PublicKey(edPublicKey: Uint8Array): Uint8Array {
+  if (edPublicKey.length !== 32) {
+    throw new SessionError(
+      `ed25519 public key must be 32 bytes (got ${edPublicKey.length})`,
+    );
+  }
+  return ed25519.utils.toMontgomery(edPublicKey);
+}
+
+/**
+ * Noise_XX static keypair DETERMINISTICALLY DERIVED from an Ed25519 identity
+ * seed (DC-05 §4): the static is bound to the device identity instead of
+ * being random. Production devices MUST use this path; random statics are
+ * for tests only.
+ */
+export function noiseStaticsFromIdentity(
+  identitySeed: Uint8Array,
+): NoiseStaticKeyPair {
+  const privateKey = ed25519ToX25519PrivateKey(identitySeed);
+  return { privateKey, publicKey: x25519.getPublicKey(privateKey) };
 }
 
 // ---------------------------------------------------------------------------
@@ -390,6 +454,16 @@ export async function generateNoiseStaticKeypair(): Promise<NoiseStaticKeyPair> 
 export interface DuplexPairOptions {
   initiatorStaticKeys?: NoiseStaticKeyPair;
   responderStaticKeys?: NoiseStaticKeyPair;
+  /**
+   * Ed25519 identity seed keys (DC-05 §2.1). When given, the Noise static is
+   * DETERMINISTICALLY DERIVED from the identity via the DC-05 §4 conversion
+   * (ed25519ToX25519PrivateKey) instead of being random — this binds the
+   * handshake static to the device identity so PairingSession's V1/V2 check
+   * (converted QR key vs remote static) can pass in production topology.
+   * Takes precedence over the matching `*StaticKeys` option.
+   */
+  initiatorIdentitySeed?: Uint8Array;
+  responderIdentitySeed?: Uint8Array;
   /** Observe raw (ciphertext) frames as they hit the wire. */
   tapFrames?: FrameTap;
 }
@@ -405,10 +479,22 @@ export async function makeLocalDuplexPair(
   options: DuplexPairOptions = {},
 ): Promise<[NoiseTransportHandle, NoiseTransportHandle]> {
   const lib = await loadNoiseLibrary();
-  const initiatorKeys =
-    options.initiatorStaticKeys ?? generateStaticKeys(lib);
-  const responderKeys =
-    options.responderStaticKeys ?? generateStaticKeys(lib);
+  const resolveKeys = (
+    explicit: NoiseStaticKeyPair | undefined,
+    identitySeed: Uint8Array | undefined,
+  ): NoiseStaticKeyPair => {
+    if (identitySeed !== undefined) return noiseStaticsFromIdentity(identitySeed);
+    if (explicit !== undefined) return explicit;
+    return generateStaticKeys(lib);
+  };
+  const initiatorKeys = resolveKeys(
+    options.initiatorStaticKeys,
+    options.initiatorIdentitySeed,
+  );
+  const responderKeys = resolveKeys(
+    options.responderStaticKeys,
+    options.responderIdentitySeed,
+  );
 
   const initiatorToResponder = new FrameQueue();
   const responderToInitiator = new FrameQueue();
@@ -481,12 +567,27 @@ export interface FramedByteTransport {
  * Fail-closed (§6.3): decrypt failure throws SessionError and permanently
  * kills the wrapper — subsequent calls throw immediately; no plaintext path.
  *
+ * @internal TEST/INTERNAL USE ONLY (Review-3 M-3): this primitive wraps
+ * TRANSCRIPT-FREE keys, bypassing the XX handshake that authenticates the
+ * peer. Runtime-guarded: callers must pass `{ allowUnboundKeys: true }` to
+ * acknowledge they are test/diagnostic code; production sessions must come
+ * from {@link makeLocalDuplexPair}-style real handshakes instead.
+ *
  * Async because the underlying Noise library loads once per process.
  */
 export async function wrapWithEncryption(
   inner: FramedByteTransport,
   sessionKeys: SessionKeys,
+  opts?: { allowUnboundKeys?: boolean },
 ): Promise<SyncTransport> {
+  if ((opts?.allowUnboundKeys ?? false) !== true) {
+    throw new SessionError(
+      "wrapWithEncryption refused: transcript-free session keys are not " +
+        "authenticated against any device identity (DC-05 Review-3 M-3). " +
+        "This primitive is internal/test-only — pass { allowUnboundKeys: true } " +
+        "to acknowledge, or use a real XX handshake for production sessions.",
+    );
+  }
   const lib = await loadNoiseLibrary();
   // CipherState takes the cipher ID constant, not the name string
   // (NOISE_CIPHER_CHACHAPOLY = 17153 per noise-c.wasm constants).
@@ -575,6 +676,11 @@ export async function wrapWithEncryption(
  * secret material using HKDF-SHA256 (@noble/hashes — established, audited).
  * Both sides call this with the SAME seed; side A uses the result as-is,
  * side B swaps sendKey/receiveKey.
+ *
+ * @internal TEST/INTERNAL USE ONLY (Review-3 M-3): transcript-free key
+ * derivation with no peer authentication. Only meaningful as input to
+ * {@link wrapWithEncryption} in tests; production sessions derive keys from
+ * a real XX handshake.
  */
 export function deriveSessionKeys(
   seed: Uint8Array,

@@ -15,6 +15,7 @@
     "vitest": "^3.2.4"
   },
   "dependencies": {
+    "@noble/curves": "^2.3.0",
     "@noble/ed25519": "^3.1.0",
     "@noble/hashes": "^2.3.0",
     "better-sqlite3": "^13.0.3",

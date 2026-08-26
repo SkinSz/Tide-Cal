@@ -5,6 +5,10 @@
 
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import { concat, deriveDeviceId } from "./identity.ts";
+// DC-05 §6.1 V1: the QR's Ed25519 identity key is converted to its bound
+// X25519 form via the standard DC-05 §4 conversion before byte-comparison
+// against the Noise remote static (which is an X25519 key by construction).
+import { ed25519ToX25519PublicKey } from "../network/noise_transport.ts";
 
 // ---------------------------------------------------------------------------
 // Errors (machine-readable codes)
@@ -20,6 +24,7 @@ export type PairingErrorCode =
   | "BAD_BASE64"
   | "BAD_PUBLIC_KEY"
   | "SHORT_NONCE"
+  | "NONCE_REUSE"
   | "BAD_CONNECT";
 
 const ERROR_MESSAGES: Record<PairingErrorCode, string> = {
@@ -32,6 +37,7 @@ const ERROR_MESSAGES: Record<PairingErrorCode, string> = {
   BAD_BASE64: "field is not well-formed base64",
   BAD_PUBLIC_KEY: "public_key is not a 32-byte Ed25519 key",
   SHORT_NONCE: "nonce shorter than 128 bits",
+  NONCE_REUSE: "nonce was already seen in a recent pairing ceremony (TR-10)",
   BAD_CONNECT: "connect hint malformed (ip/port invalid)",
 };
 
@@ -72,6 +78,45 @@ export interface PairingPayload {
 /** 16 fresh random bytes, base64 (§5.1a: CSPRNG, never reused). */
 export function freshNonce(): string {
   return randomBytes(16).toString("base64");
+}
+
+// ---------------------------------------------------------------------------
+// TR-10 second clause: session-layer nonce-reuse memory (bounded LRU)
+// ---------------------------------------------------------------------------
+
+/** Maximum number of recently seen nonces retained (Review-3 M-4). */
+export const PAIRING_NONCE_LRU_LIMIT = 1024;
+
+/**
+ * Bounded LRU store of recently seen pairing nonces. Insertion-ordered Map
+ * used as an LRU: a re-sight refreshes recency; inserting past
+ * {@link PAIRING_NONCE_LRU_LIMIT} evicts the least-recently-seen entry.
+ */
+export type NonceStore = Map<string, true>;
+
+export function createNonceStore(): NonceStore {
+  return new Map();
+}
+
+/** True when `nonce` was already seen in a recent ceremony (TR-10). */
+export function isKnownNonce(nonce: string, store: NonceStore): boolean {
+  return store.has(nonce);
+}
+
+/** Record a nonce as seen, refreshing its recency and bounding the store. */
+export function recordNonce(nonce: string, store: NonceStore): void {
+  if (store.has(nonce)) {
+    // Refresh recency (LRU touch) without growing.
+    store.delete(nonce);
+    store.set(nonce, true);
+    return;
+  }
+  store.set(nonce, true);
+  while (store.size > PAIRING_NONCE_LRU_LIMIT) {
+    const oldest = store.keys().next();
+    if (oldest.done) break;
+    store.delete(oldest.value);
+  }
 }
 
 /**
@@ -241,6 +286,13 @@ export type PairingState = "idle" | "payload_exchanged" | "verified" | "trusted_
  * NO trust-store mutation occurs (§6.3 fail-closed).
  */
 export class PairingSession {
+  /**
+   * Process-wide memory of nonces seen by ANY pairing ceremony on this
+   * device (TR-10 second clause, Review-3 M-4). Bounded LRU of
+   * {@link PAIRING_NONCE_LRU_LIMIT} entries.
+   */
+  static readonly recentNonces: NonceStore = createNonceStore();
+
   #state: PairingState = "idle";
   #local?: PairingPayload;
   #remote?: PairingPayload;
@@ -255,9 +307,17 @@ export class PairingSession {
   /**
    * §5.1/§5.2: both payloads seen. `remote` comes from scanning the QR
    * (decodePairingPayload); `local` is our own announcement.
+   *
+   * TR-10 (Review-3 M-4): a remote payload whose nonce was already seen in
+   * a recent ceremony is rejected outright (fail-closed: session aborted).
    */
   exchangePayloads(local: PairingPayload, remote: PairingPayload): void {
     this.#requireState("idle");
+    if (isKnownNonce(remote.nonce, PairingSession.recentNonces)) {
+      this.#state = "aborted"; // fail closed before any state is kept
+      throw new PairingError("NONCE_REUSE", "nonce");
+    }
+    recordNonce(remote.nonce, PairingSession.recentNonces);
     this.#local = local;
     this.#remote = remote;
     this.#state = "payload_exchanged";
@@ -274,14 +334,29 @@ export class PairingSession {
    * §6.1 V1/V2: byte-compare the remote static identity against the key
    * announced in the QR (scanner side authoritative OOB binding; displayer
    * side self-check). Mismatch => abort, zero partial state retained.
+   *
+   * BOTH sides are compared in the SAME key space (DC-05 §4/§6.1 V1):
+   * the QR's Ed25519 identity key is first converted to its bound X25519
+   * form via the deterministic §4 conversion, then compared against
+   * `actualRemoteStatic` — which is an X25519 key because it comes from the
+   * Noise_XX handshake over Curve25519 statics derived from identities.
+   * Comparing raw Ed25519 bytes against Noise static can never match and
+   * was exactly the Review-3 H-1 defect.
    */
   verifyRemoteStatic(actualRemoteStatic: Uint8Array): void {
     this.#requireState("payload_exchanged");
     if (this.#remoteVerified) throw new PairingError("BAD_TYPE", "already verified");
-    const announced = Buffer.from(decodeBase64Strict(this.#remote?.public_key ?? "", "public_key"));
-    if (!announced.equals(Buffer.from(actualRemoteStatic))) {
+    const announcedEd = decodeBase64Strict(this.#remote?.public_key ?? "", "public_key");
+    let announcedX25519: Buffer;
+    try {
+      announcedX25519 = Buffer.from(ed25519ToX25519PublicKey(announcedEd));
+    } catch {
+      this.abort(); // §6.3: malformed announced key => abort, zero mutation
+      throw new PairingError("BAD_PUBLIC_KEY", "QR public_key not convertible to X25519");
+    }
+    if (!announcedX25519.equals(Buffer.from(actualRemoteStatic))) {
       this.abort(); // §6.1 V2: failure => abort, delete any partial state
-      throw new PairingError("BAD_PUBLIC_KEY", "remote_static != QR public_key");
+      throw new PairingError("BAD_PUBLIC_KEY", "remote_static != X25519(QR public_key)");
     }
     this.#remoteVerified = true;
   }

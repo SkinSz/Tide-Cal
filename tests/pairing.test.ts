@@ -5,11 +5,19 @@ import { createHash } from "node:crypto";
 import { describe, expect, test } from "vitest";
 import { generateIdentity } from "../src/security/identity.ts";
 import {
+  makeLocalDuplexPair,
+  ed25519ToX25519PublicKey,
+} from "../src/network/noise_transport.ts";
+import {
+  PAIRING_NONCE_LRU_LIMIT,
   PairingError,
   PairingSession,
+  createNonceStore,
   decodePairingPayload,
   encodePairingPayload,
   freshNonce,
+  isKnownNonce,
+  recordNonce,
   safetyNumber,
 } from "../src/security/pairing.ts";
 
@@ -255,7 +263,7 @@ describe("DC-05 §6.1 pairing session state machine", () => {
     expect(s.state).toBe("payload_exchanged");
 
     s.bindTranscript(new Uint8Array(32).fill(7));
-    s.verifyRemoteStatic(bob.publicKey);
+    s.verifyRemoteStatic(ed25519ToX25519PublicKey(bob.publicKey)); // H-1: X25519 form
     const displayed = s.displaySafetyNumber();
     s.confirmSafetyNumber(displayed, displayed);
     expect(s.state).toBe("verified");
@@ -298,7 +306,7 @@ describe("DC-05 §6.1 pairing session state machine", () => {
     const s = makeSession(alice, qrFor(bob));
     s.bindTranscript(new Uint8Array(32).fill(9));
 
-    expect(() => s.verifyRemoteStatic(impostor.publicKey)).toThrow(/BAD_PUBLIC_KEY/);
+    expect(() => s.verifyRemoteStatic(ed25519ToX25519PublicKey(impostor.publicKey))).toThrow(/BAD_PUBLIC_KEY/);
     expect(s.state).toBe("aborted");
     expect(s.isCleared).toBe(true);
   });
@@ -308,7 +316,7 @@ describe("DC-05 §6.1 pairing session state machine", () => {
     const bob = generateIdentity();
     const s = makeSession(alice, qrFor(bob));
     s.bindTranscript(new Uint8Array(32).fill(3));
-    s.verifyRemoteStatic(bob.publicKey);
+    s.verifyRemoteStatic(ed25519ToX25519PublicKey(bob.publicKey)); // H-1: X25519 form
 
     const displayed = s.displaySafetyNumber();
     const forged = displayed === "12345678-12345678-12345678-12345678-12345678"
@@ -339,7 +347,7 @@ describe("DC-05 §6.1 pairing session state machine", () => {
 
     const s2 = makeSession(alice, qrFor(bob));
     s2.bindTranscript(new Uint8Array(32).fill(4));
-    s2.verifyRemoteStatic(bob.publicKey);
+    s2.verifyRemoteStatic(ed25519ToX25519PublicKey(bob.publicKey)); // H-1: X25519 form
     s2.abort();
     expect(s2.state).toBe("aborted");
     expect(s2.isCleared).toBe(true);
@@ -387,7 +395,7 @@ describe("DC-05 §6.1 pairing session state machine", () => {
         },
       );
       s.bindTranscript(tx);
-      s.verifyRemoteStatic(attacker.publicKey); // matches announcement byte-for-byte
+      s.verifyRemoteStatic(ed25519ToX25519PublicKey(attacker.publicKey)); // matches announcement (converted), byte-for-byte
       const shown = s.displaySafetyNumber().replaceAll("-", "");
       // Programmatic mismatch detection against the OTHER screen's number:
       expect(shown).not.toBe(peerDisplayed.replaceAll("-", ""));
@@ -406,5 +414,142 @@ describe("DC-05 §6.1 pairing session state machine", () => {
 
     expect(trustA).toEqual([]); // zero trust-store mutation on both devices
     expect(trustB).toEqual([]);
+  });
+});
+
+describe("Review-3 H-1: REAL Noise_XX handshake bound to Ed25519 identities", () => {
+  // The QR announces the Ed25519 identity key; the Noise static is derived
+  // from that identity via the DC-05 §4 conversion. verifyRemoteStatic must
+  // therefore pass for the TRUE peer's handshake static (converted) and fail
+  // for a MITM-substituted key.
+  function qrPayloadFor(id: ReturnType<typeof generateIdentity>): string {
+    return encodePairingPayload({
+      v: 1,
+      device_id: id.deviceId,
+      public_key: Buffer.from(id.publicKey).toString("base64"),
+      nonce: freshNonce(),
+    });
+  }
+
+  test("true peer: handshake remoteStatic == X25519(QR public_key) -> verification PASSES", async () => {
+    const alice = generateIdentity();
+    const bob = generateIdentity();
+
+    // Real XX handshake with identity-derived statics on both sides.
+    const [aliceTransport, bobTransport] = await makeLocalDuplexPair({
+      initiatorIdentitySeed: alice.privateKey,
+      responderIdentitySeed: bob.privateKey,
+    });
+
+    // Scanner side (Bob): scanned ALICE's QR, verifies what his transport learned.
+    const sessionAtBob = new PairingSession();
+    const localAtBob = decodePairingPayload(qrPayloadFor(bob));
+    const scannedQr = decodePairingPayload(qrPayloadFor(alice));
+    sessionAtBob.exchangePayloads(localAtBob, scannedQr);
+    sessionAtBob.bindTranscript(bobTransport.handshakeHash());
+    // V1/V2 in the SAME key space: convert the QR's Ed25519 key, compare to
+    // the X25519 remote static from the REAL handshake.
+    expect(() =>
+      sessionAtBob.verifyRemoteStatic(
+        ed25519ToX25519PublicKey(alice.publicKey),
+        // ^ equals bobTransport.remoteStaticKey() — asserted first:
+      ),
+    ).not.toThrow();
+    expect(
+      Buffer.from(bobTransport.remoteStaticKey()).equals(
+        Buffer.from(ed25519ToX25519PublicKey(alice.publicKey)),
+      ),
+    ).toBe(true);
+    expect(sessionAtBob.state).toBe("payload_exchanged");
+    sessionAtBob.abort();
+  });
+
+  test("MITM-substituted key: verification FAILS and aborts with zero state", async () => {
+    const alice = generateIdentity();
+    const bob = generateIdentity();
+    const attacker = generateIdentity();
+
+    // Bob = scanner = Noise RESPONDER. The MITM connects toward him as
+    // INITIATOR carrying its own (substituted) identity-derived static.
+    const [, bobTransport] = await makeLocalDuplexPair({
+      initiatorIdentitySeed: attacker.privateKey,
+    });
+
+    const sessionAtBob = new PairingSession();
+    sessionAtBob.exchangePayloads(
+      decodePairingPayload(qrPayloadFor(bob)),
+      decodePairingPayload(qrPayloadFor(alice)), // Bob scanned ALICE's QR...
+    );
+    sessionAtBob.bindTranscript(bobTransport.handshakeHash());
+
+    // ...but the wire carries the ATTACKER's static. Converted comparison
+    // must reject it (and would also reject the raw Ed25519 bytes — the
+    // old H-1 defect where no comparison could ever succeed).
+    expect(() =>
+      sessionAtBob.verifyRemoteStatic(bobTransport.remoteStaticKey()),
+    ).toThrow(/BAD_PUBLIC_KEY/);
+    expect(sessionAtBob.state).toBe("aborted");
+    expect(sessionAtBob.isCleared).toBe(true);
+
+    // Sanity: the substituted static really is the attacker's converted key.
+    expect(
+      Buffer.from(bobTransport.remoteStaticKey()).equals(
+        Buffer.from(ed25519ToX25519PublicKey(attacker.publicKey)),
+      ),
+    ).toBe(true);
+  });
+});
+
+describe("Review-3 M-4 / TR-10 second clause: session-layer nonce-reuse memory", () => {
+  function payloadWith(nonce: string, id = generateIdentity()): string {
+    return encodePairingPayload({
+      v: 1,
+      device_id: id.deviceId,
+      public_key: Buffer.from(id.publicKey).toString("base64"),
+      nonce,
+    });
+  }
+
+  test("crafted payload reusing a previously seen nonce is REJECTED (NONCE_REUSE)", () => {
+    const local = generateIdentity();
+    const remote = generateIdentity();
+
+    // Ceremony #1: fresh payload accepted; its nonce enters the memory.
+    const s1 = new PairingSession();
+    const first = decodePairingPayload(payloadWith(freshNonce(), remote));
+    s1.exchangePayloads(decodePairingPayload(payloadWith(freshNonce(), local)), first);
+    expect(s1.state).toBe("payload_exchanged");
+
+    // Ceremony #2: crafted replay of the SAME nonce (fresh everything else).
+    const s2 = new PairingSession();
+    const reused = decodePairingPayload(payloadWith(first.nonce, generateIdentity()));
+    expect(() =>
+      s2.exchangePayloads(decodePairingPayload(payloadWith(freshNonce(), local)), reused),
+    ).toThrow(PairingError);
+    try {
+      new PairingSession().exchangePayloads(
+        decodePairingPayload(payloadWith(freshNonce(), local)),
+        reused,
+      );
+    } catch (e) {
+      expect((e as PairingError).code).toBe("NONCE_REUSE");
+    }
+    expect(s2.state).toBe("aborted");
+  });
+
+  test("isKnownNonce / recordNonce behave as a bounded LRU", () => {
+    const store = createNonceStore();
+    expect(isKnownNonce("n0", store)).toBe(false);
+    recordNonce("n0", store);
+    expect(isKnownNonce("n0", store)).toBe(true);
+    // Fill past capacity; oldest entry evicted.
+    for (let i = 1; i <= PAIRING_NONCE_LRU_LIMIT; i++) recordNonce(`n${i}`, store);
+    expect(store.size).toBeLessThanOrEqual(PAIRING_NONCE_LRU_LIMIT);
+    expect(isKnownNonce("n0", store)).toBe(false); // evicted
+    expect(isKnownNonce(`n${PAIRING_NONCE_LRU_LIMIT}`, store)).toBe(true);
+    // Re-sighting refreshes recency.
+    recordNonce(`n${PAIRING_NONCE_LRU_LIMIT}`, store);
+    for (let i = 1000; i < 1010; i++) recordNonce(`m${i}`, store);
+    expect(isKnownNonce(`n${PAIRING_NONCE_LRU_LIMIT}`, store)).toBe(true);
   });
 });

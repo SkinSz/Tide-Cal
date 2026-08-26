@@ -18,7 +18,7 @@
 //     {"reason":"stolen","revoked_at_hlc":1724600030000,
 //      "revoked_by_device_id":"d-ab..","revoked_device_id":"d-cd..","v":1}
 
-import { signAsync, verifyAsync } from "./identity.ts";
+import { signAsync, verifyAsync, deriveDeviceId } from "./identity.ts";
 
 /** Record body per DC-05 §7.1 (the exact object that gets signed). */
 export interface RevocationRecord {
@@ -324,20 +324,49 @@ export class RevocationQueue {
   }
 }
 
-export type SyncDecision = "ALLOW" | "DENY_UNPAIRED" | "DENY_REVOKED";
+export type SyncDecision = "ALLOW" | "DENY_UNPAIRED" | "DENY_REVOKED" | "DENY_KEY_MISMATCH";
 
 /**
- * DC-05 §7.3 enforcement gate (unit-level shape; the real one consults the
- * persisted trust store's FRESHEST entry per device_id, DC-10 E3):
- * revoked => DENY_REVOKED, unknown => DENY_UNPAIRED, else ALLOW.
- * Pure function of the trust map — propagation state never feeds it.
+ * Constant-time-ish byte equality for key comparison.
+ */
+function keysEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= (a[i] ?? 0) ^ (b[i] ?? 0);
+  return diff === 0;
+}
+
+/**
+ * DC-05 §3.3 enforcement gate (unit-level shape; the real one consults the
+ * persisted trust store's FRESHEST entry per device_id, DC-10 E3).
+ *
+ * With `claimedPublicKey` provided, the impostor checks from the §3.3
+ * pseudocode are enforced (Review-3 M-5):
+ *   - SHA-256(claimedPublicKey) hex digest must reproduce `peerId`
+ *     ("d-" + hex), i.e. the claimed key must hash to the claimed identity;
+ *   - the STORED entry.publicKey must equal the claimed key byte-for-byte.
+ * Any mismatch yields DENY_KEY_MISMATCH (impostor / substituted claim),
+ * checked BEFORE any payload could flow and before status is consulted for
+ * the digest check per §3.3's ordering.
+ *
+ * Without `claimedPublicKey`, behavior is unchanged: revoked => DENY_REVOKED,
+ * unknown => DENY_UNPAIRED, else ALLOW. Pure function of its arguments —
+ * propagation state never feeds it.
  */
 export function canSynchronize(
   trustStore: ReadonlyMap<string, TrustStoreEntry>,
   peerId: string,
+  claimedPublicKey?: Uint8Array,
 ): SyncDecision {
   const entry = trustStore.get(peerId);
   if (entry === undefined) return "DENY_UNPAIRED";
+  if (claimedPublicKey !== undefined) {
+    // §3.3 line 1: hash(remoteClaim.public_key) != idDigest(entry.device_id)
+    const claimedId = deriveDeviceId(claimedPublicKey);
+    if (claimedId !== peerId || !keysEqual(entry.publicKey, claimedPublicKey)) {
+      return "DENY_KEY_MISMATCH";
+    }
+  }
   if (entry.status === "revoked") return "DENY_REVOKED";
   return "ALLOW";
 }

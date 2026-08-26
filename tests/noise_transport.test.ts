@@ -17,6 +17,9 @@ import {
   wrapWithEncryption,
   deriveSessionKeys,
   generateNoiseStaticKeypair,
+  ed25519ToX25519PrivateKey,
+  ed25519ToX25519PublicKey,
+  noiseStaticsFromIdentity,
   SessionError,
 } from "../src/network/noise_transport.ts";
 import {
@@ -203,18 +206,25 @@ describe("DC-05 §6: Noise encrypted transport", () => {
     const good = deriveSessionKeys(seed);
     const evil = deriveSessionKeys(new Uint8Array(32).fill(9));
     const frames: Uint8Array[] = [];
-    const sender = await wrapWithEncryption(recorderTarget({ frames }), good);
+    // M-3: wrapWithEncryption is internal/test-only — tests acknowledge via
+    // { allowUnboundKeys: true }; the default now throws (guarded below).
+    const sender = await wrapWithEncryption(recorderTarget({ frames }), good, { allowUnboundKeys: true });
     await sender.send(hello({ k: 1 }));
-    const receiverWrongKeys = await wrapWithEncryption(playerSource([frames[0]!]), {
-      sendKey: evil.receiveKey,
-      receiveKey: evil.sendKey,
-    });
+    const receiverWrongKeys = await wrapWithEncryption(
+      playerSource([frames[0]!]),
+      {
+        sendKey: evil.receiveKey,
+        receiveKey: evil.sendKey,
+      },
+      { allowUnboundKeys: true },
+    );
     await expectSessionError(receiverWrongKeys.receive());
 
     // Correct keys decrypt fine (sanity that failure above was key mismatch).
     const receiverRightKeys = await wrapWithEncryption(
       playerSource([frames[0]!]),
       { sendKey: good.receiveKey, receiveKey: good.sendKey },
+      { allowUnboundKeys: true },
     );
     expect(await receiverRightKeys.receive()).toEqual(hello({ k: 1 }));
   });
@@ -302,14 +312,22 @@ describe("DC-05 §6: Noise encrypted transport", () => {
 
     // A sends with keys.sendKey; B must receive with keys.sendKey => B's
     // receiveKey = A's sendKey (directional keys are mirrored).
-    const tA = await wrapWithEncryption(pipeTo(qAtoB, qBtoA), {
-      sendKey: keys.sendKey,
-      receiveKey: keys.receiveKey,
-    });
-    const tB = await wrapWithEncryption(pipeTo(qBtoA, qAtoB), {
-      sendKey: keys.receiveKey,
-      receiveKey: keys.sendKey,
-    });
+    const tA = await wrapWithEncryption(
+      pipeTo(qAtoB, qBtoA),
+      {
+        sendKey: keys.sendKey,
+        receiveKey: keys.receiveKey,
+      },
+      { allowUnboundKeys: true },
+    );
+    const tB = await wrapWithEncryption(
+      pipeTo(qBtoA, qAtoB),
+      {
+        sendKey: keys.receiveKey,
+        receiveKey: keys.sendKey,
+      },
+      { allowUnboundKeys: true },
+    );
 
     const dir = mkdtempSync(join(tmpdir(), "tide-noise-"));
     try {
@@ -380,6 +398,7 @@ describe("DC-05 §6: Noise encrypted transport", () => {
         },
       },
       { sendKey: keys.sendKey, receiveKey: keys.receiveKey },
+      { allowUnboundKeys: true },
     );
     const tB = await wrapWithEncryption(
       {
@@ -391,6 +410,7 @@ describe("DC-05 §6: Noise encrypted transport", () => {
         },
       },
       { sendKey: keys.receiveKey, receiveKey: keys.sendKey },
+      { allowUnboundKeys: true },
     );
 
     const msgs: SyncMessage[] = [
@@ -411,6 +431,124 @@ describe("DC-05 §6: Noise encrypted transport", () => {
     await expectSessionError(tB.receive());
     await expectSessionError(tB.receive()); // still dead
     await expectSessionError(tB.send(hello({ after: 1 })));
+  });
+});
+
+describe("Review-3 M-3: wrapWithEncryption transcript-free-key guard", () => {
+  test("default (no opts) REFUSES transcript-free session keys", async () => {
+    const keys = deriveSessionKeys(new Uint8Array(32).fill(1));
+    let err: unknown;
+    try {
+      await wrapWithEncryption(recorderTarget({ frames: [] }), keys);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(SessionError);
+    expect((err as SessionError).message).toMatch(/allowUnboundKeys|M-3/i);
+  });
+
+  test("explicit false is equally refused; only { allowUnboundKeys: true } passes the gate", async () => {
+    const keys = deriveSessionKeys(new Uint8Array(32).fill(2));
+    await expect(
+      wrapWithEncryption(recorderTarget({ frames: [] }), keys, { allowUnboundKeys: false }),
+    ).rejects.toBeInstanceOf(SessionError);
+    // Opt-in works and yields a functioning transport.
+    const frames: Uint8Array[] = [];
+    const t = await wrapWithEncryption(recorderTarget({ frames }), keys, { allowUnboundKeys: true });
+    await t.send(hello({ guarded: 1 }));
+    expect(frames.length).toBe(1);
+  });
+
+  test("deriveSessionKeys itself remains deterministic (documented @internal)", () => {
+    const seed = new Uint8Array(32).fill(11);
+    const a = deriveSessionKeys(seed);
+    const b = deriveSessionKeys(seed);
+    expect(Buffer.from(a.sendKey).equals(Buffer.from(b.sendKey))).toBe(true);
+    expect(Buffer.from(a.receiveKey).equals(Buffer.from(b.receiveKey))).toBe(true);
+  });
+});
+
+describe("Review-3 H-1: Ed25519 -> X25519 identity binding (DC-05 §4)", () => {
+  // Cross-checked vectors: private conversion must equal @noble/curves'
+  // own toMontgomerySecret, and X25519(pub-of-converted-priv) must equal
+  // converted pub (the §4 binding invariant).
+  test("private key conversion: SHA-512(seed), clamp — matches library construction", async () => {
+    const { ed25519: curve } = await import("@noble/curves/ed25519.js");
+    for (const n of [1, 7, 42]) {
+      const edSeed = new Uint8Array(32).map((_, i) => (i * n + 5) % 256);
+      const ours = ed25519ToX25519PrivateKey(edSeed);
+      const libRef = curve.utils.toMontgomerySecret(edSeed);
+      expect(Buffer.from(ours).equals(Buffer.from(libRef))).toBe(true);
+      // Clamp actually applied.
+      expect(ours[0]! & 7).toBe(0);
+      expect(ours[31]! & 128).toBe(0);
+      expect(ours[31]! & 64).toBe(64);
+    }
+  });
+
+  test("binding invariant: X25519(converted priv) == converted pub, deterministic", async () => {
+    const { x25519 } = await import("@noble/curves/ed25519.js");
+    const { generateIdentity } = await import("../src/security/identity.ts");
+    for (let i = 0; i < 8; i++) {
+      const id = generateIdentity();
+      const privX = ed25519ToX25519PrivateKey(id.privateKey);
+      const pubA = x25519.getPublicKey(privX);
+      const pubB = ed25519ToX25519PublicKey(id.publicKey);
+      expect(Buffer.from(pubA).equals(Buffer.from(pubB))).toBe(true);
+      // Deterministic across repeated calls.
+      expect(Buffer.from(ed25519ToX25519PublicKey(id.publicKey)).equals(Buffer.from(pubB))).toBe(true);
+    }
+  });
+
+  test("rejects wrong-length key material", () => {
+    expect(() => ed25519ToX25519PrivateKey(new Uint8Array(16))).toThrow(SessionError);
+    expect(() => ed25519ToX25519PublicKey(new Uint8Array(64))).toThrow(SessionError);
+  });
+
+  test("identity-derived handshake: remote static == converted identity key (real XX)", async () => {
+    const { generateIdentity } = await import("../src/security/identity.ts");
+    const alice = generateIdentity();
+    const bob = generateIdentity();
+
+    const [a, b] = await makeLocalDuplexPair({
+      initiatorIdentitySeed: alice.privateKey,
+      responderIdentitySeed: bob.privateKey,
+    });
+
+    // Each side learned the peer's static, which IS the peer's converted
+    // Ed25519 identity public key — not a random Curve25519 key.
+    expect(
+      Buffer.from(a.remoteStaticKey()).equals(
+        Buffer.from(ed25519ToX25519PublicKey(bob.publicKey)),
+      ),
+    ).toBe(true);
+    expect(
+      Buffer.from(b.remoteStaticKey()).equals(
+        Buffer.from(ed25519ToX25519PublicKey(alice.publicKey)),
+      ),
+    ).toBe(true);
+
+    // The derived statics are also reproducible standalone.
+    const again = noiseStaticsFromIdentity(bob.privateKey);
+    expect(Buffer.from(again.publicKey).equals(Buffer.from(a.remoteStaticKey()))).toBe(true);
+
+    // And traffic still flows over the real handshake.
+    await a.send(hello({ bound: 1 }));
+    expect(await b.receive()).toEqual(hello({ bound: 1 }));
+  });
+
+  test("random-static pairs remain unaffected when no identity seed given", async () => {
+    const explicit = await generateNoiseStaticKeypair();
+    const [, r] = await makeLocalDuplexPair({
+      initiatorStaticKeys: explicit,
+    });
+    expect(r.remoteStaticKey().length).toBe(32);
+    // Explicit statics still take effect when no seed overrides them.
+    expect(
+      Buffer.from(r.remoteStaticKey()).equals(
+        Buffer.from(ed25519ToX25519PublicKey(new Uint8Array(32))), // never true
+      ),
+    ).toBe(false);
   });
 });
 
