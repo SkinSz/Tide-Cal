@@ -136,6 +136,57 @@ describe("EventCore: mutations go through DC-07 createLocalChange", () => {
   });
 });
 
+describe("frontend/store.ts injected domain-core bridge", () => {
+  // The UI prefers window.__TIDE_EVENT_STORE__ when present; verify that
+  // mutations actually reach the EventCore-backed adapter (and therefore
+  // createLocalChange) instead of Tauri/localStorage.
+  test("store routes CRUD through an injected EventStoreBridge", async () => {
+    const core = new EventCore(dbPath);
+    const calls: string[] = [];
+    const bridge = {
+      listEvents: (range?: { fromMs?: number | null; toMs?: number | null }) => {
+        calls.push("list");
+        return core.listEvents(range);
+      },
+      createEvent: (input: never) => {
+        calls.push("create");
+        return core.createEvent(input);
+      },
+      updateEvent: (id: string, input: never) => {
+        calls.push("update");
+        return core.updateEvent(id, input);
+      },
+      deleteEvent: (id: string) => {
+        calls.push("delete");
+        core.deleteEvent(id);
+      },
+    };
+    (globalThis as { window?: unknown }).window = { __TIDE_EVENT_STORE__: bridge };
+
+    const store = await import("../frontend/store.ts");
+    const ev = await store.createEvent(INPUT);
+    expect(calls).toEqual(["create"]);
+    expect(ev.id).toBe((await store.listEvents())[0]!.id);
+
+    await store.updateEvent(ev.id, { ...INPUT, title: "renamed" });
+    expect((await store.listEvents())[0]!.title).toBe("renamed");
+    await store.deleteEvent(ev.id);
+    expect(await store.listEvents()).toHaveLength(0);
+    expect(calls).toEqual(["create", "list", "update", "list", "delete", "list"]);
+
+    // Change records prove the mutation ran through the DC-07 core.
+    const n = core.db
+      .prepare<[string], { c: number }>(
+        "SELECT COUNT(*) AS c FROM changes WHERE entity_id = ?",
+      )
+      .get(ev.id)!.c;
+    expect(n).toBe(3); // create(set) + update(title) + delete(remove)
+
+    delete (globalThis as { window?: unknown }).window;
+    core.db.close();
+  });
+});
+
 describe("sidecar protocol", () => {
   test("request/response round-trip incl. error case", () => {
     const core = new EventCore(dbPath);
