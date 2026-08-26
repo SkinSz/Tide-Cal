@@ -122,3 +122,49 @@ Contracts are authoritative; this log tracks code-vs-contract gaps.
 - [ ] P-M1..M4 validation/deepEqual fixes — queue after criticals
 - [ ] pairing.test esbuild #require issue — check builder output (may be stale info)
 - [ ] revocation 5 failures noted by reviewer vs 19/19 pass reported by builder — verify locally
+
+## Review 3 — re-review of new network/security modules (agent, 2026-08-26). Verdict: NEEDS-FIXES (no criticals)
+
+### HIGH
+- H-1 Ed25519<->X25519 binding missing: Noise static keys are random Curve25519,
+  not derived from Ed25519 identity. PairingSession.verifyRemoteStatic compares
+  X25519 vs Ed25519 keys -> can never match in production. MUST land before
+  pairing/transport seam is wired.
+
+### MEDIUM
+- M-1 mDNS adapter stub returns NoopAdapter even when mdns-sd loads; misleading log.
+- M-2 No expected-peer pinning / canSynchronize not wired into session setup.
+  Any device completing XX handshake can deliver payloads. NEEDS WIRING before
+  network-facing milestones; gate function exists in revocation.ts but unused.
+- M-3 wrapWithEncryption/deriveSessionKeys = transcript-free key path, public API
+  bypass primitive. Mark test-only or require transcript proof.
+- M-4 TR-10 second clause unimplemented: no nonce-reuse memory at session layer.
+- M-5 canSynchronize lacks DENY_KEY_MISMATCH variant + claimed-key parameter.
+
+### LOW/NIT
+- L-1 TOCTOU in acceptRevocation (await between check and set).
+- L-2 FrameQueue concurrent receive() loses wakeups.
+- L-3 EndpointCache.add ttl default 0 footgun.
+- L-4 revocation device-id format unchecked.
+- L-5 OfferDedup.shouldOffer doesn't record intent (footgun).
+- NITs: cost off-by-one (conservative), NaN backlog disables Trigger C,
+  BAD_TYPE misuse, storeTrust state-before-store, injectInboundFrame on prod
+  interface, classifyDiscovered mislabel, locale sort, queue(peer) includes
+  peer-authored records.
+
+### Clean categories
+Nonce management, key-material logging, constant-time exposure, privacy leaks
+(TXT allowlist + tests), TTL boundary logic, quarantine bypass.
+
+### Test gaps
+No test feeds real Noise remoteStaticKey into pairing flow (masks H-1);
+conflicting-triple revocation path untested; handshake-stage failures untested.
+
+## Remediation status R3
+- [ ] H-1 implement Ed25519->X25519 conversion + fix pairing verification + integration test
+- [ ] M-2 wire canSynchronize into session setup (before network milestone)
+- [ ] M-3 restrict wrapWithEncryption to internal/test use
+- [ ] M-4 nonce reuse tracking
+- [ ] M-5 extend canSynchronize signature
+- [ ] M-1 honest adapter stub logging
+- [ ] L/NIT batch after UI milestone
