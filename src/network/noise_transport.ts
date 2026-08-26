@@ -338,7 +338,7 @@ export interface NoiseTransportHandle extends SyncTransport {
   injectInboundFrame(frame: Uint8Array): void;
 }
 
-class NoiseSessionTransport implements NoiseTransportHandle {
+export class NoiseSessionTransport implements NoiseTransportHandle {
   private dead = false;
 
   constructor(
@@ -541,6 +541,120 @@ export async function makeLocalDuplexPair(
       options.tapFrames,
     ),
   ];
+}
+
+// ---------------------------------------------------------------------------
+// Single-ended handshake over a real framed carrier (sync_runtime wire-in)
+// ---------------------------------------------------------------------------
+
+export type XxRole = "initiator" | "responder";
+
+/**
+ * Run one Noise_XX handshake over an arbitrary {@link FramedByteTransport}
+ * (e.g. length-prefix-framed TCP from sync_runtime) and return the encrypted
+ * session transport bound to that carrier.
+ *
+ * DC-05 §5.3 roles: QR displayer = INITIATOR, scanner = RESPONDER; for
+ * post-pairing sync sessions either role assignment is valid (XX symmetry).
+ *
+ * Same fail-closed semantics as makeLocalDuplexPair: any handshake error
+ * throws SessionError and the caller must drop the connection.
+ */
+export async function handshakeOverTransport(
+  role: XxRole,
+  inner: FramedByteTransport,
+  identitySeed: Uint8Array,
+): Promise<RawSessionHandle> {
+  const lib = await loadNoiseLibrary();
+  const statics = noiseStaticsFromIdentity(identitySeed);
+  const isInitiator = role === "initiator";
+  const roleConstant = isInitiator
+    ? lib.constants.NOISE_ROLE_INITIATOR
+    : lib.constants.NOISE_ROLE_RESPONDER;
+
+  const inbound = new FrameQueue();
+
+  // Outbound queue -> carrier pump. runXxHandshake / NoiseSessionTransport
+  // both push frames via the fake queue below; this loop drains them.
+  const outQ: Uint8Array[] = [];
+  let waiting: ((f: Uint8Array) => void) | null = null;
+  const pushOut = (frame: Uint8Array): void => {
+    if (waiting) {
+      const w = waiting;
+      waiting = null;
+      w(frame);
+    } else {
+      outQ.push(frame);
+    }
+  };
+  const pump = (async () => {
+    for (;;) {
+      const frame =
+        outQ.length > 0
+          ? outQ.shift()!
+          : await new Promise<Uint8Array>((resolve) => {
+              waiting = resolve;
+            });
+      await inner.send(frame);
+    }
+  })();
+  void pump.catch(() => {
+    /* carrier closed; session calls fail closed on their own */
+  });
+
+  // Carrier -> inbound feed for the lifetime of the connection.
+  void (async () => {
+    for (;;) {
+      const frame = await inner.receive();
+      if (frame === null) break;
+      inbound.push(frame);
+    }
+  })().catch(() => {
+    /* carrier died; pending reads will reject/close */
+  });
+
+  const fakeQueue = { push: pushOut } as unknown as FrameQueue;
+
+  const result = await runXxHandshake(
+    lib,
+    roleConstant,
+    inbound,
+    fakeQueue,
+    statics,
+    undefined,
+    isInitiator ? "initiator" : "responder",
+  );
+
+  // Raw cipher-frame access (for channels whose payload shape is NOT the
+  // DC-08 SyncMessage union — e.g. the pairing ceremony's own JSON messages).
+  // Same key material, same transport security (DC-05 §6.2), different codec.
+  return {
+    sendCipher: result.sendCipher,
+    receiveCipher: result.receiveCipher,
+    handshakeHash: () => new Uint8Array(result.handshakeHash),
+    remoteStaticKey: () => new Uint8Array(result.remoteStaticKey),
+    isDead: () => false, // cipher states throw once freed/exhausted
+    outbound: fakeQueue,
+    inbound,
+  } satisfies RawSessionHandle;
+}
+
+/**
+ * A completed Noise session exposing RAW ciphertext frame queues instead of
+ * a SyncMessage-typed transport. Consumers MUST encrypt/decrypt every frame
+ * with the provided cipher states and call free() on them when done — there
+ * is deliberately no plaintext bypass.
+ */
+export interface RawSessionHandle {
+  sendCipher: NoiseCipherState;
+  receiveCipher: NoiseCipherState;
+  handshakeHash(): Uint8Array;
+  remoteStaticKey(): Uint8Array;
+  isDead(): boolean;
+  /** Push-to-peer queue; frames are ciphertext after EncryptWithAd. */
+  outbound: FrameQueue;
+  /** From-peer queue; frames are ciphertext to be DecryptWithAd'd. */
+  inbound: FrameQueue;
 }
 
 // ---------------------------------------------------------------------------
