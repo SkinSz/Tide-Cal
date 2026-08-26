@@ -125,3 +125,38 @@ dialog textarea {
 }
 dialog menu { display: flex; gap: 8px; margin: 16px 0 0; padding: 0; }
 dialog menu .spacer { flex: 1; }
+
+/* Conflicts (DC-14 surface) */
+#btn-conflicts.has-conflicts { border-color: var(--danger); color: var(--danger); }
+.conflicts-dlg { min-width: 640px; }
+.conflicts-layout { display: flex; gap: 16px; max-height: 60vh; }
+#conflict-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+#conflict-detail { flex: 1.4; overflow-y: auto; }
+.conflict-row {
+  text-align: left;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font: inherit;
+  cursor: pointer;
+}
+.conflict-row:hover { border-color: var(--accent); }
+.conflict-row.selected { border-color: var(--accent); background: var(--panel); }
+.conflict-row-title { display: block; font-weight: 600; margin-bottom: 2px; }
+.muted { color: var(--muted); font-size: 0.78rem; }
+.conflict-empty { color: var(--muted); font-size: 0.85rem; padding: 8px 0; }
+.conflict-candidate { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-top: 10px; }
+.conflict-candidate-head { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.conflict-value {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 9px;
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.conflict-value.deleted { color: var(--muted); text-decoration: line-through; }
+.conflict-actions { display: flex; gap: 8px; margin-top: 8px; justify-content: flex-end; }

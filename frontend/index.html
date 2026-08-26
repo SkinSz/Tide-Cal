@@ -13,6 +13,9 @@
       <button id="btn-next" title="Next">›</button>
       <h1 id="cal-label"></h1>
       <span class="spacer"></span>
+      <button id="btn-conflicts" title="No unresolved conflicts">
+        <span class="conflicts-label">⚠ Conflicts (0)</span>
+      </button>
       <button id="btn-new">+ New event</button>
       <div class="seg">
         <button id="btn-month">Month</button>
@@ -40,6 +43,20 @@
           <span class="spacer"></span>
           <button type="button" id="ev-cancel">Cancel</button>
           <button type="button" id="ev-save" class="primary">Save</button>
+        </menu>
+      </div>
+    </dialog>
+
+    <dialog id="conflict-dialog">
+      <div class="dlg-body conflicts-dlg">
+        <h2>Conflicts</h2>
+        <div class="conflicts-layout">
+          <div id="conflict-list"></div>
+          <div id="conflict-detail"></div>
+        </div>
+        <menu>
+          <span class="spacer"></span>
+          <button type="button" id="conflict-close">Close</button>
         </menu>
       </div>
     </dialog>

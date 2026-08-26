@@ -221,6 +221,20 @@ export class ConflictsViewModel {
   }
 
   // ------------------------------------------------------------------
+  // Presentation accessor: entity display title for list rows.
+  // ------------------------------------------------------------------
+
+  /** Display title of an affected event entity, or null when unknown. */
+  entityTitle(entityId: string): string | null {
+    const row = this.db
+      .prepare<[string], { title: string }>(
+        "SELECT title FROM events WHERE event_id = ?",
+      )
+      .get(entityId);
+    return row?.title ?? null;
+  }
+
+  // ------------------------------------------------------------------
   // Detail view (§3.2) — pure read, no detection run, no mutation
   // ------------------------------------------------------------------
 
