@@ -94,10 +94,12 @@ interface EventRow {
 
 export class EventCore {
   readonly db: ReturnType<typeof openDatabase>;
+  readonly dbPath: string;
   private readonly deviceId: string;
   private readonly hlc = new HlcTicker();
 
   constructor(dbPath: string) {
+    this.dbPath = dbPath;
     this.db = openDatabase({ path: dbPath });
     this.deviceId = loadOrCreateDeviceId(dbPath);
     this.ensureDefaultCalendar();
@@ -274,7 +276,7 @@ export class EventCore {
   }
 }
 
-function eventFields(e: CalendarEvent) {
+export function eventFields(e: CalendarEvent) {
   return {
     title: e.title,
     description: e.description,
@@ -284,7 +286,7 @@ function eventFields(e: CalendarEvent) {
   };
 }
 
-function insertEventRow(
+export function insertEventRow(
   db: ReturnType<typeof openDatabase>,
   e: CalendarEvent,
   hlc: number,
@@ -324,7 +326,7 @@ function insertEventRow(
   );
 }
 
-function rowToEvent(r: EventRow): CalendarEvent {
+export function rowToEvent(r: EventRow): CalendarEvent {
   let startMs = r.utc_start_ms;
   let endMs = r.utc_end_ms;
   if (startMs == null || endMs == null) {
