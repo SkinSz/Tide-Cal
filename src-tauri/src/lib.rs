@@ -1,22 +1,20 @@
-use rusqlite::Connection;
+// Tide desktop shell: Tauri IPC commands proxy event CRUD to the Node
+// sidecar (dist/sidecar.mjs) hosting the TS domain core. See sidecar.rs.
+//
+// The sidecar is spawned once in `setup`. If node is unavailable or the
+// child dies, commands return Err(String) and the frontend store degrades
+// to its localStorage fallback.
+
+mod sidecar;
+
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use serde_json::json;
 use tauri::{Manager, State};
 
-/// A calendar event as stored in the local Tide database.
+/// Event input as sent by the frontend shell (camelCase; snake_case kept as
+/// an alias for older callers).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Event {
-    id: String,
-    title: String,
-    description: String,
-    /// epoch milliseconds
-    start_ms: i64,
-    /// epoch milliseconds
-    end_ms: i64,
-    all_day: bool,
-}
-
-#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct EventInput {
     title: String,
     description: String,
@@ -25,155 +23,110 @@ struct EventInput {
     all_day: bool,
 }
 
-/// App state holding the SQLite connection (opened once in `setup`).
-struct Db(Mutex<Connection>);
-
-fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS events (
-            id          TEXT PRIMARY KEY,
-            title       TEXT NOT NULL,
-            description TEXT NOT NULL DEFAULT '',
-            start_ms    INTEGER NOT NULL,
-            end_ms      INTEGER NOT NULL,
-            all_day     INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE INDEX IF NOT EXISTS idx_events_start ON events(start_ms);",
-    )
+impl EventInput {
+    fn to_json(self) -> serde_json::Value {
+        serde_json::to_value(&self).unwrap_or(serde_json::Value::Null)
+    }
 }
 
-fn row_to_event(row: &rusqlite::Row) -> rusqlite::Result<Event> {
-    Ok(Event {
-        id: row.get(0)?,
-        title: row.get(1)?,
-        description: row.get(2)?,
-        start_ms: row.get(3)?,
-        end_ms: row.get(4)?,
-        all_day: row.get::<_, i64>(5)? != 0,
+/// Managed sidecar handle (None when the sidecar could not be spawned).
+/// Arc-wrapped so commands can clone it into blocking tasks.
+struct SidecarState(std::sync::Arc<Option<sidecar::Sidecar>>);
+
+// ---------------------------------------------------------------------------
+// IPC commands (proxy to the sidecar)
+// ---------------------------------------------------------------------------
+
+fn proxy(
+    sc: &std::sync::Arc<Option<sidecar::Sidecar>>,
+    op: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let sc: &sidecar::Sidecar = match sc.as_ref() {
+        Some(s) => s,
+        None => return Err("tide sidecar unavailable".to_string()),
+    };
+    sc.call(op, args).map_err(|e| {
+        log::warn!("sidecar {op} failed: {e}");
+        e
     })
 }
 
-// ---------------------------------------------------------------------------
-// IPC commands
-// ---------------------------------------------------------------------------
-
 #[tauri::command]
-fn list_events(
-    db: State<Db>,
+async fn list_events(
+    sc: State<'_, SidecarState>,
     from_ms: Option<i64>,
     to_ms: Option<i64>,
-) -> Result<Vec<Event>, String> {
-    let conn = db.0.lock().map_err(|e| e.to_string())?;
-    // Overlap test: event.start < to AND event.end > from
-    let sql = match (from_ms, to_ms) {
-        (Some(from), Some(to)) => (
-            "SELECT id,title,description,start_ms,end_ms,all_day FROM events \
-             WHERE start_ms < ?1 AND end_ms > ?2 ORDER BY start_ms",
-            vec![to, from],
-        ),
-        _ => ("SELECT id,title,description,start_ms,end_ms,all_day FROM events ORDER BY start_ms", vec![]),
-    };
-    let mut stmt = conn.prepare(sql.0).map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map(rusqlite::params_from_iter(sql.1), row_to_event)
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    Ok(rows)
-}
-
-#[tauri::command]
-fn create_event(db: State<Db>, input: EventInput) -> Result<Event, String> {
-    let event = Event {
-        id: format!(
-            "{}-{}",
-            chrono_millis(),
-            &uuid_suffix()
-        ),
-        title: input.title,
-        description: input.description,
-        start_ms: input.start_ms,
-        end_ms: input.end_ms,
-        all_day: input.all_day,
-    };
-    let conn = db.0.lock().map_err(|e| e.to_string())?;
-    conn.execute(
-        "INSERT INTO events (id,title,description,start_ms,end_ms,all_day) \
-         VALUES (?1,?2,?3,?4,?5,?6)",
-        rusqlite::params![
-            event.id,
-            event.title,
-            event.description,
-            event.start_ms,
-            event.end_ms,
-            event.all_day as i64
-        ],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(event)
-}
-
-#[tauri::command]
-fn update_event(db: State<Db>, id: String, input: EventInput) -> Result<Event, String> {
-    let conn = db.0.lock().map_err(|e| e.to_string())?;
-    let n = conn
-        .execute(
-            "UPDATE events SET title=?2, description=?3, start_ms=?4, end_ms=?5, all_day=?6 \
-             WHERE id=?1",
-            rusqlite::params![
-                id,
-                input.title,
-                input.description,
-                input.start_ms,
-                input.end_ms,
-                input.all_day as i64
-            ],
-        )
-        .map_err(|e| e.to_string())?;
-    if n == 0 {
-        return Err(format!("event not found: {id}"));
-    }
-    Ok(Event {
-        id,
-        title: input.title,
-        description: input.description,
-        start_ms: input.start_ms,
-        end_ms: input.end_ms,
-        all_day: input.all_day,
+) -> Result<Vec<serde_json::Value>, String> {
+    let args = json!({ "from_ms": from_ms, "to_ms": to_ms });
+    let handle = std::sync::Arc::clone(&sc.0);
+    tauri::async_runtime::spawn_blocking(move || {
+        proxy(&handle, "list_events", args)
+            .map(|v| v.as_array().cloned().unwrap_or_default())
     })
+    .await
+    .map_err(|e| format!("join sidecar task: {e}"))?
 }
 
 #[tauri::command]
-fn delete_event(db: State<Db>, id: String) -> Result<(), String> {
-    let conn = db.0.lock().map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM events WHERE id=?1", [&id])
-        .map_err(|e| e.to_string())?;
+async fn create_event(
+    sc: State<'_, SidecarState>,
+    input: EventInput,
+) -> Result<serde_json::Value, String> {
+    let args = json!({ "input": input.to_json() });
+    let handle = std::sync::Arc::clone(&sc.0);
+    tauri::async_runtime::spawn_blocking(move || proxy(&handle, "create_event", args))
+        .await
+        .map_err(|e| format!("join sidecar task: {e}"))?
+}
+
+#[tauri::command]
+async fn update_event(
+    sc: State<'_, SidecarState>,
+    id: String,
+    input: EventInput,
+) -> Result<serde_json::Value, String> {
+    let args = json!({ "id": id, "input": input.to_json() });
+    let handle = std::sync::Arc::clone(&sc.0);
+    tauri::async_runtime::spawn_blocking(move || proxy(&handle, "update_event", args))
+        .await
+        .map_err(|e| format!("join sidecar task: {e}"))?
+}
+
+#[tauri::command]
+async fn delete_event(sc: State<'_, SidecarState>, id: String) -> Result<(), String> {
+    let args = json!({ "id": id });
+    let handle = std::sync::Arc::clone(&sc.0);
+    tauri::async_runtime::spawn_blocking(move || proxy(&handle, "delete_event", args))
+        .await
+        .map_err(|e| format!("join sidecar task: {e}"))??;
     Ok(())
 }
 
-fn now_millis() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
-}
+// ---------------------------------------------------------------------------
+// Setup helpers
+// ---------------------------------------------------------------------------
 
-fn chrono_millis() -> String {
-    now_millis().to_string()
-}
-
-fn uuid_suffix() -> String {
-    // 8 hex chars from a simple xorshift seeded by the clock — sufficient for
-    // shell-phase local ids until the domain core's change-id generator lands.
-    let mut x = now_millis() as u64 ^ 0x9E3779B97F4A7C15;
-    let mut s = String::with_capacity(8);
-    for _ in 0..4 {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        s.push_str(&format!("{:04x}", (x & 0xFFFF) as u16));
+/// Resolve dist/sidecar.mjs:
+/// 1. TIDE_SIDECAR_PATH env override
+/// 2. app resource dir (bundled builds)
+/// 3. ../../dist/sidecar.mjs relative to cwd (dev)
+fn resolve_sidecar_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("TIDE_SIDECAR_PATH") {
+        let p = std::path::PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+        log::warn!("TIDE_SIDECAR_PATH={p:?} does not exist; trying defaults");
     }
-    s
+    if let Ok(res) = app.path().resource_dir() {
+        let p = res.join("dist").join("sidecar.mjs");
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let dev = std::path::PathBuf::from("../../dist/sidecar.mjs");
+    dev.is_file().then_some(dev)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -187,14 +140,46 @@ pub fn run() {
                         .build(),
                 )?;
             }
-            let dir = app.path().app_data_dir()?;
-            std::fs::create_dir_all(&dir)?;
-            let conn = Connection::open(dir.join("tide.db"))
-                .map_err(|e| format!("open db: {e}"))?;
-            conn.pragma_update(None, "journal_mode", "WAL")
-                .map_err(|e| format!("wal: {e}"))?;
-            init_schema(&conn).map_err(|e| format!("schema: {e}"))?;
-            app.manage(Db(Mutex::new(conn)));
+
+            // The sidecar owns the authoritative TS domain-core database.
+            let data_dir = app.path().app_data_dir()?;
+            std::fs::create_dir_all(&data_dir)?;
+            let db_path = data_dir.join("tide-domain.db");
+
+            match resolve_sidecar_path(app.handle()) {
+                Some(path) => {
+                    let mut cmd = std::process::Command::new("node");
+                    cmd.env("TIDE_DB_PATH", &db_path);
+                    cmd.arg(&path);
+                    match sidecar::Sidecar::spawn(cmd) {
+                        Ok(sc) => {
+                            match sc.ping() {
+                                Ok(_) => log::info!(
+                                    "tide sidecar ready at {}",
+                                    path.display()
+                                ),
+                                Err(e) => log::warn!(
+                                    "tide sidecar spawned but ping failed: {e}; \
+                                     event CRUD will fall back client-side"
+                                ),
+                            }
+                            app.manage(SidecarState(std::sync::Arc::new(Some(sc))));
+                        }
+                        Err(e) => {
+                            log::error!("failed to spawn tide sidecar: {e}");
+                            app.manage(SidecarState(std::sync::Arc::new(None)));
+                        }
+                    }
+                }
+                None => {
+                    log::error!(
+                        "tide sidecar bundle not found \
+                         (set TIDE_SIDECAR_PATH or run `npm run sidecar:build`); \
+                         event CRUD will fall back client-side"
+                    );
+                    app.manage(SidecarState(std::sync::Arc::new(None)));
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
