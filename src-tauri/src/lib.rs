@@ -103,6 +103,30 @@ async fn delete_event(sc: State<'_, SidecarState>, id: String) -> Result<(), Str
     Ok(())
 }
 
+/// Generic passthrough for the sync surface (device_info, pairing_offer,
+/// pairing_accept, sync_now). Keeping it generic avoids one Rust command per
+/// op while payload shapes settle; typed commands can be added later.
+#[tauri::command]
+async fn sync_op(
+    sc: State<'_, SidecarState>,
+    op: String,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    const ALLOWED: [&str; 4] = [
+        "device_info",
+        "pairing_offer",
+        "pairing_accept",
+        "sync_now",
+    ];
+    if !ALLOWED.contains(&op.as_str()) {
+        return Err(format!("op not allowed over this command: {op}"));
+    }
+    let handle = std::sync::Arc::clone(&sc.0);
+    tauri::async_runtime::spawn_blocking(move || proxy(&handle, &op, args))
+        .await
+        .map_err(|e| format!("join sidecar task: {e}"))?
+}
+
 // ---------------------------------------------------------------------------
 // Setup helpers
 // ---------------------------------------------------------------------------
@@ -185,6 +209,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_events,
             create_event,
+            sync_op,
             update_event,
             delete_event
         ])

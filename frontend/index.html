@@ -13,6 +13,9 @@
       <button id="btn-next" title="Next">›</button>
       <h1 id="cal-label"></h1>
       <span class="spacer"></span>
+      <button id="btn-devices" title="Devices & sync">
+        <span class="devices-label">⇄ Devices</span>
+      </button>
       <button id="btn-conflicts" title="No unresolved conflicts">
         <span class="conflicts-label">⚠ Conflicts (0)</span>
       </button>
@@ -73,6 +76,39 @@
         <menu>
           <span class="spacer"></span>
           <button type="button" id="conflict-close">Close</button>
+        </menu>
+      </div>
+    </dialog>
+
+    <dialog id="devices-dialog">
+      <div class="dlg-body devices-dlg">
+        <h2>Devices &amp; Sync</h2>
+        <div class="devices-self">
+          <span>This device: <code id="self-device-id">…</code></span>
+          <span class="muted">listening on port <span id="self-listen-port">…</span></span>
+        </div>
+        <div class="pairing-grid">
+          <fieldset>
+            <legend>Show pairing code</legend>
+            <button type="button" id="btn-pairing-show" class="primary">Create code</button>
+            <div id="pairing-step-show" hidden>
+              <textarea id="pairing-code-out" rows="4" readonly></textarea>
+              <p class="muted">Paste this into “Enter pairing code” on the other device.</p>
+            </div>
+          </fieldset>
+          <fieldset>
+            <legend>Enter pairing code</legend>
+            <textarea id="pairing-code-in" rows="4" placeholder='{"v":1,"device_id":…}'></textarea>
+            <button type="button" id="btn-pairing-accept">Pair device</button>
+          </fieldset>
+        </div>
+        <h3>Paired devices</h3>
+        <div id="peers-list"></div>
+        <div id="devices-busy" hidden class="muted">Working…</div>
+        <div id="devices-log"></div>
+        <menu>
+          <span class="spacer"></span>
+          <button type="button" id="devices-close">Close</button>
         </menu>
       </div>
     </dialog>

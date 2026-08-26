@@ -266,3 +266,46 @@ dialog menu .spacer { flex: 1; }
 .time-option.picked { color: var(--accent); font-weight: 600; }
 
 /* Clicked-hour highlight in week view */
+/* Devices & sync dialog */
+.devices-dlg { min-width: 620px; }
+.devices-self { display: flex; gap: 16px; margin-bottom: 12px; font-size: 0.85rem; }
+.devices-self code { font-size: 0.8rem; color: var(--accent); }
+.pairing-grid { display: flex; gap: 14px; }
+.pairing-grid fieldset {
+  flex: 1;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.pairing-grid textarea {
+  width: 100%;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-family: ui-monospace, monospace;
+  font-size: 0.72rem;
+  resize: vertical;
+}
+#peers-list { max-height: 140px; overflow-y: auto; margin-bottom: 8px; }
+.peer-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  margin-bottom: 4px;
+  font-size: 0.85rem;
+}
+#devices-log {
+  max-height: 90px;
+  overflow-y: auto;
+  font-size: 0.75rem;
+  color: var(--muted);
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+}
