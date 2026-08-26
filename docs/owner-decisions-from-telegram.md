@@ -12,3 +12,12 @@ made from work via Telegram. Format: [timestamp] DECISION/QUESTION/PREF: text.
 [ACK by relay 2026-08-26 08:14] Received: owner wants agentic work on the Tauri app shell (visible calendar UI) started now. Status check at relay time: no src-tauri/ directory exists yet — Tauri shell not yet started. Main session will prioritize this at next work session, reading this file first, within the 2-3 parallel stream cap.
 2026-08-26 08:35 (via Telegram status session): Owner decision — Tauri app shell (src-tauri/, new top-level directory, calendar UI) may start NOW in parallel; it touches no files in the current security-fix workstream (src/network, src/security), so no conflict. Flag: shell work must stay out of existing src/ modules until H-1 fix is committed.
 [ACK by relay 2026-08-26 08:35] Received: Tauri app shell (src-tauri/, top-level, calendar UI) cleared to start in parallel with the security-fix workstream — no file overlap. Constraint noted: shell work stays out of existing src/ modules until the H-1 fix is committed. Main CLI session will implement at next work session, reading this file first.
+
+## 2026-08-26 (CLI session, smoke-test round 2)
+- Timezone-aware rendering postponed (owner decision). Scope is LAN/same-WiFi
+  device sync; likelihood of diverging timezones across the user's devices
+  judged low. Schema keeps tz_id column, so revisit only when a real
+  cross-zone need appears.
+- 12h/24h format toggle: acknowledged as future option, not a priority.
+- UX fixes landed (commit 4876889): date-picker OK button + Enter commits,
+  hourly ruler labels for all 24h, hour guide lines through day columns.
