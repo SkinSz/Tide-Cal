@@ -37,16 +37,26 @@
         <label>Day
           <input type="date" id="ev-date" required />
         </label>
-        <button type="button" id="ev-date-ok" class="primary">OK</button>
         <label class="check"><input type="checkbox" id="ev-allday" /> Whole day</label>
         <div id="ev-time-row">
-          <label>Start <input type="time" id="ev-start-t" /></label>
-          <label>End <input type="time" id="ev-end-t" /></label>
+          <label>Start
+            <span class="time-wrap">
+              <input type="time" id="ev-start-t" step="900" />
+              <button type="button" class="time-arrow" data-for="ev-start-t" title="Choose time">▾</button>
+            </span>
+          </label>
+          <label>End
+            <span class="time-wrap">
+              <input type="time" id="ev-end-t" step="900" />
+              <button type="button" class="time-arrow" data-for="ev-end-t" title="Choose time">▾</button>
+            </span>
+          </label>
         </div>
         <input type="hidden" id="ev-id" />
         <menu>
           <button type="button" id="ev-delete" class="danger" hidden>Delete</button>
           <span class="spacer"></span>
+          <button type="button" id="ev-date-ok" title="Close the date picker">Done</button>
           <button type="button" id="ev-cancel">Cancel</button>
           <button type="button" id="ev-save" class="primary">Save</button>
         </menu>

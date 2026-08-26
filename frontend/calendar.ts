@@ -275,6 +275,7 @@ function weekDayColumn(
   cell: DayCell,
   events: CalendarEvent[],
   onEventClick: (ev: CalendarEvent) => void,
+  clickedHour: number | null = null,
 ): HTMLElement {
   const col = document.createElement("div");
   col.className =
@@ -282,6 +283,7 @@ function weekDayColumn(
     (sameDay(cell.date, new Date()) ? " day-today" : "") +
     (sameDay(cell.date, selectedDate) ? " day-selected" : "");
   col.dataset.date = cell.date.toISOString().slice(0, 10);
+  if (clickedHour != null) col.classList.add("hour-clicked");
 
   // All-day lane on top.
   for (const ev of events.filter(
@@ -328,11 +330,23 @@ function weekDayColumn(
   }
   void onEventClick;
 
-  col.addEventListener("click", () => {
+  // Click on an empty hour band: select that day AND pre-seed a new event
+  // starting at that hour (30-min default via dialog defaults).
+  col.addEventListener("click", (e) => {
+    const target = e.target as HTMLElement;
+    if (target.closest(".chip")) return; // chip handler owns that click
+    const rect = col.getBoundingClientRect();
+    const frac = (e.clientY - rect.top) / rect.height;
+    clickedHour = Math.min(Math.floor(frac * 24), 23);
     selectedDate = startOfDay(cell.date);
     render();
     document.dispatchEvent(
       new CustomEvent("tide:dayclick", { detail: cell.date.toISOString() }),
+    );
+    document.dispatchEvent(
+      new CustomEvent("tide:hourclick", {
+        detail: { date: cell.date.toISOString(), hour: clickedHour },
+      }),
     );
   });
   return col;

@@ -48,13 +48,48 @@ function syncTimeVisibility(): void {
   row.style.display = wholeDay() ? "none" : "";
 }
 
-/**
- * Commit the native date picker: WebKit/GTK leaves its popover open until
- * focus leaves the field, so "OK" (and Enter on the field) blurs it to close.
- */
 function commitDateField(): void {
-  const inp = field<HTMLInputElement>("ev-date");
-  inp.blur();
+  field<HTMLInputElement>("ev-date").blur();
+}
+
+/**
+ * Outlook-style dropdown: 15-minute slots (00:00–23:45) as buttons that set
+ * the paired <input type="time">. Complements free typing rather than
+ * replacing it — the native time input stays editable.
+ */
+const TIME_SLOTS: string[] = Array.from(
+  { length: 24 * 4 },
+  (_, i) => `${pad(Math.floor(i / 4))}:${pad((i % 4) * 15)}`,
+);
+
+function openTimeMenu(inputId: string): void {
+  const inp = field<HTMLInputElement>(inputId);
+  document.getElementById("time-menu")?.remove();
+  const menu = document.createElement("div");
+  menu.id = "time-menu";
+  const wrap = inp.closest(".time-wrap")!;
+  const rect = wrap.getBoundingClientRect();
+  const dlgRect = dlg().getBoundingClientRect();
+  // Position relative to the dialog so the dialog's own stacking/overflow
+  // rules apply; menu opens below the field, capped to dialog height.
+  menu.style.top = `${rect.bottom - dlgRect.top}px`;
+  menu.style.left = `${rect.left - dlgRect.left}px`;
+  for (const slot of TIME_SLOTS) {
+    const opt = document.createElement("button");
+    opt.type = "button";
+    opt.className = "time-option" + (inp.value === slot ? " picked" : "");
+    opt.textContent = slot;
+    opt.addEventListener("click", () => {
+      inp.value = slot;
+      menu.remove();
+    });
+    menu.appendChild(opt);
+  }
+  dlg().appendChild(menu);
+}
+
+function closeTimeMenus(): void {
+  document.getElementById("time-menu")?.remove();
 }
 
 function openFor(date: Date, existing?: CalendarEvent): void {
@@ -144,13 +179,43 @@ export function initDialog(): void {
     openFor(new Date(), (e as CustomEvent<CalendarEvent>).detail);
   });
 
+  // Week view: click on an empty hour band -> new event pre-seeded with that
+  // day and hour (ends +1h via defaults).
+  document.addEventListener("tide:hourclick", (e) => {
+    const { date, hour } = (
+      e as CustomEvent<{ date: string; hour: number }>
+    ).detail;
+    const d = new Date(date);
+    d.setHours(hour, 0, 0, 0);
+    openFor(d);
+  });
+
   field("ev-allday").addEventListener("change", syncTimeVisibility);
-  document.getElementById("ev-date-ok")?.addEventListener("click", commitDateField);
-  field("ev-date").addEventListener("keydown", (e) => {
-    if ((e as KeyboardEvent).key === "Enter") {
-      e.preventDefault();
-      commitDateField();
-    }
+  // Date picker: WebKit's popover only closes on blur, and Enter/ESC inside
+  // it are swallowed by the popover itself. So: auto-blur as soon as a value
+  // is committed, plus the "Done" menu button as the visible escape hatch.
+  field("ev-date").addEventListener("change", commitDateField);
+  document
+    .getElementById("ev-date-ok")
+    ?.addEventListener("click", commitDateField);
+
+  // Time fields: free typing in the native input OR the ▾ 15-min dropdown.
+  for (const btn of Array.from(
+    dlg().querySelectorAll<HTMLButtonElement>(".time-arrow"),
+  )) {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const existing = document.getElementById("time-menu");
+      if (existing) {
+        existing.remove();
+        return;
+      }
+      openTimeMenu(btn.dataset.for!);
+    });
+  }
+  dlg().addEventListener("click", (e) => {
+    const t = e.target as HTMLElement;
+    if (!t.closest("#time-menu") && !t.closest(".time-arrow")) closeTimeMenus();
   });
 
   document
