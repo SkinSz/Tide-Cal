@@ -126,6 +126,83 @@ describe("DC-09 full-state synchronization", () => {
     receiver.close();
   });
 
+  test("REGRESSION: stale snapshot must not regress applied_upto (monotonicity)", () => {
+    const receiver = openDatabase({ path: join(dir, Math.random().toString(36).slice(2) + ".db") });
+    insertCalendar(receiver);
+
+    // Receiver durably applied through seq 7 for producer d-A via increments.
+    // Fresh process mirror: nothing applied yet, no pending.
+    receiver.prepare(
+      "INSERT INTO applied_upto (producer_device_id, applied_through) VALUES ('d-A', 7)"
+    ).run();
+
+    // A snapshot built by an OLD session of d-A, advertising only seq 1.
+    const staleSnapshots: Snapshot[] = [
+      {
+        snapshot_clock: { "d-A": 1 },
+        entities: [],
+        tombstones: [],
+      },
+    ];
+    // The receiver's KnowledgeState mirror — start clean like a fresh process.
+    const k = emptyKnowledge();
+    for (const snap of staleSnapshots) {
+      applySnapshot(receiver, snap, k);
+    }
+
+    // Monotonicity (DC-06 §3.4 / TR-7): never regress the durable frontier.
+    const got = receiver
+      .prepare(
+        "SELECT applied_through FROM applied_upto WHERE producer_device_id = 'd-A'",
+      )
+      .get() as { applied_through: number } | undefined;
+    expect(got?.applied_through).toBeGreaterThanOrEqual(7);
+    receiver.close();
+  });
+
+  test("REGRESSION: calendar round-trips through build/applySnapshot", () => {
+    const sender = seedSender();
+    // Give the calendar a change-history entry so buildSnapshot can anchor its
+    // version vector (production always bootstraps via createLocalChange).
+    createLocalChange(sender, "d-S", {
+      entity_id: "c-1",
+      entity_type: "calendar",
+      field_path: "title",
+      operation: "set",
+      payload: { value: "My Calendar" },
+      hlc_now: () => Date.now(),
+    });
+    const receiver = openDatabase({ path: join(dir, Math.random().toString(36).slice(2) + ".db") });
+
+    const snapshots: Snapshot[] = [];
+    buildSnapshot(sender, (s) => snapshots.push(s));
+    const res = applyAll(receiver, snapshots);
+
+    // Calendar entry was emitted AND materialized on the receiver.
+    expect(res.appliedEntities).toBeGreaterThanOrEqual(1);
+    const cal = receiver
+      .prepare<[string], { calendar_id: string; title: string }>(
+        "SELECT calendar_id, title FROM calendars WHERE calendar_id = ?",
+      )
+      .get("c-1");
+    expect(cal).toBeDefined();
+    expect(cal?.title).toBe("Home");  // sender's calendars-row state
+
+    // Give the receiver calendar a change-history anchor (production devices
+    // bootstrap via createLocalChange, which supplies this automatically).
+    seedRawChange(receiver, "d-S", 9, "c-1", { "d-S": 1 }, "Home");
+
+    // And round-trips BACK again intact.
+    const snapshots2: Snapshot[] = [];
+    buildSnapshot(receiver, (s2) => snapshots2.push(s2));
+    const ents = snapshots2.flatMap((s) => s.entities);
+    const calEntry = ents.find((e) => e.entity_type === "calendar");
+    expect(calEntry).toBeDefined();
+
+    sender.close();
+    receiver.close();
+  });
+
   test("TR-8 clock exchange: applied_upto dominates snapshot_clock", () => {
     const sender = seedSender();
     const receiver = openDatabase({ path: join(dir, Math.random().toString(36).slice(2) + ".db") });

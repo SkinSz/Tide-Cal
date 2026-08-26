@@ -14,7 +14,7 @@ import {
   appliedThrough,
   emptyKnowledge,
 } from "../sync/knowledge_state.ts";
-import { applyRemoteChange } from "../persistence/database.ts";
+import { applyRemoteChange, quarantineRecord } from "../persistence/database.ts";
 import type { Database } from "better-sqlite3";
 // DC-09 full-state snapshot construction/application (M-7 trigger layer).
 import { applySnapshot, buildSnapshot, type Snapshot, type SnapshotEntry } from "./full_state.ts";
@@ -639,8 +639,16 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
       let record: ChangeRecord;
       try {
         record = validateChangeRecord(raw);
-      } catch {
-        // DC-04 §4.3 quarantine path (storage wired in persistence layer)
+      } catch (e) {
+        // DC-04 §4.3: durable quarantine before dropping. Countable and
+        // inspectable; the session keeps going (never blocking).
+        quarantineRecord(deps.db, {
+          reason:
+            "invalid_change_record:" +
+            (e instanceof Error ? e.message.slice(0, 120) : String(e).slice(0, 120)),
+          senderDeviceId: deps.selfDeviceId,
+          rawRecord: raw,
+        });
         continue;
       }
       const outcome = applyRemoteChange(
@@ -716,9 +724,32 @@ async function expectType<T extends SyncMessage["type"]>(
   return msg as Extract<SyncMessage, { type: T }>;
 }
 
-/** Rebuild in-memory knowledge state from persisted tables. */
-export function loadKnowledgeFromDb(_db: Database) {
-  return emptyKnowledge();
+/**
+ * Rebuild in-memory knowledge state from persisted tables (F4 fix):
+ * applied_upto rows restore the contiguous frontiers, pending_changes rows
+ * restore buffered out-of-order seqs. Without this, a restart regenerates an
+ * empty state and re-requests/over-applies records it already holds.
+ */
+export function loadKnowledgeFromDb(db: Database) {
+  const k = emptyKnowledge();
+  const upto = db
+    .prepare(
+      "SELECT producer_device_id AS d, applied_through AS a FROM applied_upto",
+    )
+    .all() as Array<{ d: string; a: number }>;
+  for (const r of upto) k.appliedUpto[r.d] = r.a;
+  const pend = db
+    .prepare("SELECT device_id AS d, local_seq AS s FROM pending_changes")
+    .all() as Array<{ d: string; s: number }>;
+  for (const r of pend) {
+    let set = k.pending.get(r.d);
+    if (!set) {
+      set = new Set<number>();
+      k.pending.set(r.d, set);
+    }
+    set.add(r.s);
+  }
+  return k;
 }
 
 /** Fallback per-peer trigger key when no explicit peer id is configured. */

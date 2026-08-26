@@ -95,12 +95,38 @@ export function buildSnapshot(
     )
     .all();
 
+  // Calendars are semantic state too (DC-09 §4): a receiver whose
+  // applied_upto advances past a peer's calendar bootstrap record must be able
+  // to materialize it, else later incremental pulls classify as duplicate and
+  // the row can never land.
+  const calendars = db
+    .prepare<[], Record<string, unknown>>(
+      "SELECT * FROM calendars ORDER BY calendar_id ASC",
+    )
+    .all();
+
   const buffer: SnapshotEntry[] = [];
   const flush = () => {
     if (buffer.length === 0) return;
     emit({ snapshot_clock, entities: [...buffer], tombstones: [] });
     buffer.length = 0;
   };
+
+  for (const c of calendars) {
+    const entityId = String(c.calendar_id);
+    const version = localVersionClock(db, entityId);
+    const winner = latestProducer(db, entityId);
+    if (winner === undefined) continue;
+    buffer.push({
+      entity_id: entityId,
+      entity_type: "calendar",
+      data: JSON.stringify(c),
+      producer_device_id: winner.device_id,
+      producer_seq: winner.local_seq,
+      causality_clock: version,
+    });
+    if (buffer.length >= batchSize) flush();
+  }
 
   for (const e of events) {
     const entityId = e.event_id;
@@ -201,7 +227,6 @@ export function applySnapshot(
         result.survivedLocal++;
         continue; // local survives; next anti-entropy round reconciles
       }
-
       db.prepare(
         `INSERT INTO temp.stage_entities (entity_id, entity_type, data) VALUES (?, ?, ?)
          ON CONFLICT(entity_id) DO UPDATE SET data = excluded.data`,
@@ -230,6 +255,28 @@ export function applySnapshot(
         utc_start_ms=excluded.utc_start_ms, utc_end_ms=excluded.utc_end_ms,
         updated_hlc=excluded.updated_hlc`);
 
+    const upsertCalendar = db.prepare(`
+      INSERT INTO calendars (calendar_id, title, color, created_hlc, updated_hlc)
+      VALUES (@calendar_id, @title, @color, @created_hlc, @updated_hlc)
+      ON CONFLICT(calendar_id) DO UPDATE SET
+        title=excluded.title, color=excluded.color,
+        updated_hlc=MAX(calendars.updated_hlc, excluded.updated_hlc)`);
+
+    for (const s of staged) {
+      if (s.entity_type === "calendar") {
+        const data = JSON.parse(s.data) as {
+          calendar_id: string; title: string | null;
+          color: string | null; created_hlc: number; updated_hlc: number;
+        };
+        upsertCalendar.run({
+          calendar_id: data.calendar_id,
+          title: data.title ?? "",
+          color: data.color ?? null,
+          created_hlc: data.created_hlc ?? 0,
+          updated_hlc: data.updated_hlc ?? 0,
+        });
+      }
+    }
     for (const s of staged) {
       if (s.entity_type === "event") {
         const data = JSON.parse(s.data);
@@ -288,7 +335,16 @@ export function applySnapshot(
         d,
         Math.max(current, s),
       );
-      // mirror into in-memory knowledge
+      // F3 fix: the snapshot frontier covers seqs <= s; any DURABLE pending
+      // rows at or below it are zombies (in-memory pending was already
+      // dropped by advanceAppliedIfContiguous — delete their persisted twins
+      // so they neither leak into post-restart knowledge nor re-drain).
+      db.prepare(
+        "DELETE FROM pending_changes WHERE device_id = ? AND local_seq <= ?",
+      ).run(d, Math.max(current, s));
+      // Mirror the durable advance into in-memory knowledge (DC-06 §3.4).
+      // The Math.max write above is the single durable persistence point —
+      // never overwritten by raw `s`, so applied_upto is monotone.
       advanceAppliedIfContiguous(knowledge, d, s);
     }
 

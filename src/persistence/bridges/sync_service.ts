@@ -14,6 +14,23 @@ import {
   eventFields,
 } from "./event_core.ts";
 
+/** Existing non-schedule fields of an event row ("" when absent). */
+function existingText(db: Database, eventId: string, col: string): string {
+  const row = db
+    .prepare(`SELECT title, description FROM events WHERE event_id = ?`)
+    .get(eventId) as { title: string; description: string } | undefined;
+  void col;
+  if (!row) return "";
+  return col === "title" ? row.title : row.description;
+}
+
+/** True when the event row exists locally. */
+function eventRowExists(db: Database, eventId: string): boolean {
+  return !!db
+    .prepare(`SELECT 1 FROM events WHERE event_id = ?`)
+    .get(eventId);
+}
+
 /**
  * Entity mutation for applied remote changes. Mirrors EventCore's own row
  * writes: an event entity payload {value: CalendarEvent} upserts the row;
@@ -29,6 +46,55 @@ export function makeEntityMutator(): (
 
     if (record.operation === "remove") {
       db.prepare("DELETE FROM events WHERE event_id = ?").run(record.entity_id);
+      return;
+    }
+
+    // Field-level change (DC-01 §2 / EventCore.updateEvent groups):
+    //   payload.value is a SCALAR for 'title' | 'description',
+    //   an object {startMs,endMs,allDay} for 'schedule',
+    //   or the full event object for field_path 'event'.
+    if (record.field_path === "title") {
+      if (typeof record.payload.value !== "string") return;
+      db.prepare(
+        "UPDATE events SET title = ?, updated_hlc = ? WHERE event_id = ?",
+      ).run(record.payload.value, record.hlc_timestamp, record.entity_id);
+      return;
+    }
+    if (record.field_path === "description") {
+      if (typeof record.payload.value !== "string") return;
+      db.prepare(
+        "UPDATE events SET description = ?, updated_hlc = ? WHERE event_id = ?",
+      ).run(record.payload.value, record.hlc_timestamp, record.entity_id);
+      return;
+    }
+    if (record.field_path === "schedule") {
+      const v = record.payload.value as
+        | { startMs?: unknown; endMs?: unknown; allDay?: unknown }
+        | undefined;
+      if (
+        !v ||
+        typeof v.startMs !== "number" ||
+        typeof v.endMs !== "number"
+      )
+        return;
+      // Regression fix (allDay-flip crash): derive ALL schema columns
+      // (date/wall/tz + utc) consistently via insertEventRow's derivation.
+      // The old UPDATE touched only utc_* and all_day, violating the schema
+      // CHECK whenever allDay flipped while date/wall columns were non-null.
+      if (!eventRowExists(db, record.entity_id)) return; // unknown entity: ignore
+      insertEventRow(
+        db,
+        {
+          id: record.entity_id,
+          title: existingText(db, record.entity_id, "title"),
+          description: existingText(db, record.entity_id, "description"),
+          startMs: v.startMs,
+          endMs: Math.max(v.endMs, v.startMs),
+          allDay: v.allDay === true,
+        },
+        record.hlc_timestamp,
+        true, // upsert
+      );
       return;
     }
 

@@ -26,6 +26,7 @@ import {
   SYNC_DEFAULT_PORT,
   type InboundSession,
 } from "../../network/sync_runtime.ts";
+import type { DeviceIdentity } from "../../security/identity.ts";
 import {
   createPairingOffer,
   acceptPairingPayload,
@@ -51,11 +52,15 @@ class SyncManager {
 
   constructor(
     private readonly core: EventCore,
+    /** Pre-loaded identity; must be the SAME one EventCore was built with. */
+    identity?: DeviceIdentity,
     dataDir?: string,
   ) {
-    this.identity = loadOrCreateIdentity(
-      dataDir ?? core.dbPath.replace(/[/\\][^/\\]+$/, "") ?? ".",
-    );
+    this.identity =
+      identity ??
+      loadOrCreateIdentity(
+        dataDir ?? core.dbPath.replace(/[/\\][^/\\]+$/, "") ?? ".",
+      );
   }
 
   get deviceId(): string {
@@ -235,8 +240,16 @@ function main(): void {
     console.error("tide-sidecar: TIDE_DB_PATH is required");
     process.exit(2);
   }
-  const core = new EventCore(dbPath);
-  const sync = new SyncManager(core, process.env.TIDE_DATA_DIR);
+  // F1 fix (identity split): construct EventCore WITH the persisted Ed25519
+  // deviceId so domain records, the sync engine, and the pairing identity all
+  // share ONE producer id. The marker-file fallback in EventCore is never
+  // reached here — a single installation can no longer split identities.
+  const syncIdentity = loadOrCreateIdentity(
+    process.env.TIDE_DATA_DIR ??
+      dbPath.replace(/[/\\][^/\\]+$/, "") ?? ".",
+  );
+  const core = new EventCore(dbPath, syncIdentity.deviceId);
+  const sync = new SyncManager(core, syncIdentity);
   const dispatch = makeDispatcher(core);
   const syncDispatch = makeSyncDispatcher(sync, core);
   const combined: Dispatcher = (op, args) =>

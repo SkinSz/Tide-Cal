@@ -98,10 +98,12 @@ export class EventCore {
   private readonly deviceId: string;
   private readonly hlc = new HlcTicker();
 
-  constructor(dbPath: string) {
+  constructor(dbPath: string, deviceId?: string) {
     this.dbPath = dbPath;
     this.db = openDatabase({ path: dbPath });
-    this.deviceId = loadOrCreateDeviceId(dbPath);
+    // Explicit id keeps one device = ONE identity across core + sync engine;
+    // the marker-file fallback stays for legacy/standalone constructions.
+    this.deviceId = deviceId ?? loadOrCreateDeviceId(dbPath);
     this.ensureDefaultCalendar();
   }
 
@@ -292,38 +294,121 @@ export function insertEventRow(
   hlc: number,
   upsert = false,
 ): void {
-  const sql = upsert
-    ? `INSERT INTO events (event_id, calendar_id, title, description, all_day,
-           start_date, end_date, start_wall, end_wall, tz_id,
-           utc_start_ms, utc_end_ms, created_hlc, updated_hlc)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(event_id) DO UPDATE SET
-           title = excluded.title, description = excluded.description,
-           all_day = excluded.all_day, start_date = excluded.start_date,
-           end_date = excluded.end_date, start_wall = excluded.start_wall,
-           end_wall = excluded.end_wall, utc_start_ms = excluded.utc_start_ms,
-           utc_end_ms = excluded.utc_end_ms, updated_hlc = excluded.updated_hlc`
-    : `INSERT INTO events (event_id, calendar_id, title, description, all_day,
-           start_date, end_date, start_wall, end_wall, tz_id,
-           utc_start_ms, utc_end_ms, created_hlc, updated_hlc)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+  const derived = derivedScheduleColumns(e);
+  if (upsert) {
+    // NOTE: INSERT ... ON CONFLICT DO UPDATE is NOT usable here — SQLite
+    // evaluates table CHECK constraints during the INSERT phase, BEFORE the
+    // conflict branch runs, so flipping all_day on an existing row (timed ->
+    // all-day or the reverse) fails the CHECK no matter what values the
+    // UPDATE would write. All-schedule-column UPDATEs are instead routed
+    // through updateEventRowDerived / upsertEventRow.
+    const exists = !!db
+      .prepare("SELECT 1 FROM events WHERE event_id = ?")
+      .get(e.id);
+    if (!exists) {
+      insertNewEventRow(db, e, hlc, derived);
+    } else {
+      updateEventRowDerived(db, e.id, e, hlc, derived);
+    }
+    return;
+  }
+  insertNewEventRow(db, e, hlc, derived);
+}
 
-  db.prepare(sql).run(
+/** Schedule-derived columns exactly as the schema CHECK requires them. */
+export function derivedScheduleColumns(e: CalendarEvent): {
+  all_day: number;
+  start_date: string | null;
+  end_date: string | null;
+  start_wall: string | null;
+  end_wall: string | null;
+  tz_id: string | null;
+  utc_start_ms: number;
+  utc_end_ms: number;
+} {
+  return {
+    all_day: e.allDay ? 1 : 0,
+    start_date: e.allDay ? localDateStr(e.startMs) : null,
+    end_date: e.allDay ? localDateStr(Math.max(e.endMs, e.startMs)) : null,
+    start_wall: e.allDay ? null : localWallStr(e.startMs),
+    end_wall: e.allDay ? null : localWallStr(e.endMs),
+    tz_id: e.allDay ? null : timezoneId(),
+    utc_start_ms: e.startMs,
+    utc_end_ms: Math.max(e.endMs, e.startMs),
+  };
+}
+
+function insertNewEventRow(
+  db: ReturnType<typeof openDatabase>,
+  e: CalendarEvent,
+  hlc: number,
+  d: ReturnType<typeof derivedScheduleColumns>,
+): void {
+  db.prepare(`INSERT INTO events (event_id, calendar_id, title, description,
+      all_day, start_date, end_date, start_wall, end_wall, tz_id,
+      utc_start_ms, utc_end_ms, created_hlc, updated_hlc)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
     e.id,
     DEFAULT_CALENDAR_ID,
     e.title,
     e.description,
-    e.allDay ? 1 : 0,
-    e.allDay ? localDateStr(e.startMs) : null,
-    e.allDay ? localDateStr(Math.max(e.endMs, e.startMs)) : null,
-    e.allDay ? null : localWallStr(e.startMs),
-    e.allDay ? null : localWallStr(e.endMs),
-    e.allDay ? null : timezoneId(),
-    e.startMs,
-    Math.max(e.endMs, e.startMs),
+    d.all_day,
+    d.start_date,
+    d.end_date,
+    d.start_wall,
+    d.end_wall,
+    d.tz_id,
+    d.utc_start_ms,
+    d.utc_end_ms,
     hlc,
     hlc,
   );
+}
+
+/**
+ * Update ALL schedule-derived columns consistently. Because every column the
+ * CHECK constraint inspects changes in one statement, allDay flips are safe.
+ * Returns rows-affected so callers can detect "unknown event".
+ */
+export function updateEventRowDerived(
+  db: ReturnType<typeof openDatabase>,
+  eventId: string,
+  e: CalendarEvent,
+  hlc: number,
+  d: ReturnType<typeof derivedScheduleColumns>,
+): boolean {
+  const info = db.prepare(`
+    UPDATE events SET title = ?, description = ?, all_day = ?, start_date = ?,
+      end_date = ?, start_wall = ?, end_wall = ?, tz_id = ?,
+      utc_start_ms = ?, utc_end_ms = ?, updated_hlc = ?
+    WHERE event_id = ?`).run(
+    e.title,
+    e.description,
+    d.all_day,
+    d.start_date,
+    d.end_date,
+    d.start_wall,
+    d.end_wall,
+    d.tz_id,
+    d.utc_start_ms,
+    d.utc_end_ms,
+    hlc,
+    eventId,
+  );
+  return info.changes > 0;
+}
+
+/** Insert-or-update with correct column derivation either way. */
+export function upsertEventRow(
+  db: ReturnType<typeof openDatabase>,
+  e: CalendarEvent,
+  hlc: number,
+): void {
+  const derived = derivedScheduleColumns(e);
+  const updated = updateEventRowDerived(db, e.id, e, hlc, derived);
+  if (!updated) {
+    insertNewEventRow(db, e, hlc, derived);
+  }
 }
 
 export function rowToEvent(r: EventRow): CalendarEvent {
