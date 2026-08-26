@@ -210,6 +210,23 @@ dialog menu .spacer { flex: 1; }
 }
 .chip-timed { z-index: 2; }
 
+/* Event dialog: keep layout stable when the time menu opens */
+.conflicts-dlg, .dlg-body { position: relative; }
+#event-dialog { overflow: visible; }
+
+/* Hour-band cells in week view */
+.hour-cell {
+  position: absolute;
+  left: 0;
+  right: 0;
+  z-index: 1;
+  cursor: pointer;
+}
+.hour-cell:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.picked-band {
+  background: color-mix(in srgb, var(--accent) 22%, transparent) !important;
+}
+
 /* Outlook-style time dropdown (inside the event dialog) */
 .time-wrap { position: relative; display: flex; align-items: center; gap: 4px; }
 .time-wrap input[type="time"] { flex: 1; margin-top: 4px; }
@@ -223,7 +240,7 @@ dialog menu .spacer { flex: 1; }
   position: absolute;
   z-index: 50;
   width: 110px;
-  max-height: min(420px, calc(100% - 8px));
+  max-height: 380px;
   overflow-y: auto;
   background: var(--panel);
   border: 1px solid var(--border);
@@ -247,19 +264,3 @@ dialog menu .spacer { flex: 1; }
 .time-option.picked { color: var(--accent); font-weight: 600; }
 
 /* Clicked-hour highlight in week view */
-.week-col.hour-clicked::after {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  height: calc(100% / 24 * 1);
-  top: var(--clicked-top, 0%);
-  background: color-mix(in srgb, var(--accent) 18%, transparent);
-  pointer-events: none;
-}
-
-.time-option.disabled {
-  color: var(--muted);
-  opacity: 0.4;
-  cursor: not-allowed;
-}

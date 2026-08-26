@@ -78,18 +78,17 @@ function openTimeMenu(inputId: string): void {
     const opt = document.createElement("button");
     opt.type = "button";
     opt.className = "time-option" + (inp.value === slot ? " picked" : "");
-    // For the End field, slots earlier than Start are a logical break —
-    // disable them instead of letting an impossible range be picked.
+    opt.textContent = slot;
+    // For the End field, slots earlier than Start are omitted entirely
+    // (owner preference: disappear rather than appear disabled).
     if (inputId === "ev-end-t") {
       const startVal = field<HTMLInputElement>("ev-start-t").value;
-      if (startVal && slot < startVal) opt.classList.add("disabled");
+      if (startVal && slot <= startVal) continue;
     }
-    if (!opt.classList.contains("disabled")) {
-      opt.addEventListener("click", () => {
-        inp.value = slot;
-        menu.remove();
-      });
-    }
+    opt.addEventListener("click", () => {
+      inp.value = slot;
+      menu.remove();
+    });
     menu.appendChild(opt);
   }
   dlg().appendChild(menu);
@@ -188,14 +187,12 @@ export function initDialog(): void {
     openFor(new Date(), (e as CustomEvent<CalendarEvent>).detail);
   });
 
-  // Week view: click on an empty hour band -> new event pre-seeded with that
-  // day and hour (ends +1h via defaults).
-  document.addEventListener("tide:hourclick", (e) => {
-    const { date, hour } = (
-      e as CustomEvent<{ date: string; hour: number }>
-    ).detail;
-    const d = new Date(date);
-    d.setHours(hour, 0, 0, 0);
+  // Week view: double-click an empty hour band -> new event pre-seeded with
+  // that day+hour. Single click just selects/highlights (see calendar.ts).
+  document.addEventListener("tide:neweventat", (e) => {
+    const d = new Date(
+      (e as CustomEvent<string>).detail,
+    );
     openFor(d);
   });
 

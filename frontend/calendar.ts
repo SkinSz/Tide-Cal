@@ -330,23 +330,43 @@ function weekDayColumn(
   }
   void onEventClick;
 
-  // Click on an empty hour band: select that day AND pre-seed a new event
-  // starting at that hour (30-min default via dialog defaults).
+  // Real hour cells overlaying the column: hover shows the band, single
+  // click selects it (highlight), double-click creates an event there.
+  for (let h = 0; h < 24; h++) {
+    const band = document.createElement("div");
+    band.className = "hour-cell";
+    if (h === clickedHour) band.classList.add("picked-band");
+    band.dataset.hour = String(h);
+    const startMin = h * 60;
+    band.style.top = `${(startMin / MINUTES_PER_DAY) * 100}%`;
+    band.style.height = `${(60 / MINUTES_PER_DAY) * 100}%`;
+    band.title = `${pad(h)}:00 – ${pad((h + 1) % 24)}:00 (double-click: new appointment)`;
+    col.appendChild(band);
+  }
+
+  // Single click on empty space: select day + highlight that hour band.
   col.addEventListener("click", (e) => {
     const target = e.target as HTMLElement;
     if (target.closest(".chip")) return; // chip handler owns that click
-    const rect = col.getBoundingClientRect();
-    const frac = (e.clientY - rect.top) / rect.height;
-    clickedHour = Math.min(Math.floor(frac * 24), 23);
     selectedDate = startOfDay(cell.date);
+    const cellDiv = target.closest(".hour-cell") as HTMLElement | null;
+    clickedHour = cellDiv ? Number(cellDiv.dataset.hour) : null;
     render();
     document.dispatchEvent(
       new CustomEvent("tide:dayclick", { detail: cell.date.toISOString() }),
     );
+  });
+  // Double click: open the new-event dialog pre-seeded with day + hour.
+  col.addEventListener("dblclick", (e) => {
+    const target = e.target as HTMLElement;
+    if (target.closest(".chip")) return;
+    const cellDiv = target.closest(".hour-cell") as HTMLElement | null;
+    const hour = cellDiv ? Number(cellDiv.dataset.hour) : new Date().getHours();
+    selectedDate = startOfDay(cell.date);
+    const d = new Date(cell.date);
+    d.setHours(hour, 0, 0, 0);
     document.dispatchEvent(
-      new CustomEvent("tide:hourclick", {
-        detail: { date: cell.date.toISOString(), hour: clickedHour },
-      }),
+      new CustomEvent("tide:neweventat", { detail: d.toISOString() }),
     );
   });
   return col;
