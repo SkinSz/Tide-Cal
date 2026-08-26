@@ -160,3 +160,7 @@ dialog menu .spacer { flex: 1; }
 }
 .conflict-value.deleted { color: var(--muted); text-decoration: line-through; }
 .conflict-actions { display: flex; gap: 8px; margin-top: 8px; justify-content: flex-end; }
+
+/* Event dialog: day + whole-day + time row */
+#ev-time-row { display: flex; gap: 10px; }
+#ev-time-row label { flex: 1; }
