@@ -8,6 +8,7 @@
     "test": "vitest run"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4",
     "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^24.3.1",
     "mdns-sd": "^0.0.1",
