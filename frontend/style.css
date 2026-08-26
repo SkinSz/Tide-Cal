@@ -167,6 +167,8 @@ dialog menu .spacer { flex: 1; }
 
 /* Week view: time-grid with duration-proportional blocks */
 #calendar-grid.week {
+  /* ruler + 7 day columns (root default is 7 cols total -> Sunday clipped) */
+  grid-template-columns: 44px repeat(7, 1fr);
   grid-template-rows: auto auto 1fr;
   height: 100%;
 }
