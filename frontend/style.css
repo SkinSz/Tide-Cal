@@ -35,7 +35,7 @@ body {
 #toolbar .spacer { flex: 1; }
 #cal-label { font-weight: 600; min-width: 170px; }
 .nav { display: flex; gap: 2px; }
-.modes { display: flex; gap: 2px; }
+.seg { display: flex; gap: 2px; }
 
 button {
   background: transparent;
@@ -49,7 +49,7 @@ button {
 button:hover { background: var(--accent-soft); }
 button.primary { background: var(--accent); border-color: var(--accent); color: #08131c; font-weight: 600; }
 button.danger { color: var(--danger); border-color: var(--danger); }
-.modes button.active { background: var(--accent-soft); border-color: var(--accent); }
+.seg button.active { background: var(--accent-soft); border-color: var(--accent); }
 
 /* Grid */
 main { flex: 1; overflow: auto; padding: 8px; }
@@ -123,5 +123,5 @@ dialog textarea {
   font: inherit;
   font-size: 0.85rem;
 }
-dialog footer { display: flex; gap: 8px; margin-top: 16px; }
-dialog footer .spacer { flex: 1; }
+dialog menu { display: flex; gap: 8px; margin: 16px 0 0; padding: 0; }
+dialog menu .spacer { flex: 1; }

@@ -7,37 +7,41 @@
     <link rel="stylesheet" href="./style.css" />
   </head>
   <body>
-    <div id="app">
-      <header id="toolbar">
-        <button id="btn-prev" title="Previous">‹</button>
-        <button id="btn-today">Today</button>
-        <button id="btn-next" title="Next">›</button>
-        <h1 id="view-label"></h1>
-        <span class="spacer"></span>
-        <div class="seg">
-          <button id="btn-month" class="active">Month</button>
-          <button id="btn-week">Week</button>
-        </div>
-      </header>
-      <main id="calendar"></main>
-    </div>
+    <header id="toolbar">
+      <button id="btn-prev" title="Previous">‹</button>
+      <button id="btn-today">Today</button>
+      <button id="btn-next" title="Next">›</button>
+      <h1 id="cal-label"></h1>
+      <span class="spacer"></span>
+      <button id="btn-new">+ New event</button>
+      <div class="seg">
+        <button id="btn-month">Month</button>
+        <button id="btn-week">Week</button>
+      </div>
+    </header>
+
+    <main id="calendar-grid" aria-label="Calendar"></main>
 
     <dialog id="event-dialog">
-      <form method="dialog" id="event-form">
-        <h2 id="dlg-title">New event</h2>
-        <label>Title <input name="title" required maxlength="200" /></label>
-        <label>Description <textarea name="description" rows="2"></textarea></label>
-        <label>All day <input type="checkbox" name="all_day" /></label>
-        <label>Start <input type="datetime-local" name="start" required /></label>
-        <label>End <input type="datetime-local" name="end" required /></label>
-        <p id="dlg-error" class="error hidden"></p>
+      <div class="dlg-body">
+        <h2 id="dialog-title">New event</h2>
+        <label>Title
+          <input id="ev-title" required maxlength="200" />
+        </label>
+        <label>Description
+          <textarea id="ev-desc" rows="2"></textarea>
+        </label>
+        <label class="check"><input type="checkbox" id="ev-allday" /> All day</label>
+        <label>Start <input type="datetime-local" id="ev-start" required /></label>
+        <label>End <input type="datetime-local" id="ev-end" required /></label>
+        <input type="hidden" id="ev-id" />
         <menu>
-          <button type="button" id="btn-delete" class="danger hidden">Delete</button>
+          <button type="button" id="ev-delete" class="danger" hidden>Delete</button>
           <span class="spacer"></span>
-          <button type="button" id="btn-cancel">Cancel</button>
-          <button type="submit" id="btn-save" value="save">Save</button>
+          <button type="button" id="ev-cancel">Cancel</button>
+          <button type="button" id="ev-save" class="primary">Save</button>
         </menu>
-      </form>
+      </div>
     </dialog>
 
     <script type="module" src="./main.ts"></script>
