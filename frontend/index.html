@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Tide</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header id="toolbar">
+        <button id="btn-prev" title="Previous">‹</button>
+        <button id="btn-today">Today</button>
+        <button id="btn-next" title="Next">›</button>
+        <h1 id="view-label"></h1>
+        <span class="spacer"></span>
+        <div class="seg">
+          <button id="btn-month" class="active">Month</button>
+          <button id="btn-week">Week</button>
+        </div>
+      </header>
+      <main id="calendar"></main>
+    </div>
+
+    <dialog id="event-dialog">
+      <form method="dialog" id="event-form">
+        <h2 id="dlg-title">New event</h2>
+        <label>Title <input name="title" required maxlength="200" /></label>
+        <label>Description <textarea name="description" rows="2"></textarea></label>
+        <label>All day <input type="checkbox" name="all_day" /></label>
+        <label>Start <input type="datetime-local" name="start" required /></label>
+        <label>End <input type="datetime-local" name="end" required /></label>
+        <p id="dlg-error" class="error hidden"></p>
+        <menu>
+          <button type="button" id="btn-delete" class="danger hidden">Delete</button>
+          <span class="spacer"></span>
+          <button type="button" id="btn-cancel">Cancel</button>
+          <button type="submit" id="btn-save" value="save">Save</button>
+        </menu>
+      </form>
+    </dialog>
+
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>
