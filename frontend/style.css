@@ -199,3 +199,13 @@ dialog menu .spacer { flex: 1; }
   z-index: 1;
 }
 .lane-chip { margin-bottom: 3px; }
+
+/* Hour guide lines through the day columns (week view) */
+.hour-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+  pointer-events: none;
+}
+.chip-timed { z-index: 2; }

@@ -220,6 +220,7 @@ export async function render(): Promise<void> {
         weekDayColumn(cell, events, onEventClick),
       );
     }
+    addHourLines();
   } else {
     for (const cell of cells) {
       root.appendChild(dayColumn(cell, events, onEventClick));
@@ -248,10 +249,22 @@ function renderHourRuler(root: HTMLElement): void {
   for (let h = 0; h < 24; h++) {
     const lbl = document.createElement("div");
     lbl.className = "hour-label";
-    lbl.textContent = h % 3 === 0 ? fmtHour(h) : "";
+    lbl.textContent = fmtHour(h);
     ruler.appendChild(lbl);
   }
   root.appendChild(ruler);
+}
+
+/** Horizontal guide lines across all day columns (call after columns mount). */
+function addHourLines(): void {
+  for (let h = 0; h < 24; h++) {
+    const line = document.createElement("div");
+    line.className = "hour-line";
+    line.style.top = `${(h / 24) * 100}%`;
+    document
+      .querySelectorAll<HTMLElement>("#calendar-grid .week-col")
+      .forEach((col) => col.appendChild(line.cloneNode(true)));
+  }
 }
 
 function minutesOfDay(d: Date): number {

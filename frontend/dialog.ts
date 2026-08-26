@@ -48,6 +48,15 @@ function syncTimeVisibility(): void {
   row.style.display = wholeDay() ? "none" : "";
 }
 
+/**
+ * Commit the native date picker: WebKit/GTK leaves its popover open until
+ * focus leaves the field, so "OK" (and Enter on the field) blurs it to close.
+ */
+function commitDateField(): void {
+  const inp = field<HTMLInputElement>("ev-date");
+  inp.blur();
+}
+
 function openFor(date: Date, existing?: CalendarEvent): void {
   const d = new Date(date);
 
@@ -136,6 +145,13 @@ export function initDialog(): void {
   });
 
   field("ev-allday").addEventListener("change", syncTimeVisibility);
+  document.getElementById("ev-date-ok")?.addEventListener("click", commitDateField);
+  field("ev-date").addEventListener("keydown", (e) => {
+    if ((e as KeyboardEvent).key === "Enter") {
+      e.preventDefault();
+      commitDateField();
+    }
+  });
 
   document
     .getElementById("ev-save")
