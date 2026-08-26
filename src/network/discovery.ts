@@ -17,7 +17,6 @@
 // calendar data are forbidden in any announced field.
 
 import { createHash, randomBytes } from "node:crypto";
-import { createRequire } from "node:module";
 
 /** DC-11 §2.1 — fixed service type; contains no version/platform/user/host info. */
 export const TIDE_SERVICE_TYPE = "_tide-sync._tcp.local.";
@@ -245,9 +244,15 @@ export function classifyDiscovered(
 }
 
 // ---------------------------------------------------------------------------
-// Thin layer 2: mDNS adapter (platform specifics stay behind the interface,
-// DC-11 §7 / INVARIANT 12). No hard runtime dependency on any multicast
-// library: if none loads, NoopAdapter logs and discovery is simply inert.
+// Thin layer 2: mDNS adapter. REAL mDNS lives in Rust: src-tauri/src/discovery.rs
+// (mdns-sd crate, cargo feature `mdns`), exposed as Tauri commands per DC-11
+// §7. This seam stays so non-Tauri/test contexts have a defined interface.
+//
+// HONEST FALLBACK (review R3 M-1): when the Rust backend is not wired in,
+// createMdnsAdapter returns NoopMdnsAdapter and SAYS SO — it never logs
+// "backend available" or "would register" as if real multicast happened.
+// The npm package "mdns-sd@0.0.1" is an unrelated placeholder with no JS API
+// and has been removed from devDependencies; do not re-add it.
 // ---------------------------------------------------------------------------
 
 export interface DiscoveredService {
@@ -288,31 +293,14 @@ export class NoopMdnsAdapter implements MdnsAdapter {
   }
 }
 
-interface LoadedMdnsLib {
-  createService?: unknown;
-}
-
 /**
- * Try to load an mdns-sd-style library WITHOUT making it a hard dependency:
- * resolution failure or load failure falls back to NoopAdapter (task/DC-11
- * §6 semantics: discovery optional, offline-first safe).
+ * Adapter factory. There is intentionally NO JavaScript multicast backend:
+ * real mDNS is implemented in Rust (src-tauri/src/discovery.rs, `mdns` cargo
+ * feature) and reaches this layer through Tauri command registration. Until
+ * that wiring lands, every caller gets an explicit NoopMdnsAdapter whose log
+ * messages state that discovery is unavailable — never a misleading success.
  */
 export function createMdnsAdapter(log: MdnsLogger = defaultLogger): MdnsAdapter {
-  try {
-     
-    const require = createRequire(import.meta.url);
-    const lib = require("mdns-sd") as LoadedMdnsLib;
-    if (typeof lib.createService !== "function") {
-      log("mdns-sd loaded but exposes no usable API; using noop adapter");
-      return new NoopMdnsAdapter(log);
-    }
-    // The published mdns-sd package currently ships no usable build output;
-    // guard construction so a broken backend can never crash the caller.
-    log("multicast backend available; real adapter path enabled");
-    return new NoopMdnsAdapter(log);
-  } catch (err) {
-    const reason = err instanceof Error ? err.message : String(err);
-    log(`no multicast library available (${reason}); using noop adapter`);
-    return new NoopMdnsAdapter(log);
-  }
+  log("discovery unavailable in this build: real mDNS requires the Tauri Rust backend (src-tauri/src/discovery.rs, --features mdns); using inert noop adapter");
+  return new NoopMdnsAdapter(log);
 }
