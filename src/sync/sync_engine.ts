@@ -16,6 +16,14 @@ import {
 } from "../sync/knowledge_state.ts";
 import { applyRemoteChange } from "../persistence/database.ts";
 import type { Database } from "better-sqlite3";
+// DC-09 full-state snapshot construction/application (M-7 trigger layer).
+import { applySnapshot, buildSnapshot, type Snapshot, type SnapshotEntry } from "./full_state.ts";
+import {
+  OfferDedup,
+  TriggerStateTracker,
+  offerSessionKey,
+  resolveOfferRace,
+} from "./full_state_triggers.ts";
 
 export type SyncMessage =
   | { v: 1; type: "HELLO"; device_clock: VC }
@@ -30,7 +38,31 @@ export type SyncMessage =
       changes: ChangeRecord[];
       remaining_ranges?: Array<{ device_id: string; lo: number; hi: number }>;
     }
-  | { v: 1; type: "CHANGES_ACK"; applied_upto: Record<string, number> };
+  | { v: 1; type: "CHANGES_ACK"; applied_upto: Record<string, number> }
+  // --- DC-08 §3.6 full-state handshake carriers (DC-09 owns WHEN) ---
+  | {
+      v: 1;
+      type: "FULL_STATE_OFFER";
+      snapshot_clock: VC;
+      snapshot_size_hint_bytes?: number;
+      /** DC-09 §3.2: set on user-initiated offers (diagnostics only). */
+      user_initiated?: boolean;
+      /**
+       * Engine extension: sender device id so the receiver can run the
+       * deterministic §7.3 race resolution without transport-level context.
+       */
+      sender_device_id?: string;
+    }
+  | { v: 1; type: "FULL_STATE_ACCEPT"; offer_snapshot_clock_digest?: string }
+  | {
+      v: 1;
+      type: "FULL_STATE_SNAPSHOT";
+      snapshot_clock: VC;
+      entities: SnapshotEntry[];
+      tombstones?: Snapshot["tombstones"];
+      /** Engine extension: marks the last message of the snapshot stream. */
+      final?: boolean;
+    };
 
 export interface SyncTransport {
   /** Send one message to the peer; resolves when handed off. */
@@ -46,6 +78,13 @@ export interface SyncEngineDeps {
   /** Entity mutation for an applied change (domain layer hook). */
   mutateEntity?: (db: Database, record: ChangeRecord) => void;
   maxBatchRecords?: number;
+  /**
+   * DC-09 §3 trigger bookkeeping (streaks persist across sessions when
+   * provided); a fresh per-engine tracker is used otherwise.
+   */
+  triggers?: TriggerStateTracker;
+  /** Stable identity of the connected peer, when known at session level. */
+  peerDeviceId?: string;
 }
 
 export interface SyncEngine {
@@ -70,6 +109,10 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
   const knowledge = deps.knowledge ?? loadKnowledgeFromDb(deps.db);
   const holder: KnowledgeHolder = { knowledge };
   const maxBatch = deps.maxBatchRecords ?? 256;
+  // DC-09 §3 trigger bookkeeping; streaks are per peer/direction. Session
+  // start resets the Trigger-A streak (§3.1); dedup is per-session (§3.5).
+  const triggers = deps.triggers ?? new TriggerStateTracker();
+  let sessionDedup = new OfferDedup();
 
   /**
    * H-4: one cached pending receive per session/transport. Calling this
@@ -114,6 +157,9 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
       receivedBuffered: 0,
       receivedDuplicate: 0,
     };
+    // DC-09 §3.5: offers_made_this_session is in-memory only; a new session
+    // gets fresh dedup state.
+    sessionDedup = new OfferDedup();
 
     // --- HELLO exchange ---
     const hello: SyncMessage = {
@@ -126,6 +172,12 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
 
     const peerHello = await expectType(nextMessage(transport), "HELLO");
     advancePeerKnowledge(peerHello.device_clock);
+    // Stable key for per-peer trigger state (§3.1: streaks are per-peer,
+    // per-direction). Prefer the configured peer id; fall back to the
+    // advertised clock's producer set.
+    const peerKey =
+      deps.peerDeviceId ?? derivePeerKey(peerHello.device_clock);
+    triggers.resetStreak(peerKey); // §3.1: streak resets at session start
 
     // --- pull what we need ---
     let ranges = neededRanges(holder.knowledge, peerHello.device_clock);
@@ -142,7 +194,7 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
       pullIterations++;
       await transport.send({ v: 1, type: "CHANGES_REQUEST", ranges });
       stats.sent++;
-      const batch = await expectBatchOrPeerRequest(nextMessage(transport), transport);
+      const batch = await expectBatchOrPeerRequest(nextMessage(transport), transport, stats);
       if (batch === null) break; // peer sent a request instead; serve loop follows
       applyBatch(batch.changes, stats);
       const before = JSON.stringify(ranges);
@@ -151,8 +203,21 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
         neededRanges(holder.knowledge, peerHello.device_clock);
       if (JSON.stringify(ranges) === before) {
         gapRetries++; // unservable gap (compacted on peer): DC-09 Trigger A
+        triggers.recordGapRound(peerKey);
       } else {
         gapRetries = 0;
+        triggers.resetStreak(peerKey); // servable outcome resets (§3.1)
+      }
+    }
+
+    // --- DC-09 §3 Trigger A: persistent unservable gaps -> FULL_STATE_OFFER
+    // (the once-per-session-per-direction dedup of §3.5 applies) ---
+    if (gapRetries > 0 && triggers.shouldOfferTriggerA(peerKey)) {
+      const key = offerSessionKey(deps.selfDeviceId, peerKey, "OUTGOING");
+      if (sessionDedup.shouldOffer(key, "GAP_ROUNDS")) {
+        sessionDedup.markOffered(key);
+        await emitFullStateOffer(transport, stats);
+        await driveFullStateOffer(nextMessage(transport), transport, stats);
       }
     }
 
@@ -204,6 +269,10 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
         }
       } else if (msg.type === "CHANGES_BATCH") {
         applyBatch(msg.changes, stats);
+      } else if (msg.type === "FULL_STATE_OFFER") {
+        await handleIncomingOffer(msg, () => nextMessage(transport), transport, stats);
+      } else if (msg.type === "FULL_STATE_SNAPSHOT") {
+        applyIncomingSnapshot(msg, stats);
       } else if (msg.type === "CHANGES_ACK") {
         mergeAckIntoLastKnownClock(msg.applied_upto);
       } else if (msg.type === "HELLO") {
@@ -216,13 +285,14 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
   async function expectBatchOrPeerRequest(
     nextMessage: () => Promise<SyncMessage | null>,
     transport: SyncTransport,
+    stats: SessionStats,
   ): Promise<Extract<SyncMessage, { type: "CHANGES_BATCH" }> | null> {
     const msg = await nextMessage();
     if (msg !== null && msg.type !== "CHANGES_BATCH") {
       // Interleaved peer traffic (e.g., their CHANGES_REQUEST): stash and
       // keep waiting for our batch.
       stashed.push(msg);
-      return expectBatch(nextMessage, transport);
+      return expectBatch(nextMessage, transport, stats);
     }
     if (msg === null) return null;
     return msg;
@@ -237,6 +307,7 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
   async function expectBatch(
     nextMessage: () => Promise<SyncMessage | null>,
     transport: SyncTransport,
+    stats: SessionStats,
   ): Promise<Extract<SyncMessage, { type: "CHANGES_BATCH" }> | null> {
     for (;;) {
       const msg = stashed.length > 0 ? drainStashed() : await nextMessage();
@@ -255,8 +326,163 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
         advancePeerKnowledge(msg.device_clock);
       } else if (msg.type === "CHANGES_ACK") {
         mergeAckIntoLastKnownClock(msg.applied_upto);
+      } else if (msg.type === "FULL_STATE_OFFER") {
+        await handleIncomingOffer(msg, nextMessage, transport, stats);
+      } else if (msg.type === "FULL_STATE_SNAPSHOT") {
+        applyIncomingSnapshot(msg, stats);
       }
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // DC-09 full-state offer/accept/snapshot handling (M-7 trigger layer)
+  // -------------------------------------------------------------------------
+
+  /** Emit a FULL_STATE_OFFER carrying our current device clock (DC-08 §3.6). */
+  async function emitFullStateOffer(
+    transport: SyncTransport,
+    stats: SessionStats,
+    userInitiated = false,
+  ): Promise<void> {
+    await transport.send({
+      v: 1,
+      type: "FULL_STATE_OFFER",
+      snapshot_clock: getDeviceClockDb(),
+      sender_device_id: deps.selfDeviceId,
+      ...(userInitiated ? { user_initiated: true } : {}),
+    });
+    stats.sent++;
+  }
+
+  /**
+   * DC-09 §4/§4.4: stream current semantic state as FULL_STATE_SNAPSHOT
+   * messages under the batch bound; identical snapshot_clock throughout,
+   * `final` marks stream end (no resume tokens in v1).
+   */
+  async function streamFullStateSnapshot(
+    transport: SyncTransport,
+    stats: SessionStats,
+  ): Promise<void> {
+    const chunks: Snapshot[] = [];
+    buildSnapshot(deps.db, (s) => chunks.push(s));
+    if (chunks.length === 0) {
+      chunks.push({ snapshot_clock: getDeviceClockDb(), entities: [], tombstones: [] });
+    }
+    for (let i = 0; i < chunks.length; i++) {
+      const chunkMsg = chunks[i]!;
+      await transport.send({
+        v: 1,
+        type: "FULL_STATE_SNAPSHOT",
+        snapshot_clock: chunkMsg.snapshot_clock,
+        entities: chunkMsg.entities,
+        tombstones: chunkMsg.tombstones,
+        final: i === chunks.length - 1,
+      });
+      stats.sent++;
+    }
+  }
+
+  /** DC-09 §5: apply a received snapshot through the transactional pipeline. */
+  function applyIncomingSnapshot(
+    msg: Extract<SyncMessage, { type: "FULL_STATE_SNAPSHOT" }>,
+    stats: SessionStats,
+  ): void {
+    const result = applySnapshot(
+      deps.db,
+      {
+        snapshot_clock: msg.snapshot_clock,
+        entities: msg.entities,
+        tombstones: msg.tombstones ?? [],
+      },
+      holder.knowledge,
+    );
+    stats.receivedApplied += result.appliedEntities;
+  }
+
+  /** Send FULL_STATE_ACCEPT and consume the winner's snapshot stream. */
+  async function acceptOffer(
+    offer: Extract<SyncMessage, { type: "FULL_STATE_OFFER" }>,
+    getNext: () => Promise<SyncMessage | null>,
+    transport: SyncTransport,
+    stats: SessionStats,
+  ): Promise<void> {
+    await transport.send({
+      v: 1,
+      type: "FULL_STATE_ACCEPT",
+      offer_snapshot_clock_digest: JSON.stringify(offer.snapshot_clock),
+    });
+    stats.sent++;
+    await receiveAndApplySnapshots(getNext, stats);
+  }
+
+  /** After ACCEPT was sent (or won race as loser): consume snapshots. */
+  async function receiveAndApplySnapshots(
+    getNext: () => Promise<SyncMessage | null>,
+    stats: SessionStats,
+  ): Promise<void> {
+    for (let poll = 0; poll < 20; poll++) {
+      const msg = await receiveWithTimeout(getNext, 5);
+      if (msg === null) return;
+      if (msg.type === "FULL_STATE_SNAPSHOT") {
+        applyIncomingSnapshot(msg, stats);
+        if (msg.final) return;
+        continue;
+      }
+      stashed.push(msg); // unrelated traffic stays in order for later loops
+    }
+  }
+
+  /**
+   * After emitting our offer: wait briefly for an ACCEPT or a rival offer.
+   * A silent decline/ignore (§7.4) just times out and ends the attempt.
+   */
+  async function driveFullStateOffer(
+    getNext: () => Promise<SyncMessage | null>,
+    transport: SyncTransport,
+    stats: SessionStats,
+  ): Promise<void> {
+    for (let poll = 0; poll < 10; poll++) {
+      const msg = await receiveWithTimeout(getNext, 5);
+      if (msg === null) return;
+      if (msg.type === "FULL_STATE_ACCEPT") {
+        await streamFullStateSnapshot(transport, stats);
+        return;
+      }
+      if (msg.type === "FULL_STATE_OFFER") {
+        if (resolveOfferRace(deps.selfDeviceId, msg.sender_device_id ?? "")) {
+          continue; // §7.3: ours stands; theirs declined silently
+        }
+        await acceptOffer(msg, getNext, transport, stats); // defer to winner
+        return;
+      }
+      stashed.push(msg);
+    }
+  }
+
+  /**
+   * DC-09 §7.3 simultaneous-offer resolution for a RECEIVED offer:
+   * higher device_id wins — proceed with OUR offer (declining theirs
+   * silently); the lower side defers and accepts the winner's snapshot.
+   */
+  async function handleIncomingOffer(
+    offer: Extract<SyncMessage, { type: "FULL_STATE_OFFER" }>,
+    getNext: () => Promise<SyncMessage | null>,
+    transport: SyncTransport,
+    stats: SessionStats,
+  ): Promise<void> {
+    const sender = offer.sender_device_id;
+    if (sender !== undefined && resolveOfferRace(deps.selfDeviceId, sender)) {
+      // Race victory: proceeding with our own offer is mandated by §7.3 and
+      // bypasses session dedup (recorded so later automatic offers dedup).
+      sessionDedup.markOffered(
+        offerSessionKey(deps.selfDeviceId, sender, "OUTGOING"),
+      );
+      await emitFullStateOffer(transport, stats);
+      await driveFullStateOffer(getNext, transport, stats);
+      return;
+    }
+    // Lower device_id defers: accept theirs.
+    await acceptOffer(offer, getNext, transport, stats);
   }
 
   function chunk<T>(arr: T[], size: number): T[][] {
@@ -372,4 +598,10 @@ async function expectType<T extends SyncMessage["type"]>(
 /** Rebuild in-memory knowledge state from persisted tables. */
 export function loadKnowledgeFromDb(_db: Database) {
   return emptyKnowledge();
+}
+
+/** Fallback per-peer trigger key when no explicit peer id is configured. */
+function derivePeerKey(clock: VC): string {
+  const producers = Object.keys(clock).sort();
+  return producers.length > 0 ? producers.join(",") : "unknown";
 }
