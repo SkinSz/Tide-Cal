@@ -78,14 +78,23 @@ function openTimeMenu(inputId: string): void {
     const opt = document.createElement("button");
     opt.type = "button";
     opt.className = "time-option" + (inp.value === slot ? " picked" : "");
-    opt.textContent = slot;
-    opt.addEventListener("click", () => {
-      inp.value = slot;
-      menu.remove();
-    });
+    // For the End field, slots earlier than Start are a logical break —
+    // disable them instead of letting an impossible range be picked.
+    if (inputId === "ev-end-t") {
+      const startVal = field<HTMLInputElement>("ev-start-t").value;
+      if (startVal && slot < startVal) opt.classList.add("disabled");
+    }
+    if (!opt.classList.contains("disabled")) {
+      opt.addEventListener("click", () => {
+        inp.value = slot;
+        menu.remove();
+      });
+    }
     menu.appendChild(opt);
   }
   dlg().appendChild(menu);
+  // Open scrolled so the currently selected value is visible.
+  menu.querySelector(".picked")?.scrollIntoView({ block: "center" });
 }
 
 function closeTimeMenus(): void {

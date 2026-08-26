@@ -222,8 +222,8 @@ dialog menu .spacer { flex: 1; }
 #time-menu {
   position: absolute;
   z-index: 50;
-  width: 90px;
-  max-height: 240px;
+  width: 110px;
+  max-height: min(420px, calc(100% - 8px));
   overflow-y: auto;
   background: var(--panel);
   border: 1px solid var(--border);
@@ -256,4 +256,10 @@ dialog menu .spacer { flex: 1; }
   top: var(--clicked-top, 0%);
   background: color-mix(in srgb, var(--accent) 18%, transparent);
   pointer-events: none;
+}
+
+.time-option.disabled {
+  color: var(--muted);
+  opacity: 0.4;
+  cursor: not-allowed;
 }
