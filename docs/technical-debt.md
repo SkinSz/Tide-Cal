@@ -1,0 +1,77 @@
+# Tide Technical Debt Log
+
+Canonical project-level technical-debt registry. Stable IDs; statuses:
+OPEN / INVESTIGATE / DEFERRED / BLOCKED / RESOLVED.
+When an item is fixed: mark RESOLVED, record the resolving commit and the
+regression test that proves it — do not delete entries.
+
+Established 2026-08-27 after sync-engine milestone commit `e534c1f`
+(verified state at commit: 320/320 tests, TSC clean, two-instance E2E
+stable, blind final verification PASS WITH CONCERNS with zero new issues).
+
+---
+
+## TD-001 — Quarantined sequence gap
+- **ID:** TD-001
+- **Title:** Quarantined producer sequence can permanently block later records from the same producer
+- **Priority:** 7/10 — HIGH
+- **Status:** OPEN
+- **Why it matters:** Potential synchronization liveness/convergence failure. If producer P's seq N is quarantined, dense-sequence expectation means all of P's later records buffer in `pending_changes` waiting for a record that will never apply — unbounded durable growth, stream never converges.
+- **Current behavior:** `applyBatch` in `src/sync/sync_engine.ts` quarantines records failing `validateChangeRecord` (DC-04 §4.3 durable quarantine) but does not advance any frontier for them. Later seqs of the same producer stay buffered (confirmed by blind verifier probe3: d-M seq 1 quarantined, seq 2 left as durable pending zombie).
+- **Trigger for addressing it:** Next sync work session; must precede release of multi-device sync.
+- **Relevant files/components:** `src/sync/sync_engine.ts` (applyBatch quarantine branch), `src/persistence/database.ts` (`quarantineRecord`, `applyRemoteChange`, pending table), `src/sync/knowledge_state.ts` (classifyArrival/advanceApplied), `docs/contracts/DC-04` §4.3, DC-02 knowledge semantics, DC-08 protocol.
+- **Known repro:** Quarantine producer P seq N through engine session, then deliver P seq N+1 valid → N+1 buffers forever. Blind verifier probe preserved at `/tmp/tide-verify-final/probe3.ts` (if still present).
+- **Required protocol/design decision (must be made BEFORE implementing):** What does the protocol intend when a record is rejected/quarantined? Options include (a) quarantine implies skip+advance applied_upto to N for that producer (treat rejected as "processed"), (b) explicit negative ack/re-request protocol change per DC-08, (c) documented per-stream recovery path. Decide semantics first, then implement the smallest conformant solution.
+- **Lead-dev recommendation (2026-08-27, PENDING OWNER APPROVAL — do not implement before approval):**
+  Adopt **Option 3 — quarantine-and-skip with retained records + defined recovery path.**
+  Semantics: on validation failure, quarantine the record AND advance the producer's
+  applied_upto past the rejected seq (treat as "processed"), but KEEP the quarantined
+  record durably (never delete). Recovery: quarantined records are retried automatically
+  on engine restart (re-validate — a version update may now accept them) and remain
+  inspectable. No wire-protocol change required; validation is NOT weakened; no data is
+  destroyed on a false reject. Rejected alternatives: (a) skip+discard — permanently
+  loses data on a false rejection; (b) negative-ack/re-request per DC-08 — safest but a
+  full protocol extension, deferred as future work.
+  Companion UI work (owner-initiated, scope TBD): surface quarantined records in the GUI
+  similar to the conflict dialog — e.g. a "Sync-Errors" view showing the affected
+  producer/seq with per-item Retry and Delete actions. Scope options range from plain
+  error surfacing (cheap) to interpreted user-facing messages with retry/delete per
+  record (more extensive; needs quarantine metadata + a new dialog + RPC surface).
+  Implementation must follow the approved DC once this decision is ratified.
+- **Constraints on the fix:** Do NOT weaken validation merely to make sequences advance. Must add deterministic regression tests including the specific case "seq N quarantined followed by seq N+1"; verify the producer stream cannot become permanently stuck; verify restart/persistence behavior; keep existing suite green.
+
+## TD-002 — NaN numeric payload handling
+- **ID:** TD-002
+- **Title:** Malformed numeric input containing NaN may bind as NULL or corrupt durable event rows
+- **Priority:** 5/10 — MEDIUM
+- **Status:** INVESTIGATE
+- **Why it matters:** Silent durable-state corruption possibility from malformed remote payloads (better-sqlite3 binds JS NaN to SQL NULL).
+- **Current behavior (blind verifier finding):** NaN in schedule startMs/endMs is not caught by `typeof v.startMs === "number"` guards; NaN binds as NULL into nullable `utc_start_ms`/`utc_end_ms`, wall strings become `"NaN:NaN:NaN"`. Does not violate CHECK (row stays internally consistent with all_day unchanged), classification was expected/unsupported input.
+- **Trigger for addressing it:** Cheap investigation only: determine whether NaN is reachable via a supported remote sync path (JSON.parse accepts `NaN`? JSON spec does not allow bare NaN — check what `JSON.stringify`/parser actually produce over the wire), how serializer/validator/binding handle it, whether incorrect durable state is achievable. Only escalate to a fix if reachability + corruption are demonstrated; otherwise close as hardening note.
+- **Relevant files/components:** `src/persistence/bridges/sync_service.ts` (mutator guards), `src/sync/change_record.ts` (validateChangeRecord), `src/persistence/bridges/event_core.ts` (derivedScheduleColumns).
+
+## TD-003 — Legacy dev-* identity migration
+- **ID:** TD-003
+- **Title:** Legacy dev-* identity data migration
+- **Priority:** 4/10 now; potentially 6/10 at release
+- **Status:** DEFERRED
+- **Why it matters:** Databases written by pre-unification trees attribute historic changes to the marker-file id (`dev-<uuid>`) while new records use the Ed25519-derived id (`d-<sha256>`). Historic data keeps a second producer identity forever.
+- **Trigger for addressing it:** Preparing any release/update that must upgrade existing SQLite databases created by older versions. Do NOT implement before then.
+- **Relevant files/components:** `src/persistence/bridges/event_core.ts` (`loadOrCreateDeviceId` marker-file fallback), `src/network/sync_runtime.ts` (`loadOrCreateIdentity`), `src/persistence/bridges/sidecar_server.ts`.
+
+## TD-004 — Sidecar identity-path E2E coverage
+- **ID:** TD-004
+- **Title:** No end-to-end test covers sidecar main() production startup identity wiring
+- **Priority:** 6/10 — MEDIUM-HIGH
+- **Status:** OPEN
+- **Why it matters:** The F1 identity-split fix in `sidecar_server.ts main()` is verified statically and at unit level, but the realistic production startup/wiring path has never been executed under test. Cheap risk elimination.
+- **Current behavior:** Existing regression test R1 constructs EventCore + engine directly; no test drives `main()`'s actual load-identity-once → inject into EventCore + SyncManager sequence across restart.
+- **Trigger for addressing it:** FIRST task next session, BEFORE substantial further sync/sidecar refactoring.
+- **Test requirements (smallest realistic E2E):**
+  - exercise the real production startup wiring path;
+  - verify SyncManager loads/uses the persisted sync deviceId;
+  - verify EventCore receives that same explicit deviceId;
+  - verify EventCore and SyncEngine therefore share one device identity;
+  - verify identity remains stable across initialization/restart where applicable.
+  - Do NOT redesign identity semantics.
+- **Relevant files/components:** `src/persistence/bridges/sidecar_server.ts` (main(), SyncManager), `tests/regression_agents23.test.ts` (R1 neighbors), spawn/headless pattern already exists in `tests/two_instance_sync.test.ts` and the stdio test in `tests/event_store_bridge.test.ts`.
