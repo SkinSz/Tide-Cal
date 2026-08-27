@@ -1,15 +1,13 @@
 # TIDE DESIGN CONTRACT DC-16
 # Peer Misbehavior Handling: Detection, Throttling, and
 # Blocking of Invalid-Packet Floods
-Status: DRAFT v2 — REVISED PER OWNER FEEDBACK (2026-08-27). NOT YET
-        APPROVED. v2 changes: (1) two-tier model separating ordinary
-        misbehavior (self-clearing) from flood/DDoS-style attacks
-        (hardened, NOT self-clearing); (2) DDoS tier assumes the
-        attacker knows the code (open source) and can burst at line
-        rate; (3) thresholds replaced by a concrete reasonable quota
-        sized for a single-person calendar; (4) block state surfaced
-        and managed in a new Paired-Devices menu (contract extended;
-        pairs with DC-05 pairing management work).
+Status: APPROVED by project owner (2026-08-27, v2 as committed).
+        Open items resolved with owner go-ahead for implementation:
+        D7 = NO auto-escalation of suspend (Level-4 recommendation is
+        surfaced on inspection only); O3 = silence on the wire (no
+        DC-08 signaling); O4 = minimal read-only Paired Devices list
+        in this package, extended later. Thresholds (D6) ship as
+        config with the §2.4 values as initial defaults.
 Depends on: DC-05 (device identity, pairing); DC-08 (sync message
             protocol); DC-10 (revocation propagation); DC-13 (background
             sync scheduling: debounce_seconds 10, sweep_minutes 10);
