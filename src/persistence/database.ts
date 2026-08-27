@@ -94,6 +94,15 @@ function initializeSchema(db: Database.Database): void {
           total_invalid      INTEGER NOT NULL CHECK (total_invalid >= 0),
           last_invalid_at    INTEGER NOT NULL)`);
       }
+      if (row!.version < 5) {
+        // TD-005 remainder: durable cumulative prune counter for the
+        // resolved-row retention cap (TD-008). Silent by design; count is
+        // exposed via listQuarantineStats. IF NOT EXISTS keeps this safe if
+        // a sibling migration already created it (collision coordination).
+        db.exec(`CREATE TABLE IF NOT EXISTS quarantine_prune_stats (
+          id            INTEGER PRIMARY KEY CHECK (id = 1),
+          total_pruned  INTEGER NOT NULL DEFAULT 0)`);
+      }
       db.prepare("UPDATE schema_version SET version = ?").run(SCHEMA_VERSION);
     });
     tx();
@@ -612,11 +621,18 @@ export function reconcileQuarantineResolutions(
 
 /**
  * TD-005: badge/dialog stats. The badge counts ACTIVE rows only — resolved
- * rows are archived diagnostics, not pending problems.
+ * rows are archived diagnostics, not pending problems. total_pruned is the
+ * durable cumulative count of resolved rows removed by the retention cap
+ * (TD-008): pruning is silent by design, but never invisible in aggregate.
  */
 export function listQuarantineStats(
   db: Database.Database,
-): { active: number; resolved: number; total: number } {
+): {
+  active: number;
+  resolved: number;
+  total: number;
+  total_pruned: number;
+} {
   const row = db
     .prepare<
       [],
@@ -628,10 +644,162 @@ export function listQuarantineStats(
        FROM quarantine`,
     )
     .get();
+  const pruned = db
+    .prepare<[], { total_pruned: number } | undefined>(
+      "SELECT total_pruned FROM quarantine_prune_stats WHERE id = 1",
+    )
+    .get();
   return {
     active: row?.active ?? 0,
     resolved: row?.resolved ?? 0,
     total: row?.total ?? 0,
+    total_pruned: pruned?.total_pruned ?? 0,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// TD-005 remainder — user resolution actions + resolved-row retention (TD-008)
+// ---------------------------------------------------------------------------
+
+/**
+ * TD-008 retention cap on RESOLVED quarantine rows only. No runtime config
+ * mechanism exists yet (TIDE_* env vars are boot-only), so this is a
+ * constant here: keep the newest 1,000 resolved rows; ACTIVE rows are NEVER
+ * pruned (product rule: quarantined records are never deleted silently).
+ */
+export const QUARANTINE_RESOLVED_RETENTION_CAP = 1000;
+
+/**
+ * TD-008: prune the OLDEST resolved rows beyond `cap`. Silent by design
+ * (resolved rows are non-actionable); returns the number pruned this run
+ * and accumulates it durably in quarantine_prune_stats so
+ * listQuarantineStats can expose the lifetime total. Never touches active
+ * rows. Deterministic ordering: newest = highest quarantine_id.
+ */
+export function pruneResolvedQuarantine(
+  db: Database.Database,
+  cap: number = QUARANTINE_RESOLVED_RETENTION_CAP,
+): number {
+  if (!Number.isInteger(cap) || cap < 0) {
+    throw new Error(`invalid retention cap: ${cap}`);
+  }
+  let pruned = 0;
+  db.transaction(() => {
+    const info = db
+      .prepare(
+        `DELETE FROM quarantine
+         WHERE resolved_at_hlc IS NOT NULL
+           AND quarantine_id NOT IN (
+             SELECT quarantine_id FROM quarantine
+             WHERE resolved_at_hlc IS NOT NULL
+             ORDER BY quarantine_id DESC LIMIT ?)`,
+      )
+      .run(cap);
+    pruned = info.changes;
+    if (pruned > 0) {
+      db.prepare(
+        `INSERT INTO quarantine_prune_stats (id, total_pruned) VALUES (1, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           total_pruned = total_pruned + excluded.total_pruned`,
+      ).run(pruned);
+    }
+  })();
+  return pruned;
+}
+
+export interface UserDeleteResult {
+  ok: boolean;
+  /** true when the skipped_seqs row existed; false when it was re-created */
+  skip_row_present: boolean;
+  /** true when a missing skipped_seqs row had to be re-created */
+  skip_row_recreated: boolean;
+}
+
+/**
+ * TD-005 remainder: user "give up on this record" action. The quarantine
+ * row is RETAINED (never physically deleted) and marked
+ * resolved_reason='user_deleted' — retaining the row preserves the durable
+ * audit trail at negligible cost while fully carrying the give-up semantics.
+ *
+ * CRITICAL INVARIANT: the producer's skipped_seqs entry for this seq MUST
+ * exist afterwards so the sync stream stays unblocked (the seq counts as
+ * processed). If the skip row is missing it is re-created here — UNLESS the
+ * record was actually applied (its change exists), in which case the skip
+ * row was legitimately removed and must NOT come back.
+ *
+ * Two-step confirmation lives in the UI (DC-15 §3.5); the RPC additionally
+ * requires `confirm === true` — a defense-in-depth gate at the op level.
+ */
+export function deleteQuarantineByUser(
+  db: Database.Database,
+  quarantineId: number,
+  opts: { confirm: boolean },
+): UserDeleteResult {
+  if (opts?.confirm !== true) {
+    throw new Error(
+      "delete_quarantine requires explicit confirm: true (destructive action, DC-15 §3.5)",
+    );
+  }
+  const row = db
+    .prepare<
+      [number],
+      { raw_record: string; resolved_at_hlc: number | null }
+    >(
+      "SELECT raw_record, resolved_at_hlc FROM quarantine WHERE quarantine_id = ?",
+    )
+    .get(quarantineId);
+  if (!row) throw new Error(`quarantine row ${quarantineId} not found`);
+
+  // Derive (producer, seq) when the raw record is shape-compatible.
+  let producer: string | null = null;
+  let seq: number | null = null;
+  try {
+    const raw = JSON.parse(row.raw_record) as {
+      device_id?: unknown;
+      local_seq?: unknown;
+    };
+    if (typeof raw.device_id === "string" && raw.device_id.length > 0) {
+      producer = raw.device_id;
+    }
+    if (
+      typeof raw.local_seq === "number" &&
+      Number.isInteger(raw.local_seq) &&
+      raw.local_seq > 0
+    ) {
+      seq = raw.local_seq;
+    }
+  } catch {
+    /* unparsable: nothing to guarantee beyond resolving the row */
+  }
+
+  let skipRowPresent = false;
+  let recreated = false;
+  db.transaction(() => {
+    // Idempotent: an already-resolved row keeps its original resolution.
+    if (row.resolved_at_hlc === null) {
+      markQuarantineResolved(db, quarantineId, "user_deleted");
+    }
+    if (producer !== null && seq !== null) {
+      const applied = !!db
+        .prepare("SELECT 1 FROM changes WHERE change_id = ?")
+        .get(`${producer}:${seq}`);
+      if (!applied) {
+        // The record was never applied: the seq must count as processed so
+        // later seqs of this producer keep flowing (stream unblocked).
+        skipRowPresent = isSeqSkipped(db, producer, seq);
+        if (!skipRowPresent) {
+          markSeqSkipped(db, producer, seq);
+          recreated = true;
+        }
+      } else {
+        skipRowPresent = true; // applied: skip row legitimately absent
+      }
+    }
+  })();
+  return {
+    ok: true,
+    skip_row_present: skipRowPresent,
+    skip_row_recreated: recreated,
   };
 }
 

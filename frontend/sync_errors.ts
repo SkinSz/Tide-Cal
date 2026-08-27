@@ -27,12 +27,78 @@ export interface SyncErrorView {
   seq: number;
   /** reason code VERBATIM (never interpreted/reworded) */
   reason: string;
+  /** TD-005 remainder: short plain-language sentence for the reason code */
+  reason_human: string;
   received_at_hlc: number;
   raw: string;
   /** TD-005: true once the row is resolved (archived, not deleted) */
   resolved: boolean;
   /** TD-005: resolution reason (e.g. "revalidated_on_restart"); null while active */
   resolved_reason: string | null;
+}
+
+/**
+ * TD-005 remainder: plain-language sentences for the machine reason codes
+ * validateChangeRecord emits. Codes arrive as
+ * "invalid_change_record:<detail>" (see sync_engine's quarantine branch);
+ * the bare detail and the bare code are also mapped. The technical code is
+ * ALWAYS shown alongside the sentence — information is never hidden.
+ * Unknown codes fall back to the code verbatim.
+ */
+const REASON_HINTS: Record<string, string> = {
+  invalid_change_record: "The record failed validation for this version.",
+  invalid_member_id:
+    "The record contains a field this version doesn't recognize.",
+  missing_field:
+    "The record is missing a required field this version expects.",
+  bad_seq: "The record's sequence number is missing or invalid.",
+  bad_operation:
+    "The record uses an operation this version doesn't recognize.",
+  bad_entity_type:
+    "The record has a data type this version doesn't recognize.",
+  id_mismatch: "The record's ID doesn't match its contents.",
+};
+
+/**
+ * TD-005 remainder: map a quarantine reason code to a short plain-language
+ * sentence. Real codes emitted by the engine are
+ * "invalid_change_record:" + the validator's error MESSAGE (e.g.
+ * "invalid operation upsert"), so matching is keyword-based over the detail
+ * part; exact short-code hits are tried first. The technical code is ALWAYS
+ * shown alongside — information is never hidden. Unknown codes fall back to
+ * the code itself — the UI never invents a meaning it doesn't have.
+ */
+export function humanReason(code: string): string {
+  if (REASON_HINTS[code]) return REASON_HINTS[code]!;
+  const m = /^invalid_change_record:(.+)$/.exec(code);
+  if (!m) return code;
+  const d = m[1]!;
+  if (REASON_HINTS[d]) return REASON_HINTS[d]!; // short-code detail form
+  if (/^invalid operation /.test(d)) {
+    return "The record uses an operation this version doesn't recognize.";
+  }
+  if (/^invalid entity_type /.test(d)) {
+    return "The record has a data type this version doesn't recognize.";
+  }
+  if (d.startsWith("change_id ") && d.includes("!=")) {
+    return "The record's ID doesn't match its contents.";
+  }
+  if (d.includes("local_seq")) {
+    return "The record's sequence number is missing or invalid.";
+  }
+  if (d.includes("non-finite number")) {
+    return "The record contains a number this version can't represent.";
+  }
+  if (d.includes("causality_clock")) {
+    return "The record's version information is malformed.";
+  }
+  if (d.includes("hlc_timestamp")) {
+    return "The record's timestamp is missing or invalid.";
+  }
+  if (d.startsWith("invalid ")) {
+    return "The record is missing a required field this version expects.";
+  }
+  return code; // unknown detail: fall back to the code VERBATIM
 }
 
 /**
@@ -61,6 +127,7 @@ export function shapeQuarantineRows(rows: QuarantineRow[]): SyncErrorView[] {
       producer: producer ? producer.slice(0, 16) + "…" : "(unknown)",
       seq,
       reason: r.quarantine_reason,
+      reason_human: humanReason(r.quarantine_reason),
       received_at_hlc: r.received_at_hlc,
       raw: r.raw_record,
       resolved: r.resolved_at_hlc != null,
@@ -281,8 +348,13 @@ function renderErrorRow(view: SyncErrorView): HTMLDivElement {
   }`;
   const reason = document.createElement("code");
   reason.className = "muted";
-  reason.textContent = view.reason; // verbatim reason code
+  reason.textContent = view.reason; // verbatim reason code — never hidden
   head.append(title, reason);
+
+  // TD-005 remainder: plain-language sentence above the raw code.
+  const human = document.createElement("div");
+  human.className = "reason-human";
+  human.textContent = view.reason_human;
 
   const details = document.createElement("details");
   const summary = document.createElement("summary");
@@ -291,16 +363,115 @@ function renderErrorRow(view: SyncErrorView): HTMLDivElement {
   pre.textContent = view.raw;
   details.append(summary, pre);
 
-  row.append(head, details);
+  row.append(head, human, details);
   if (view.resolved) {
     // TD-005: show both the original quarantine reason (above) and how the
     // row was resolved. Archive only — no retry/delete actions exist.
     const res = document.createElement("div");
     res.className = "muted";
-    res.textContent = `resolved: ${view.resolved_reason ?? "unknown"}`;
+    res.textContent = `resolved: ${RESOLVED_HINTS[view.resolved_reason ?? ""] ?? view.resolved_reason ?? "unknown"}`;
     row.appendChild(res);
+    return row;
   }
+
+  // --- TD-005 remainder: per-item actions on ACTIVE rows only ------------
+  const actions = document.createElement("div");
+  actions.className = "sync-error-actions";
+
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.textContent = "Retry";
+  retry.title = "Re-check this record now and apply it if it has become valid.";
+  retry.addEventListener("click", () => {
+    retry.disabled = true;
+    retry.textContent = "Retrying…";
+    void (async () => {
+      let note: string;
+      try {
+        const r = await syncOp<{ outcome: string }>("retry_quarantine", {
+          quarantine_id: view.quarantine_id,
+        });
+        note =
+          r.outcome === "applied" || r.outcome === "duplicate"
+            ? "Applied."
+            : r.outcome === "buffered"
+              ? "Still blocked by an earlier missing record."
+              : "Still invalid — remains quarantined.";
+      } catch (err) {
+        note = `Retry failed: ${err instanceof Error ? err.message : String(err)}`;
+      }
+      const noteEl = document.createElement("span");
+      noteEl.className = "muted";
+      noteEl.textContent = note;
+      actions.replaceChildren(noteEl);
+      await refreshListAndBadge();
+    })();
+  });
+
+  const del = document.createElement("button");
+  del.type = "button";
+  del.textContent = "Delete";
+  del.title = "Give up on this record permanently.";
+  del.addEventListener("click", () => {
+    // DC-15 §3.5 two-step confirmation (destructive action):
+    // state what happens, require an explicit second click.
+    const warn = document.createElement("span");
+    warn.className = "delete-warning";
+    warn.textContent =
+      "This record will be permanently discarded from this device. " +
+      "It will NEVER be applied, and the sender will not be notified.";
+    const confirmBtn = document.createElement("button");
+    confirmBtn.type = "button";
+    confirmBtn.textContent = "Confirm delete";
+    confirmBtn.addEventListener("click", () => {
+      confirmBtn.disabled = true;
+      void (async () => {
+        let note: string;
+        try {
+          await syncOp("delete_quarantine", {
+            quarantine_id: view.quarantine_id,
+            confirm: true, // explicit flag — the op refuses without it
+          });
+          note = "Record given up on. Later records from this device still sync.";
+        } catch (err) {
+          note = `Delete failed: ${err instanceof Error ? err.message : String(err)}`;
+        }
+        const noteEl = document.createElement("span");
+        noteEl.className = "muted";
+        noteEl.textContent = note;
+        actions.replaceChildren(noteEl);
+        await refreshListAndBadge();
+      })();
+    });
+    const cancelBtn = document.createElement("button");
+    cancelBtn.type = "button";
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.addEventListener("click", () => {
+      actions.replaceChildren(retry, del);
+    });
+    actions.replaceChildren(warn, confirmBtn, cancelBtn);
+  });
+
+  actions.append(retry, del);
+  row.appendChild(actions);
   return row;
+}
+
+/** Plain-language labels for resolved_reason codes (verbatim fallback). */
+const RESOLVED_HINTS: Record<string, string> = {
+  revalidated_on_restart: "applied after re-validation",
+  retried_by_user: "applied after you clicked Retry",
+  user_deleted: "given up on by you (never applied)",
+};
+
+/** Re-render the dialog list + badge after a retry/delete action. */
+async function refreshListAndBadge(): Promise<void> {
+  try {
+    renderList((await fetchQuarantine()).rows);
+  } catch {
+    /* leave the current list as-is */
+  }
+  await refreshSyncErrorsBadge();
 }
 
 export function initSyncErrors(): void {

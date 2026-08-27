@@ -42,6 +42,25 @@ export interface EventStoreBridge {
   createEvent(input: EventInput): CalendarEvent | Promise<CalendarEvent>;
   updateEvent(id: string, input: EventInput): CalendarEvent | Promise<CalendarEvent>;
   deleteEvent(id: string): void | Promise<void>;
+  /**
+   * READ-ONLY recurrence surfacing (DC-12 §2): series rows + overrides.
+   * Optional — older bridges without it simply show no recurrence indicators.
+   */
+  listSeries?():
+    | Array<{
+        seriesId: string;
+        baseEventId: string;
+        recurrenceRule: string;
+        overrides: Array<{ recurrenceId: string; cancelled: boolean }>;
+      }>
+    | Promise<
+        Array<{
+          seriesId: string;
+          baseEventId: string;
+          recurrenceRule: string;
+          overrides: Array<{ recurrenceId: string; cancelled: boolean }>;
+        }>
+      >;
 }
 
 declare global {
@@ -111,6 +130,35 @@ function newId(): string {
 }
 
 // --- public API ------------------------------------------------------------
+
+export interface SeriesRow {
+  seriesId: string;
+  baseEventId: string;
+  recurrenceRule: string;
+  overrides: Array<{ recurrenceId: string; cancelled: boolean }>;
+}
+
+/**
+ * READ-ONLY: series + occurrence_overrides for recurrence surfacing.
+ * Falls back to [] when no backend exposes it (localStorage fallback store
+ * has no series concept) — callers then simply render no indicators.
+ */
+export function listSeries(): Promise<SeriesRow[]> {
+  const bridge = injectedBridge();
+  const run = async () =>
+    bridge?.listSeries
+      ? bridge.listSeries()
+      : invoke<SeriesRow[]>("list_series");
+  // Per-call display fallback ONLY — must NOT set the global usingFallback
+  // flag: list_series is an optional decoration whose absence (backend not
+  // wired yet, plain browser) says nothing about event-CRUD availability.
+  // Poisoning the global flag here silently diverted all subsequent event
+  // CRUD to localStorage in the desktop app (verifier-found MAJOR bug).
+  return run().catch((e) => {
+    console.warn("[tide] listSeries unavailable, showing no indicators:", e);
+    return [] as SeriesRow[];
+  });
+}
 
 export function listEvents(range?: {
   fromMs: number;

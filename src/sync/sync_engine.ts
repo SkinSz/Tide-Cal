@@ -23,6 +23,9 @@ import {
   hardBlockProducer,
   appendInvalidTally,
   reconcileQuarantineResolutions,
+  // TD-005 remainder (TD-008): silent resolved-row retention cap at startup.
+  pruneResolvedQuarantine,
+  markQuarantineResolved,
 } from "../persistence/database.ts";
 // TD-006 / DC-16: two-tier peer misbehavior handling (Tier-1 in-memory
 // ladder + Tier-2 durable hard block via hardBlockProducer).
@@ -193,6 +196,12 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
   // TD-005 hook (one line, per integration note): after a revalidation pass
   // that applied formerly-quarantined records, mark those rows resolved.
   reconcileQuarantineResolutions(deps.db);
+  // TD-008 closure: resolved-row retention cap (keep newest 1,000). Silent
+  // by design — resolved rows are non-actionable. Also re-run after each new
+  // resolution (retryQuarantineRecord / reconcile paths call prune at the
+  // engine boundary; see sidecar retry_quarantine op). Active rows are
+  // NEVER pruned.
+  pruneResolvedQuarantine(deps.db);
   const holder: KnowledgeHolder = { knowledge };
   const maxBatch = deps.maxBatchRecords ?? 256;
   // DC-09 §3 trigger bookkeeping; streaks are per peer/direction. Session
@@ -923,6 +932,86 @@ export interface RevalidationResult {
   stillInvalid: number;
 }
 
+/** Outcome of running ONE quarantined raw record through the apply path. */
+type SingleRevalidation =
+  | { outcome: "invalid" } // validateChangeRecord still rejects it
+  | { outcome: "failed" } // apply path threw (e.g. domain mutation)
+  | { outcome: "applied" }
+  | { outcome: "duplicate" }
+  | { outcome: "buffered" };
+
+/**
+ * TD-005 remainder: revalidation of a SINGLE quarantined raw record —
+ * extracted verbatim from revalidateQuarantine's loop body so the per-item
+ * Retry action and the restart pass share ONE implementation (same
+ * validation, same atomic skip-row removal + apply, same restore-on-failure).
+ * Idempotent: re-applying an already-applied record classifies as duplicate.
+ */
+function revalidateOneQuarantineRaw(
+  db: Database,
+  rawRecord: string,
+  mutate?: (db: Database, record: ChangeRecord) => void,
+  knowledge?: NonNullable<SyncEngineDeps["knowledge"]>,
+): SingleRevalidation {
+  let record: ChangeRecord;
+  try {
+    record = validateChangeRecord(JSON.parse(rawRecord));
+  } catch {
+    return { outcome: "invalid" }; // still invalid: quarantine + skip unchanged
+  }
+  try {
+    let outcome: SingleRevalidation["outcome"] | undefined;
+    // Atomic per row: the skip-row removal and the apply share one
+    // transaction (applyRemoteChange's inner transaction nests safely).
+    db.transaction(() => {
+      db.prepare(
+        "DELETE FROM skipped_seqs WHERE producer_device_id = ? AND local_seq = ?",
+      ).run(record.device_id, record.local_seq);
+      const k = knowledge ?? loadKnowledgeFromDb(db);
+      const res = applyRemoteChange(db, record, k, mutate);
+      outcome = res;
+    })();
+    if (outcome === "applied") return { outcome: "applied" };
+    if (outcome === "buffered") return { outcome: "buffered" };
+    // duplicate (already have it): the skip row is legitimately gone.
+    return { outcome: "duplicate" };
+  } catch {
+    // Domain mutation failed: remain quarantined, restore the skip row.
+    markSeqSkipped(db, record.device_id, record.local_seq);
+    return { outcome: "failed" };
+  }
+}
+
+export function retryQuarantineRecord(
+  db: Database,
+  quarantineId: number,
+  mutate?: (db: Database, record: ChangeRecord) => void,
+):
+  | { outcome: "applied" | "duplicate" | "buffered"; resolved: boolean }
+  | { outcome: "invalid" | "failed"; resolved: false }
+  | { outcome: "already_resolved" | "not_found"; resolved: false } {
+  const row = db
+    .prepare(
+      "SELECT raw_record, resolved_at_hlc FROM quarantine WHERE quarantine_id = ?",
+    )
+    .get(quarantineId) as
+    | { raw_record: string; resolved_at_hlc: number | null }
+    | undefined;
+  if (!row) return { outcome: "not_found", resolved: false };
+  if (row.resolved_at_hlc !== null) {
+    return { outcome: "already_resolved", resolved: false }; // idempotent
+  }
+  const res = revalidateOneQuarantineRaw(db, row.raw_record, mutate);
+  if (res.outcome === "invalid" || res.outcome === "failed") {
+    return { outcome: res.outcome, resolved: false };
+  }
+  // Applied/duplicate/buffered: the record is now durably present (changes
+  // row exists, or it is buffered waiting for a gap that reconcile will
+  // close later). Mark resolved via the existing machinery; idempotent.
+  const resolved = markQuarantineResolved(db, quarantineId, "retried_by_user");
+  return { outcome: res.outcome, resolved };
+}
+
 /**
  * TD-001 (6): restart-time revalidation pass. Iterates EVERY quarantine row
  * and re-runs validateChangeRecord + the full apply path against current
@@ -947,34 +1036,15 @@ export function revalidateQuarantine(
   };
   for (const row of rows) {
     result.examined++;
-    let record: ChangeRecord;
-    try {
-      record = validateChangeRecord(JSON.parse(row.raw_record));
-    } catch {
-      result.stillInvalid++; // still invalid: quarantine + skip unchanged
-      continue;
+    // TD-005 remainder: single-record logic extracted and shared with the
+    // per-item Retry action (retryQuarantineRecord) — one apply path, both
+    // entry points.
+    const res = revalidateOneQuarantineRaw(db, row.raw_record, mutate, knowledge);
+    if (res.outcome === "applied") result.revalidated++;
+    else if (res.outcome === "invalid" || res.outcome === "failed") {
+      result.stillInvalid++; // remain quarantined with their skip row
     }
-    try {
-      // Atomic per row: the skip-row removal and the apply share one
-      // transaction (applyRemoteChange's inner transaction nests safely).
-      db.transaction(() => {
-        db.prepare(
-          "DELETE FROM skipped_seqs WHERE producer_device_id = ? AND local_seq = ?",
-        ).run(record.device_id, record.local_seq);
-        const k = knowledge ?? loadKnowledgeFromDb(db);
-        const outcome = applyRemoteChange(db, record, k, mutate);
-        if (outcome === "applied") {
-          result.revalidated++;
-        } else {
-          // duplicate (already have it) or buffered (gap remains): the skip
-          // row is legitimately gone. Quarantine diagnostic row survives.
-        }
-      })();
-    } catch {
-      // Domain mutation failed: remain quarantined, restore the skip row.
-      result.stillInvalid++;
-      markSeqSkipped(db, record.device_id, record.local_seq);
-    }
+    // duplicate/buffered: skip row legitimately gone / gap still open.
   }
   return result;
 }

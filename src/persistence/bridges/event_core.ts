@@ -276,6 +276,49 @@ export class EventCore {
       )
       .get(id);
   }
+
+  /**
+   * READ-ONLY series listing for recurrence surfacing (DC-12 §2): every
+   * series row with its verbatim RRULE joined to its occurrence_overrides.
+   * No change records, no mutation — pure SELECT over stored state.
+   */
+  listSeries(): Array<{
+    seriesId: string;
+    baseEventId: string;
+    recurrenceRule: string;
+    overrides: Array<{ recurrenceId: string; cancelled: boolean }>;
+  }> {
+    const rows = this.db
+      .prepare<
+        [],
+        { series_id: string; base_event_id: string; recurrence_rule: string }
+      >(`SELECT series_id, base_event_id, recurrence_rule FROM series`)
+      .all();
+    const overrides = this.db
+      .prepare<
+        [],
+        { series_id: string; recurrence_id: string; cancelled: number }
+      >(
+        `SELECT series_id, recurrence_id, cancelled
+         FROM occurrence_overrides ORDER BY recurrence_id`,
+      )
+      .all();
+    const bySeries = new Map<
+      string,
+      Array<{ recurrenceId: string; cancelled: boolean }>
+    >();
+    for (const o of overrides) {
+      let list = bySeries.get(o.series_id);
+      if (!list) bySeries.set(o.series_id, (list = []));
+      list.push({ recurrenceId: o.recurrence_id, cancelled: o.cancelled !== 0 });
+    }
+    return rows.map((r) => ({
+      seriesId: r.series_id,
+      baseEventId: r.base_event_id,
+      recurrenceRule: r.recurrence_rule,
+      overrides: bySeries.get(r.series_id) ?? [],
+    }));
+  }
 }
 
 export function eventFields(e: CalendarEvent) {

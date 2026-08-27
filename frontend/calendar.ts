@@ -1,6 +1,7 @@
 // Tide calendar grid: month view and week view, vanilla TS DOM rendering.
 import type { CalendarEvent } from "./store.ts";
-import { listEvents } from "./store.ts";
+import { listEvents, listSeries, type SeriesRow } from "./store.ts";
+import { recurrenceBadge, type SeriesInfo } from "./recurrence.ts";
 
 export type ViewMode = "month" | "week";
 
@@ -123,18 +124,76 @@ async function eventsForRange(from: Date, to: Date): Promise<CalendarEvent[]> {
   }
 }
 
-function eventChip(ev: CalendarEvent, allDayStyle: boolean): HTMLElement {
+/**
+ * Series lookup for recurrence surfacing: base_event_id -> SeriesInfo.
+ * Best-effort/read-only: a failed series fetch renders no indicators
+ * (never blocks the calendar).
+ */
+async function seriesByBaseEvent(): Promise<Map<string, SeriesInfo>> {
+  let rows: SeriesRow[] = [];
+  try {
+    rows = await listSeries();
+  } catch (e) {
+    console.warn("[tide] series lookup unavailable:", e);
+  }
+  const map = new Map<string, SeriesInfo>();
+  for (const r of rows) {
+    map.set(r.baseEventId, {
+      seriesId: r.seriesId,
+      baseEventId: r.baseEventId,
+      rule: r.recurrenceRule,
+      overrides: r.overrides,
+    });
+  }
+  return map;
+}
+
+/**
+ * Append the read-only recurrence indicator to a chip: 🔁 glyph + tooltip
+ * with the plain-language rule (raw RRULE fallback), plus a "changed
+ * occurrence" marker when overrides exist (DC-12 §2.2).
+ */
+function decorateRecurrence(
+  chip: HTMLElement,
+  ev: CalendarEvent,
+  series: Map<string, SeriesInfo>,
+): void {
+  const info = series.get(ev.id);
+  if (!info) return;
+  const badge = recurrenceBadge(info);
+  const glyph = document.createElement("span");
+  glyph.className = "recurrence-glyph";
+  glyph.textContent = badge.glyph;
+  glyph.title = badge.tooltip;
+  chip.appendChild(glyph);
+  if (badge.hasOverride) {
+    const marker = document.createElement("span");
+    marker.className = "override-marker";
+    marker.textContent = "✎";
+    marker.title = badge.tooltip;
+    chip.appendChild(marker);
+  }
+  chip.title = badge.tooltip;
+}
+
+function eventChip(
+  ev: CalendarEvent,
+  allDayStyle: boolean,
+  series: Map<string, SeriesInfo>,
+): HTMLElement {
   const chip = document.createElement("div");
   chip.className = allDayStyle ? "chip chip-allday" : "chip";
   chip.dataset.eventId = ev.id;
   chip.textContent = allDayStyle ? ev.title : `${fmtTime(ev.startMs)} ${ev.title}`;
   chip.title = ev.title;
+  decorateRecurrence(chip, ev, series);
   return chip;
 }
 
 function dayColumn(
   cell: DayCell,
   events: CalendarEvent[],
+  series: Map<string, SeriesInfo>,
   onEventClick: (ev: CalendarEvent) => void,
 ): HTMLElement {
   const col = document.createElement("div");
@@ -157,7 +216,7 @@ function dayColumn(
     const en = new Date(e.endMs - 1);
     return s <= endOfDay(cell.date) && en >= startOfDay(cell.date);
   })) {
-    const chip = eventChip(ev, ev.allDay || !sameDay(new Date(ev.startMs), cell.date));
+    const chip = eventChip(ev, ev.allDay || !sameDay(new Date(ev.startMs), cell.date), series);
     chip.addEventListener("click", (e) => {
       e.stopPropagation();
       onEventClick(ev);
@@ -207,7 +266,10 @@ export async function render(): Promise<void> {
   const cells = mode === "month" ? monthGrid() : weekCells();
   const rangeStart = cells[0]!.date;
   const rangeEnd = addDays(cells[cells.length - 1]!.date, 1);
-  const events = await eventsForRange(rangeStart, rangeEnd);
+  const [events, series] = await Promise.all([
+    eventsForRange(rangeStart, rangeEnd),
+    seriesByBaseEvent(),
+  ]);
   // Re-check: async gap may mean the user navigated meanwhile.
   if (seq !== renderSeq) {
     return;
@@ -217,13 +279,13 @@ export async function render(): Promise<void> {
     renderHourRuler(root);
     for (const cell of cells) {
       root.appendChild(
-        weekDayColumn(cell, events, onEventClick),
+        weekDayColumn(cell, events, series, onEventClick),
       );
     }
     addHourLines();
   } else {
     for (const cell of cells) {
-      root.appendChild(dayColumn(cell, events, onEventClick));
+      root.appendChild(dayColumn(cell, events, series, onEventClick));
     }
   }
   document.getElementById("cal-label")!.textContent = label();
@@ -274,6 +336,7 @@ function minutesOfDay(d: Date): number {
 function weekDayColumn(
   cell: DayCell,
   events: CalendarEvent[],
+  series: Map<string, SeriesInfo>,
   onEventClick: (ev: CalendarEvent) => void,
   clickedHour: number | null = null,
 ): HTMLElement {
@@ -292,7 +355,7 @@ function weekDayColumn(
       new Date(e.startMs) <= endOfDay(cell.date) &&
       new Date(e.endMs - 1) >= startOfDay(cell.date),
   )) {
-    const chip = eventChip(ev, true);
+    const chip = eventChip(ev, true, series);
     chip.addEventListener("click", (e) => {
       e.stopPropagation();
       onEventClick(ev);
@@ -317,7 +380,7 @@ function weekDayColumn(
     const topPct = (startMin / MINUTES_PER_DAY) * 100;
     const heightPct = Math.min((durMin / MINUTES_PER_DAY) * 100, 100 - topPct);
 
-    const chip = eventChip(ev, false);
+    const chip = eventChip(ev, false, series);
     chip.classList.add("chip-timed");
     chip.style.top = `${topPct}%`;
     chip.style.height = `${heightPct}%`;

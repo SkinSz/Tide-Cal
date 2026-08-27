@@ -2,7 +2,7 @@
 // One source of truth for table creation. Encryption-at-rest is applied at
 // connection level (SQLCipher key pragma) by the caller, not here.
 
-export const SCHEMA_VERSION = 4; // v2: TD-001 skipped_seqs; v3: TD-005 quarantine lifecycle (resolved_at_hlc, resolved_reason); v4: TD-006/DC-16 hard_blocks + peer_invalid_tally
+export const SCHEMA_VERSION = 5; // v2: TD-001 skipped_seqs; v3: TD-005 quarantine lifecycle (resolved_at_hlc, resolved_reason); v4: TD-006/DC-16 hard_blocks + peer_invalid_tally; v5: TD-005 quarantine_prune_stats (retention-cap bookkeeping)
 
 export const DDL = `
 CREATE TABLE calendars (
@@ -221,6 +221,11 @@ CREATE TABLE peer_invalid_tally (
     producer_device_id TEXT PRIMARY KEY,
     total_invalid      INTEGER NOT NULL CHECK (total_invalid >= 0),
     last_invalid_at    INTEGER NOT NULL
+);
+
+CREATE TABLE quarantine_prune_stats (
+    id            INTEGER PRIMARY KEY CHECK (id = 1),
+    total_pruned  INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE identity (

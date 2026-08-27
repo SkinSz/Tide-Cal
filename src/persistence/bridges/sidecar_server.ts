@@ -44,7 +44,12 @@ import {
   listHardBlocks,
   unhardBlockProducer,
   listPeerInvalidTally,
+  // TD-005 remainder: per-item retry/delete + resolved-row retention cap.
+  deleteQuarantineByUser,
+  pruneResolvedQuarantine,
 } from "../database.ts";
+// TD-005 remainder: per-item Retry shares the restart revalidation apply path.
+import { retryQuarantineRecord } from "../../sync/sync_engine.ts";
 // TD-006 / DC-16: Tier-1 tracker (in-memory) + state surface for the UI.
 import {
   PeerMisbehaviorTracker,
@@ -318,6 +323,44 @@ export function makeSyncDispatcher(
       case "quarantine_stats": {
         return listQuarantineStats(core.db);
       }
+      // TD-005 remainder: per-item Retry — runs the single record through
+      // the SAME revalidation apply path used at restart. Idempotent; safe
+      // against concurrent restart (both paths are transactional and
+      // dedupe on the changes UNIQUE key). Prune afterwards so the
+      // resolved-row retention cap holds after each new resolution.
+      case "retry_quarantine": {
+        if (
+          typeof args.quarantine_id !== "number" ||
+          !Number.isInteger(args.quarantine_id)
+        ) {
+          throw new Error("quarantine_id required");
+        }
+        const result = retryQuarantineRecord(
+          core.db,
+          args.quarantine_id,
+          makeEntityMutator(),
+        );
+        pruneResolvedQuarantine(core.db);
+        return result;
+      }
+      // TD-005 remainder: per-item Delete (give up on record). Requires the
+      // explicit confirm flag (defense-in-depth behind the UI's two-step
+      // confirmation, DC-15 §3.5). Retains the row with
+      // resolved_reason='user_deleted' and guarantees the skipped_seqs
+      // entry exists so the stream stays unblocked.
+      case "delete_quarantine": {
+        if (
+          typeof args.quarantine_id !== "number" ||
+          !Number.isInteger(args.quarantine_id)
+        ) {
+          throw new Error("quarantine_id required");
+        }
+        const result = deleteQuarantineByUser(core.db, args.quarantine_id, {
+          confirm: args.confirm === true,
+        });
+        pruneResolvedQuarantine(core.db);
+        return result;
+      }
       // --- TD-006 / DC-16 §4: peer misbehavior visibility + recovery ------
       // Read-only per-peer state (Sync-Errors badge section + Paired Devices).
       case "peer_state": {
@@ -403,6 +446,7 @@ function main(): void {
     op.startsWith("sync_") || op === "device_info" ||
     op === "pairing_offer" || op === "pairing_accept" ||
     op === "list_quarantine" || op === "quarantine_stats" ||
+    op === "retry_quarantine" || op === "delete_quarantine" ||
     op === "peer_state" || op === "list_paired_devices" ||
     op === "reset_peer_state" || op === "unblock_peer"
       ? syncDispatch(op, args)

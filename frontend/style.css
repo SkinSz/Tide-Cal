@@ -334,3 +334,44 @@ dialog menu .spacer { flex: 1; }
   gap: 0.5rem;
   align-items: baseline;
 }
+
+/* TD-005 remainder: Sync-Errors per-row human reason + Retry/Delete actions */
+.reason-human { font-size: 0.8rem; margin-top: 2px; }
+.sync-error-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: center;
+  margin-top: 4px;
+}
+.sync-error-actions button { font-size: 0.75rem; padding: 2px 10px; }
+.sync-error-actions button.danger { color: var(--danger); border-color: var(--danger); }
+.delete-warning {
+  color: var(--danger);
+  font-size: 0.78rem;
+  width: 100%;
+  white-space: normal;
+}
+
+/* Recurrence surfacing (DC-12 §2, display-only): series indicator + override
+   marker on grid chips, and the read-only info line in the event dialog. */
+.recurrence-glyph {
+  margin-left: 4px;
+  font-size: 0.85em;
+  opacity: 0.85;
+}
+.override-marker {
+  margin-left: 3px;
+  font-size: 0.8em;
+  font-weight: 700;
+  opacity: 0.9;
+}
+.recurrence-info {
+  margin: 0 0 8px;
+  padding: 6px 8px;
+  font-size: 0.8rem;
+  color: var(--muted, #6b7680);
+  background: rgba(128, 128, 128, 0.1);
+  border-left: 3px solid var(--accent, #4aa3df);
+  border-radius: 4px;
+}

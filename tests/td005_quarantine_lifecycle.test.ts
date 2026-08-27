@@ -93,7 +93,7 @@ describe("TD-005: resolution via revalidation", () => {
     expect(rows[0]!.resolved_reason).toBe("revalidated_on_restart");
 
     const stats = listQuarantineStats(db);
-    expect(stats).toEqual({ active: 0, resolved: 1, total: 1 });
+    expect(stats).toEqual({ active: 0, resolved: 1, total: 1, total_pruned: 0 });
   });
 
   test("markQuarantineResolved is idempotent (original resolution wins)", () => {
@@ -124,7 +124,7 @@ describe("TD-005: still-invalid rows stay active", () => {
     const rows = listQuarantine(db);
     expect(rows).toHaveLength(1);
     expect(rows[0]!.resolved_at_hlc).toBeNull();
-    expect(listQuarantineStats(db)).toEqual({ active: 1, resolved: 0, total: 1 });
+    expect(listQuarantineStats(db)).toEqual({ active: 1, resolved: 0, total: 1, total_pruned: 0 });
   });
 });
 
@@ -171,6 +171,7 @@ describe("TD-005: stats and badge shaping", () => {
       active: 2,
       resolved: 2,
       total: 4,
+      total_pruned: 0,
     });
 
     // UI shaping: active rows on top, resolved flagged with their reason.
@@ -205,7 +206,7 @@ describe("TD-005: resolution durability", () => {
     expect(after.quarantine_id).toBe(before.quarantine_id);
     expect(after.resolved_at_hlc).toBe(before.resolved_at_hlc);
     expect(after.resolved_reason).toBe("revalidated_on_restart");
-    expect(listQuarantineStats(db)).toEqual({ active: 0, resolved: 1, total: 1 });
+    expect(listQuarantineStats(db)).toEqual({ active: 0, resolved: 1, total: 1, total_pruned: 0 });
   });
 
   test("fresh database is created at schema v3+ with lifecycle columns", () => {

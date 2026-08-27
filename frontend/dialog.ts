@@ -9,10 +9,12 @@ import {
   createEvent,
   deleteEvent,
   updateEvent,
+  listSeries,
   type CalendarEvent,
   type EventInput,
 } from "./store.ts";
 import { getSelectedDate } from "./calendar.ts";
+import { dialogRecurrenceLine } from "./recurrence.ts";
 
 const dlg = () => document.getElementById("event-dialog") as HTMLDialogElement;
 
@@ -41,6 +43,34 @@ function localMs(date: string, time: string): number {
 
 function wholeDay(): boolean {
   return (field("ev-allday") as HTMLInputElement).checked;
+}
+
+/**
+ * READ-ONLY recurrence info line (DC-12 §2 / deferred #12 surface): when the
+ * edited event is a series' base event, state the rule in plain language and
+ * make the THIS-occurrence-vs-SERIES distinction visible. v1 editing rewrites
+ * the base event row only; the line says exactly that. Best-effort: failures
+ * simply leave the line hidden.
+ */
+function syncRecurrenceLine(existing?: CalendarEvent): void {
+  const line = document.getElementById("ev-recurrence-info");
+  if (!line) return;
+  line.hidden = true;
+  line.textContent = "";
+  if (!existing) return;
+  listSeries()
+    .then((rows) => {
+      const info = rows.find((r) => r.baseEventId === existing.id);
+      if (!info) return;
+      line.textContent = dialogRecurrenceLine({
+        seriesId: info.seriesId,
+        baseEventId: info.baseEventId,
+        rule: info.recurrenceRule,
+        overrides: info.overrides,
+      });
+      line.hidden = false;
+    })
+    .catch((e) => console.warn("[tide] series lookup unavailable:", e));
 }
 
 function syncTimeVisibility(): void {
@@ -131,6 +161,7 @@ function openFor(date: Date, existing?: CalendarEvent): void {
   (dlg().querySelector("#dialog-title") as HTMLElement).textContent = existing
     ? "Edit event"
     : "New event";
+  syncRecurrenceLine(existing);
   (dlg().querySelector("#ev-delete") as HTMLButtonElement).hidden =
     !existing;
   syncTimeVisibility();
