@@ -139,6 +139,45 @@ future extensions where relevant.
     Notifications are best-effort (a headless system may have no
     notification service); the notice file is the guaranteed channel.
     Both mechanisms contain NO telemetry and make NO network calls.
+  - OPTIONAL "REMOVE EVERYTHING" (owner requirement, binding): the
+    uninstaller offers an explicit opt-in action labeled
+    "Remove everything" that deletes ALL user data in addition to the
+    program. Rules:
+      * OPT-IN ONLY. Default action (plain uninstall / Next-through)
+        NEVER removes user data, config, or keystore entries — D5's
+        retention guarantee applies unless the user actively chooses
+        this option.
+      * What it removes (complete list, all platforms):
+          - $XDG_DATA_HOME/tide/ (database incl. -wal/-shm, keys
+            fallback dir if ever present, logs, notices);
+          - $XDG_CONFIG_HOME/tide/ (config.toml);
+          - $XDG_CACHE_HOME/tide/;
+          - keystore entries belonging to Tide (device identity key,
+            DB encryption key) via the OS keyring API — never by
+            raw file/path guessing.
+        Windows counterpart (§4.1 semantics): %APPDATA%\tide,
+        %LOCALAPPDATA%\tide, Credential Manager entries.
+      * DESTRUCTIVE-ACTION SAFEGUARDS (mandatory):
+          - explicit typed or checkbox confirmation (no single-click);
+          - a warning that this permanently deletes the encrypted
+            calendar database, that keystore identity keys are
+            unrecoverable, and that the device's sync history /
+            pairings on OTHER devices will reference a dead device;
+          - the warning text matches the BEFORE-uninstall notification
+            wording family (same facts, destructive variant);
+          - after removal, the AFTER-uninstall confirmation states
+            that EVERYTHING was removed and nothing remains.
+      * Linux packaging note: deb/rpm maintainer scripts cannot show
+        interactive dialogs portably, so the interactive "Remove
+        everything" choice lives in the APP (Settings → "Uninstall
+        and remove all data", which invokes the system uninstall then
+        purges), with the package's post-remove script only handling
+        the non-interactive default (keep data). AppImage, if ever
+        shipped, bundles the same app-side flow.
+      * If the purge partially fails (e.g. keystore unavailable), the
+        tool must say exactly what was NOT removed and where it
+        lives — never claim success silently.
+      * No network calls, no telemetry, ever.
   - No root daemon, no systemd unit by default. Autostart (DC-13
     tray) is a user-level ~/.config/autostart entry, created only if
     the user enables it in-app; the installer does not create it.
@@ -207,7 +246,10 @@ us into a corner; everything else is deferred until the port starts.
   D5  Uninstall removes app only; user data + identity never touched
       by default; user notified BEFORE and AFTER uninstall of what is
       removed vs. kept (desktop notification + notice file in the
-      data dir as guaranteed fallback).
+      data dir as guaranteed fallback). Optional explicit opt-in
+      "Remove everything" action deletes ALL user data + keystore
+      keys with typed/checkbox confirmation and a destructive-action
+      warning; default uninstall flow never triggers it.
   D6  Upgrades are plain package upgrades; migrations in-app only;
       TD-003 resolved first if legacy DBs exist.
   D7  No root daemon/systemd unit by default; autostart opt-in,
