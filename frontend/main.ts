@@ -3,6 +3,7 @@ import { getViewMode, navigate, render, setViewMode } from "./calendar.ts";
 import { initDialog } from "./dialog.ts";
 import { initConflicts } from "./conflicts.ts";
 import { initDevices } from "./devices.ts";
+import { initSyncErrors } from "./sync_errors.ts";
 
 function wire(id: string, fn: () => void): void {
   document.getElementById(id)?.addEventListener("click", fn);
@@ -31,5 +32,6 @@ window.addEventListener("resize", () => {
 initDialog();
 initConflicts();
 initDevices();
+initSyncErrors();
 if (getViewMode() === "week") setMode("week");
 else setMode("month");

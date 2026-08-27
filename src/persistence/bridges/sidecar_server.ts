@@ -37,6 +37,7 @@ import {
   makeEntityMutator,
   createSyncEngine,
 } from "./sync_service.ts";
+import { listQuarantine, countQuarantined } from "../database.ts";
 
 type Json = Record<string, unknown>;
 
@@ -46,7 +47,7 @@ export type Dispatcher = (op: string, args: Json) => unknown;
  * Sync runtime state for one sidecar process: identity + optional listener.
  * Data dir defaults to beside the DB (identity key must persist per install).
  */
-class SyncManager {
+export class SyncManager {
   readonly identity;
   private host: { actualPort: number; close(): void } | null = null;
 
@@ -200,6 +201,18 @@ export function makeSyncDispatcher(
           return sync.runEngineSession(session);
         })();
       }
+      // TD-001 §2 Option A "Sync Errors": read-only quarantine listing for
+      // the UI badge + dialog. No retry/delete surface exists by design.
+      case "list_quarantine": {
+        const limit =
+          typeof args.limit === "number" && args.limit > 0
+            ? Math.floor(args.limit)
+            : undefined;
+        return {
+          rows: listQuarantine(core.db, { limit }),
+          total: countQuarantined(core.db),
+        };
+      }
       default:
         throw new Error(`unknown op: ${op}`);
     }
@@ -254,7 +267,8 @@ function main(): void {
   const syncDispatch = makeSyncDispatcher(sync, core);
   const combined: Dispatcher = (op, args) =>
     op.startsWith("sync_") || op === "device_info" ||
-    op === "pairing_offer" || op === "pairing_accept"
+    op === "pairing_offer" || op === "pairing_accept" ||
+    op === "list_quarantine"
       ? syncDispatch(op, args)
       : dispatch(op, args);
   const rl = createInterface({ input: process.stdin });

@@ -19,6 +19,9 @@
       <button id="btn-conflicts" title="No unresolved conflicts">
         <span class="conflicts-label">⚠ Conflicts (0)</span>
       </button>
+      <button id="btn-sync-errors" title="No quarantined records">
+        <span class="sync-errors-label">⛔ Sync errors (<span id="sync-errors-count">0</span>)</span>
+      </button>
       <button id="btn-new">+ New event</button>
       <div class="seg">
         <button id="btn-month">Month</button>
@@ -109,6 +112,21 @@
         <menu>
           <span class="spacer"></span>
           <button type="button" id="devices-close">Close</button>
+        </menu>
+      </div>
+    </dialog>
+
+    <dialog id="sync-errors-dialog">
+      <div class="dlg-body devices-dlg">
+        <h2>Sync errors</h2>
+        <p class="muted">
+          Records received from paired devices that failed validation and were
+          quarantined (kept verbatim, never applied). Read-only diagnostics.
+        </p>
+        <div id="sync-errors-list"></div>
+        <menu>
+          <span class="spacer"></span>
+          <button type="button" id="sync-errors-close">Close</button>
         </menu>
       </div>
     </dialog>

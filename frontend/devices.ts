@@ -6,7 +6,8 @@
 // module degrades honestly: buttons are disabled with a note.
 type Json = Record<string, unknown>;
 
-async function syncOp<T = Json>(op: string, args: Json = {}): Promise<T> {
+/** Tauri `sync_op` passthrough; shared by the Devices and Sync Errors views. */
+export async function syncOp<T = Json>(op: string, args: Json = {}): Promise<T> {
   const w = globalThis as unknown as {
     __TAURI_INTERNALS__?: unknown;
     __TAURI__?: { invoke?: (cmd: string, args?: Json) => Promise<unknown> };

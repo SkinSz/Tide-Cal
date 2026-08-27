@@ -15,6 +15,12 @@ export interface KnowledgeState {
   appliedUpto: Record<string, number>;
   /** out-of-order buffered records above applied_upto */
   pending: Map<string, Set<number>>; // device_id -> seqs
+  /**
+   * TD-001: producer seqs that were quarantined and are thereby resolved
+   * for sequence progress (durable twin: skipped_seqs). Optional so legacy
+   * constructors keep working; persistence always populates it.
+   */
+  skipped?: Map<string, Set<number>>; // device_id -> seqs
 }
 
 export function emptyKnowledge(): KnowledgeState {
@@ -25,6 +31,23 @@ export function appliedThrough(k: KnowledgeState, deviceId: string): number {
   return k.appliedUpto[deviceId] ?? 0;
 }
 
+/** The (possibly absent) skipped set for a producer (TD-001). */
+function skippedOf(k: KnowledgeState, deviceId: string): Set<number> {
+  return k.skipped?.get(deviceId) ?? new Set<number>();
+}
+
+/**
+ * TD-001: smallest seq > applied_upto[d] with no skipped_seqs row — the
+ * derived "processed frontier". applied_upto itself NEVER crosses a
+ * skipped seq (DC-02 §2.2 meaning preserved exactly).
+ */
+export function nextExpected(k: KnowledgeState, deviceId: string): number {
+  let s = appliedThrough(k, deviceId) + 1;
+  const skipped = skippedOf(k, deviceId);
+  while (skipped.has(s)) s += 1;
+  return s;
+}
+
 /** Is this (device,seq) already applied or buffered? (DC-02 §7.1) */
 export function isDuplicate(
   k: KnowledgeState,
@@ -33,6 +56,7 @@ export function isDuplicate(
 ): boolean {
   return (
     localSeq <= appliedThrough(k, deviceId) ||
+    skippedOf(k, deviceId).has(localSeq) || // TD-001
     k.pending.get(deviceId)?.has(localSeq) === true
   );
 }
@@ -53,9 +77,12 @@ export function classifyArrival(
   // DC-02 §7.1/§7.2: applied -> duplicate; buffered -> duplicate UNLESS
   // it has become applicable (applied_upto advanced to seq-1), in which
   // case the caller re-drains through it.
+  // TD-001: a quarantined (skipped) seq is also a duplicate — re-delivery
+  // merges clocks only and must not spam quarantine rows.
   const through = appliedThrough(k, deviceId);
+  if (skippedOf(k, deviceId).has(localSeq)) return "duplicate";
   if (localSeq <= through) return "duplicate";
-  if (localSeq === through + 1) return "apply";
+  if (localSeq === nextExpected(k, deviceId)) return "apply";
   return k.pending.get(deviceId)?.has(localSeq) === true ? "duplicate" : "buffer";
 }
 
@@ -85,19 +112,32 @@ export function advanceApplied(
   localSeq: number,
 ): Array<{ device_id: string; local_seq: number }> {
   const drained: Array<{ device_id: string; local_seq: number }> = [];
-  let next = appliedThrough(k, deviceId) + 1;
-  // The triggering record must be exactly `next` for a legal call; be lenient
-  // to idempotent replays only via isDuplicate checks upstream.
-  if (localSeq !== next) return drained;
+  // The triggering record must be exactly nextExpected — the smallest seq
+  // above the frontier with no skip row (TD-001). Be lenient to idempotent
+  // replays only via isDuplicate checks upstream.
+  if (localSeq !== nextExpected(k, deviceId)) return drained;
+  let next = localSeq;
+  const skipped = skippedOf(k, deviceId);
   drained.push({ device_id: deviceId, local_seq: localSeq });
   const pend = k.pending.get(deviceId);
-  while (pend?.has(next + 1)) {
+  // A skipped seq is never buffered, but guard anyway: the frontier must
+  // never advance THROUGH a seq that still carries a skip row.
+  while (pend?.has(next + 1) && !skipped.has(next + 1)) {
     next += 1;
     pend.delete(next);
     drained.push({ device_id: deviceId, local_seq: next });
   }
   if (pend && pend.size === 0) k.pending.delete(deviceId);
   k.appliedUpto[deviceId] = next;
+  // TD-001 (4): skip rows at/below the new frontier are resolved — GC them
+  // from the in-memory mirror (durable GC happens in the same transaction).
+  if (k.skipped?.has(deviceId)) {
+    const set = k.skipped.get(deviceId)!;
+    for (const s of [...set]) {
+      if (s <= next) set.delete(s);
+    }
+    if (set.size === 0) k.skipped.delete(deviceId);
+  }
   return drained;
 }
 
@@ -114,10 +154,12 @@ export function neededRanges(
     const have = appliedThrough(k, d);
     if (advSeq <= have) continue;
     const havePending = k.pending.get(d) ?? new Set<number>();
+    // TD-001: skipped seqs are never re-requested (receiver-local filter).
+    const haveSkipped = skippedOf(k, d);
     let lo = have + 1;
     for (let s = have + 1; s <= advSeq + 1; s++) {
-      // close the current run when hitting a pending seq or the end
-      if (s === advSeq + 1 || havePending.has(s)) {
+      // close the current run when hitting a pending/skipped seq or the end
+      if (s === advSeq + 1 || havePending.has(s) || haveSkipped.has(s)) {
         if (lo < s) need.push({ device_id: d, lo, hi: s - 1 });
         lo = s + 1;
       }

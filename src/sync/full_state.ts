@@ -342,6 +342,12 @@ export function applySnapshot(
       db.prepare(
         "DELETE FROM pending_changes WHERE device_id = ? AND local_seq <= ?",
       ).run(d, Math.max(current, s));
+      // TD-001 (8): a snapshot frontier legitimately jumps past skipped seqs
+      // (snapshot replaces incremental reconstruction). GC skip rows <= the
+      // new frontier; quarantine diagnostic rows survive (DC-08 §3.6).
+      db.prepare(
+        "DELETE FROM skipped_seqs WHERE producer_device_id = ? AND local_seq <= ?",
+      ).run(d, Math.max(current, s));
       // Mirror the durable advance into in-memory knowledge (DC-06 §3.4).
       // The Math.max write above is the single durable persistence point —
       // never overwritten by raw `s`, so applied_upto is monotone.
@@ -375,6 +381,14 @@ function advanceAppliedIfContiguous(
         if (s <= target) pend.delete(s);
       }
       if (pend.size === 0) k.pending.delete(deviceId);
+    }
+    // TD-001 (8): in-memory skipped mirror mirrors the durable GC.
+    if (k.skipped?.has(deviceId)) {
+      const set = k.skipped.get(deviceId)!;
+      for (const s of [...set]) {
+        if (s <= target) set.delete(s);
+      }
+      if (set.size === 0) k.skipped.delete(deviceId);
     }
   }
 }

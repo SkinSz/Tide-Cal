@@ -53,6 +53,19 @@ function initializeSchema(db: Database.Database): void {
     throw new Error(
       `database schema_version ${row.version} newer than supported ${SCHEMA_VERSION}`,
     );
+  } else if (row.version < SCHEMA_VERSION) {
+    // Forward migrations (run oldest-first, inside one transaction).
+    const tx = db.transaction(() => {
+      if (row!.version < 2) {
+        // TD-001: skipped_seqs (quarantine-and-skip progress resolution).
+        db.exec(`CREATE TABLE IF NOT EXISTS skipped_seqs (
+          producer_device_id TEXT NOT NULL,
+          local_seq          INTEGER NOT NULL CHECK (local_seq > 0),
+          PRIMARY KEY (producer_device_id, local_seq))`);
+      }
+      db.prepare("UPDATE schema_version SET version = ?").run(SCHEMA_VERSION);
+    });
+    tx();
   }
 }
 
@@ -277,6 +290,11 @@ export function applyRemoteChange(
         incoming.device_id,
         drained[drained.length - 1]!.local_seq,
       );
+      // TD-001 (4): the frontier advanced — skip rows at/below it are
+      // resolved (quarantine diagnostic rows are NEVER touched).
+      db.prepare(
+        "DELETE FROM skipped_seqs WHERE producer_device_id = ? AND local_seq <= ?",
+      ).run(incoming.device_id, drained[drained.length - 1]!.local_seq);
       mergeClocks(incoming.causality_clock);
       return "applied" as const;
     })();
@@ -286,6 +304,7 @@ export function applyRemoteChange(
     // the caller-visible knowledge stays at pre-call values.
     knowledge.appliedUpto = dbKnowledge.appliedUpto;
     knowledge.pending = dbKnowledge.pending;
+    knowledge.skipped = dbKnowledge.skipped;
     return outcome;
   } catch (err) {
     // C1 safety net (DC-02 §7.1 / DC-03 TR-8): a UNIQUE violation from the
@@ -296,6 +315,7 @@ export function applyRemoteChange(
       const fresh = loadKnowledgeFromDb(db);
       knowledge.appliedUpto = fresh.appliedUpto;
       knowledge.pending = fresh.pending;
+      knowledge.skipped = fresh.skipped;
       return "duplicate";
     }
     throw err;
@@ -304,10 +324,12 @@ export function applyRemoteChange(
 
 /**
  * C1 (Review 2): rebuild KnowledgeState from durable tables after restart.
- * appliedUpto comes from applied_upto; pending from pending_changes.
+ * appliedUpto comes from applied_upto; pending from pending_changes;
+ * TD-001: skipped seqs from skipped_seqs.
  */
 export function loadKnowledgeFromDb(db: Database.Database): KnowledgeState {
   const k = emptyKnowledge();
+  k.skipped = new Map();
   for (const r of db
     .prepare<[], { producer_device_id: string; applied_through: number }>(
       "SELECT producer_device_id, applied_through FROM applied_upto",
@@ -324,6 +346,18 @@ export function loadKnowledgeFromDb(db: Database.Database): KnowledgeState {
     if (!set) {
       set = new Set();
       k.pending.set(r.device_id, set);
+    }
+    set.add(r.local_seq);
+  }
+  for (const r of db
+    .prepare<[], { producer_device_id: string; local_seq: number }>(
+      "SELECT producer_device_id, local_seq FROM skipped_seqs",
+    )
+    .all()) {
+    let set = k.skipped.get(r.producer_device_id);
+    if (!set) {
+      set = new Set();
+      k.skipped.set(r.producer_device_id, set);
     }
     set.add(r.local_seq);
   }
@@ -385,4 +419,78 @@ export function countQuarantined(db: Database.Database, reason?: string): number
     )
     .get(reason);
   return row?.c ?? 0;
+}
+
+// ---------------------------------------------------------------------------
+// TD-001 — skipped_seqs (quarantine-and-skip) + quarantine listing surface
+// ---------------------------------------------------------------------------
+
+/**
+ * TD-001 (3): mark a quarantined producer seq as resolved for sequence
+ * progress. Idempotent; the quarantine diagnostic row itself is unchanged.
+ */
+export function markSeqSkipped(
+  db: Database.Database,
+  producerDeviceId: string,
+  localSeq: number,
+): void {
+  db.prepare(
+    "INSERT OR IGNORE INTO skipped_seqs (producer_device_id, local_seq) VALUES (?, ?)",
+  ).run(producerDeviceId, localSeq);
+}
+
+/** TD-001: does this (producer, seq) currently carry a skip row? */
+export function isSeqSkipped(
+  db: Database.Database,
+  producerDeviceId: string,
+  localSeq: number,
+): boolean {
+  return (
+    !!db
+      .prepare(
+        "SELECT 1 FROM skipped_seqs WHERE producer_device_id = ? AND local_seq = ?",
+      )
+      .get(producerDeviceId, localSeq)
+  );
+}
+
+/** TD-001: durable skip rows for a producer, ascending by seq. */
+export function listSkippedSeqs(
+  db: Database.Database,
+  producerDeviceId: string,
+): number[] {
+  return (
+    db
+      .prepare<[string], { local_seq: number }>(
+        "SELECT local_seq FROM skipped_seqs WHERE producer_device_id = ? ORDER BY local_seq",
+      )
+      .all(producerDeviceId)
+      .map((r) => r.local_seq)
+  );
+}
+
+export interface QuarantineRow {
+  quarantine_id: number;
+  quarantine_reason: string;
+  received_at_hlc: number;
+  sender_device_id: string;
+  /** raw record, stored JSON.stringify-verbatim (DC-04 TR-7) */
+  raw_record: string;
+}
+
+/**
+ * Option A "Sync Errors" surface (TD-001 §2): flat read-only list of
+ * quarantine rows, newest first. Diagnostics only — no retry/delete.
+ */
+export function listQuarantine(
+  db: Database.Database,
+  opts?: { limit?: number },
+): QuarantineRow[] {
+  return db
+    .prepare<[number], QuarantineRow>(
+      `SELECT quarantine_id, quarantine_reason, received_at_hlc,
+              sender_device_id, raw_record
+       FROM quarantine ORDER BY quarantine_id DESC LIMIT ?`,
+    )
+    .all(opts?.limit ?? 200);
 }

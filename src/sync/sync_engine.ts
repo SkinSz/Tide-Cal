@@ -14,7 +14,12 @@ import {
   appliedThrough,
   emptyKnowledge,
 } from "../sync/knowledge_state.ts";
-import { applyRemoteChange, quarantineRecord } from "../persistence/database.ts";
+import {
+  applyRemoteChange,
+  quarantineRecord,
+  markSeqSkipped,
+  isSeqSkipped,
+} from "../persistence/database.ts";
 import type { Database } from "better-sqlite3";
 // DC-09 full-state snapshot construction/application (M-7 trigger layer).
 import { applySnapshot, buildSnapshot, type Snapshot, type SnapshotEntry } from "./full_state.ts";
@@ -143,6 +148,8 @@ export interface SessionStats {
   receivedApplied: number;
   receivedBuffered: number;
   receivedDuplicate: number;
+  /** TD-001: records durably quarantined (outcome class is exclusive). */
+  receivedQuarantined: number;
 }
 
 interface KnowledgeHolder {
@@ -154,6 +161,11 @@ interface KnowledgeHolder {
 
 export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
   const knowledge = deps.knowledge ?? loadKnowledgeFromDb(deps.db);
+  // TD-001 (6): restart-time revalidation — every durable quarantine row is
+  // re-checked against current state; now-valid records apply idempotently
+  // (skip row removed, frontier may advance); still-invalid ones remain
+  // quarantined with their skip row. Validation is NOT weakened.
+  revalidateQuarantine(deps.db, deps.mutateEntity, knowledge);
   const holder: KnowledgeHolder = { knowledge };
   const maxBatch = deps.maxBatchRecords ?? 256;
   // DC-09 §3 trigger bookkeeping; streaks are per peer/direction. Session
@@ -197,12 +209,22 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     return clock;
   }
 
+  /** Element-wise MAX clock merge (same shape as applyRemoteChange's). */
+  function mergeDeviceClock(db: Database, clock: Record<string, number>): void {
+    const upsert = db.prepare(`
+      INSERT INTO device_clock (peer_device_id, max_seq) VALUES (?, ?)
+      ON CONFLICT(peer_device_id) DO UPDATE SET
+        max_seq = MAX(max_seq, excluded.max_seq)`);
+    for (const [d, s] of Object.entries(clock)) upsert.run(d, s);
+  }
+
   async function runSession(transport: SyncTransport): Promise<SessionStats> {
     const stats: SessionStats = {
       sent: 0,
       receivedApplied: 0,
       receivedBuffered: 0,
       receivedDuplicate: 0,
+      receivedQuarantined: 0,
     };
     // DC-09 §3.5: offers_made_this_session is in-memory only; a new session
     // gets fresh dedup state.
@@ -636,6 +658,33 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
 
   function applyBatch(changes: ChangeRecord[], stats: SessionStats): void {
     for (const raw of changes) {
+      // TD-001 (7): a seq that already carries a skip row is a duplicate
+      // re-delivery of a previously quarantined record — drop silently and
+      // merge clocks (DC-02 §7.1); never create a second quarantine row.
+      const rawProducer = (raw as { device_id?: unknown } | null)?.device_id;
+      const rawSeq = (raw as { local_seq?: unknown } | null)?.local_seq;
+      if (
+        typeof rawProducer === "string" &&
+        rawProducer.length > 0 &&
+        typeof rawSeq === "number" &&
+        Number.isInteger(rawSeq) &&
+        rawSeq > 0 &&
+        isSeqSkipped(deps.db, rawProducer, rawSeq)
+      ) {
+        const cc = (raw as { causality_clock?: unknown }).causality_clock;
+        if (
+          typeof cc === "object" &&
+          cc !== null &&
+          !Array.isArray(cc) &&
+          Object.values(cc).every(
+            (v) => typeof v === "number" && Number.isInteger(v) && v >= 0,
+          )
+        ) {
+          mergeDeviceClock(deps.db, cc as Record<string, number>);
+        }
+        stats.receivedDuplicate++;
+        continue;
+      }
       let record: ChangeRecord;
       try {
         record = validateChangeRecord(raw);
@@ -649,6 +698,29 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
           senderDeviceId: deps.selfDeviceId,
           rawRecord: raw,
         });
+        // TD-001 (3): the quarantined seq is resolved for sequence progress
+        // so later valid seqs can apply and pending above them drains.
+        const producer = (raw as { device_id?: unknown } | null)?.device_id;
+        const seq = (raw as { local_seq?: unknown } | null)?.local_seq;
+        if (
+          typeof producer === "string" &&
+          producer.length > 0 &&
+          typeof seq === "number" &&
+          Number.isInteger(seq) &&
+          seq > 0
+        ) {
+          markSeqSkipped(deps.db, producer, seq);
+          // Mirror onto the live knowledge so this session's neededRanges
+          // stops re-requesting the skipped position immediately.
+          if (!holder.knowledge.skipped) holder.knowledge.skipped = new Map();
+          let set = holder.knowledge.skipped.get(producer);
+          if (!set) {
+            set = new Set<number>();
+            holder.knowledge.skipped.set(producer, set);
+          }
+          set.add(seq);
+        }
+        stats.receivedQuarantined++;
         continue;
       }
       const outcome = applyRemoteChange(
@@ -725,13 +797,15 @@ async function expectType<T extends SyncMessage["type"]>(
 }
 
 /**
- * Rebuild in-memory knowledge state from persisted tables (F4 fix):
+ * TD-001 (5): rebuild in-memory knowledge from persisted tables (F4 fix):
  * applied_upto rows restore the contiguous frontiers, pending_changes rows
- * restore buffered out-of-order seqs. Without this, a restart regenerates an
+ * restore buffered out-of-order seqs, skipped_seqs rows restore the
+ * quarantined-and-skipped positions. Without this, a restart regenerates an
  * empty state and re-requests/over-applies records it already holds.
  */
 export function loadKnowledgeFromDb(db: Database) {
   const k = emptyKnowledge();
+  k.skipped = new Map();
   const upto = db
     .prepare(
       "SELECT producer_device_id AS d, applied_through AS a FROM applied_upto",
@@ -749,7 +823,85 @@ export function loadKnowledgeFromDb(db: Database) {
     }
     set.add(r.s);
   }
+  const skipped = db
+    .prepare(
+      "SELECT producer_device_id AS d, local_seq AS s FROM skipped_seqs",
+    )
+    .all() as Array<{ d: string; s: number }>;
+  for (const r of skipped) {
+    let set = k.skipped.get(r.d);
+    if (!set) {
+      set = new Set<number>();
+      k.skipped.set(r.d, set);
+    }
+    set.add(r.s);
+  }
   return k;
+}
+
+export interface RevalidationResult {
+  /** quarantine rows examined by this pass (DC-04 §4.3c countable) */
+  examined: number;
+  /** rows that became valid and were applied idempotently */
+  revalidated: number;
+  /** rows still invalid — remain quarantined with their skip row */
+  stillInvalid: number;
+}
+
+/**
+ * TD-001 (6): restart-time revalidation pass. Iterates EVERY quarantine row
+ * and re-runs validateChangeRecord + the full apply path against current
+ * durable state. Now-valid records apply idempotently (dedupe by changes
+ * UNIQUE), their skipped_seqs row is removed, and if the stalled seq becomes
+ * nextExpected the frontier advances honestly. Still-invalid records remain
+ * quarantined and skipped. Validation is never weakened; quarantine rows are
+ * never deleted (DC-04 §4.3b/TR-10).
+ */
+export function revalidateQuarantine(
+  db: Database,
+  mutate?: (db: Database, record: ChangeRecord) => void,
+  knowledge?: NonNullable<SyncEngineDeps["knowledge"]>,
+): RevalidationResult {
+  const rows = db
+    .prepare("SELECT raw_record FROM quarantine ORDER BY quarantine_id")
+    .all() as Array<{ raw_record: string }>;
+  const result: RevalidationResult = {
+    examined: 0,
+    revalidated: 0,
+    stillInvalid: 0,
+  };
+  for (const row of rows) {
+    result.examined++;
+    let record: ChangeRecord;
+    try {
+      record = validateChangeRecord(JSON.parse(row.raw_record));
+    } catch {
+      result.stillInvalid++; // still invalid: quarantine + skip unchanged
+      continue;
+    }
+    try {
+      // Atomic per row: the skip-row removal and the apply share one
+      // transaction (applyRemoteChange's inner transaction nests safely).
+      db.transaction(() => {
+        db.prepare(
+          "DELETE FROM skipped_seqs WHERE producer_device_id = ? AND local_seq = ?",
+        ).run(record.device_id, record.local_seq);
+        const k = knowledge ?? loadKnowledgeFromDb(db);
+        const outcome = applyRemoteChange(db, record, k, mutate);
+        if (outcome === "applied") {
+          result.revalidated++;
+        } else {
+          // duplicate (already have it) or buffered (gap remains): the skip
+          // row is legitimately gone. Quarantine diagnostic row survives.
+        }
+      })();
+    } catch {
+      // Domain mutation failed: remain quarantined, restore the skip row.
+      result.stillInvalid++;
+      markSeqSkipped(db, record.device_id, record.local_seq);
+    }
+  }
+  return result;
 }
 
 /** Fallback per-peer trigger key when no explicit peer id is configured. */

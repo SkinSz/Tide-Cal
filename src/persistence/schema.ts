@@ -2,7 +2,7 @@
 // One source of truth for table creation. Encryption-at-rest is applied at
 // connection level (SQLCipher key pragma) by the caller, not here.
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2; // v2: TD-001 skipped_seqs (quarantine-and-skip)
 
 export const DDL = `
 CREATE TABLE calendars (
@@ -188,6 +188,15 @@ CREATE TABLE quarantine (
     received_at_hlc   INTEGER NOT NULL,
     sender_device_id  TEXT NOT NULL,
     raw_record        TEXT NOT NULL
+);
+
+-- TD-001: producer seqs that were quarantined and are thereby resolved for
+-- sequence progress. One row per (producer, seq); compaction: rows <= the
+-- producer's applied_upto are GC'd on frontier advance.
+CREATE TABLE skipped_seqs (
+    producer_device_id TEXT NOT NULL,
+    local_seq          INTEGER NOT NULL CHECK (local_seq > 0),
+    PRIMARY KEY (producer_device_id, local_seq)
 );
 
 CREATE TABLE identity (
