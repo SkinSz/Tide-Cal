@@ -132,6 +132,31 @@ export function validateChangeRecord(r: unknown): ChangeRecord {
     throw new ChangeRecordError("missing_field", "hlc_timestamp must be a finite number");
   }
 
+  // TD-002: JSON.parse('{"x":1e999}') yields Infinity — a *number* per
+  // `typeof` that passes every structural check above, then corrupts durable
+  // rows (better-sqlite3 binds Infinity as REAL Infinity, NaN as NULL, and
+  // schedule wall/date strings derive to "NaN:NaN:NaN"-style garbage).
+  // Non-finite numbers can never be legitimately produced on the wire
+  // (JSON.stringify(NaN|Infinity) === "null"), so reject them here; the sync
+  // engine quarantines the record durably on validation failure.
+  {
+    const stack: unknown[] = [rec.payload];
+    while (stack.length > 0) {
+      const cur = stack.pop();
+      if (typeof cur === "number" && !Number.isFinite(cur)) {
+        throw new ChangeRecordError(
+          "missing_field",
+          "payload contains a non-finite number (NaN/Infinity from 1e999-style JSON overflow)",
+        );
+      }
+      if (Array.isArray(cur)) {
+        stack.push(...cur);
+      } else if (typeof cur === "object" && cur !== null) {
+        stack.push(...Object.values(cur as Record<string, unknown>));
+      }
+    }
+  }
+
   // change_id consistency (DC-01 §2 format rule)
   const expected = changeId(rec.device_id as string, rec.local_seq as number);
   if (rec.change_id !== expected) {

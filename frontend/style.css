@@ -309,3 +309,28 @@ dialog menu .spacer { flex: 1; }
   border-top: 1px solid var(--border);
   padding-top: 6px;
 }
+
+/* TD-006 / DC-16 §4: Paired Devices list + per-peer state rows */
+.paired-device-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: baseline;
+  border-bottom: 1px solid rgba(128, 128, 128, 0.25);
+  padding: 0.4rem 0;
+}
+.paired-device-actions {
+  display: flex;
+  gap: 0.4rem;
+  margin-left: auto;
+}
+.unblock-warning {
+  width: 100%;
+  white-space: normal;
+}
+.peer-state-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: baseline;
+}

@@ -19,7 +19,17 @@ import {
   quarantineRecord,
   markSeqSkipped,
   isSeqSkipped,
+  isHardBlocked,
+  hardBlockProducer,
+  appendInvalidTally,
+  reconcileQuarantineResolutions,
 } from "../persistence/database.ts";
+// TD-006 / DC-16: two-tier peer misbehavior handling (Tier-1 in-memory
+// ladder + Tier-2 durable hard block via hardBlockProducer).
+import {
+  PeerMisbehaviorTracker,
+  DEFAULT_MISBEHAVIOR_CONFIG,
+} from "./misbehavior.ts";
 import type { Database } from "better-sqlite3";
 // DC-09 full-state snapshot construction/application (M-7 trigger layer).
 import { applySnapshot, buildSnapshot, type Snapshot, type SnapshotEntry } from "./full_state.ts";
@@ -137,6 +147,13 @@ export interface SyncEngineDeps {
    * REVOCATION_RECORDS / REVOCATIONS_ACK piggyback on every session.
    */
   revocations?: RevocationChannel;
+  /**
+   * TD-006 / DC-16: per-peer misbehavior tracker (Tier-1 in-memory ladder).
+   * Shared instance across sessions keeps ladder state alive process-wide;
+   * a fresh engine without one gets its own (in-memory fails OPEN either
+   * way — restart always clears Tier-1 state, DC-16 §2.3).
+   */
+  misbehavior?: PeerMisbehaviorTracker;
 }
 
 export interface SyncEngine {
@@ -150,6 +167,13 @@ export interface SessionStats {
   receivedDuplicate: number;
   /** TD-001: records durably quarantined (outcome class is exclusive). */
   receivedQuarantined: number;
+  /**
+   * TD-006 / DC-16 §3: records dropped AT INTAKE while that producer was
+   * throttled/suspended (one aggregated counter — no quarantine rows, skip
+   * entries, or UI entries per packet). Hard-block drops are NOT counted
+   * here (they cost nothing and are visible via the hard_blocks row).
+   */
+  receivedDroppedIntake: number;
 }
 
 interface KnowledgeHolder {
@@ -166,12 +190,25 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
   // (skip row removed, frontier may advance); still-invalid ones remain
   // quarantined with their skip row. Validation is NOT weakened.
   revalidateQuarantine(deps.db, deps.mutateEntity, knowledge);
+  // TD-005 hook (one line, per integration note): after a revalidation pass
+  // that applied formerly-quarantined records, mark those rows resolved.
+  reconcileQuarantineResolutions(deps.db);
   const holder: KnowledgeHolder = { knowledge };
   const maxBatch = deps.maxBatchRecords ?? 256;
   // DC-09 §3 trigger bookkeeping; streaks are per peer/direction. Session
   // start resets the Trigger-A streak (§3.1); dedup is per-session (§3.5).
   const triggers = deps.triggers ?? new TriggerStateTracker();
   let sessionDedup = new OfferDedup();
+  // TD-006 / DC-16: Tier-1 tracker (in-memory, fails OPEN). The Tier-2 hard
+  // block is written durably through the onHardBlock hook; the intake gate
+  // re-checks the DURABLE row on every record so a hard block applies
+  // instantly from any ladder level and survives restarts.
+  const misbehavior =
+    deps.misbehavior ??
+    new PeerMisbehaviorTracker(DEFAULT_MISBEHAVIOR_CONFIG, Date.now);
+  // The durable Tier-2 write ALWAYS goes through this engine's database,
+  // including for an injected tracker (hook is attached, not replaced).
+  misbehavior.onHardBlock = (p) => hardBlockProducer(deps.db, p);
 
   /**
    * H-4: one cached pending receive per session/transport. Calling this
@@ -225,6 +262,7 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
       receivedBuffered: 0,
       receivedDuplicate: 0,
       receivedQuarantined: 0,
+      receivedDroppedIntake: 0,
     };
     // DC-09 §3.5: offers_made_this_session is in-memory only; a new session
     // gets fresh dedup state.
@@ -658,6 +696,32 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
 
   function applyBatch(changes: ChangeRecord[], stats: SessionStats): void {
     for (const raw of changes) {
+      // TD-006 / DC-16 §2.1: per-PRODUCER key from the batch envelope's
+      // record itself (cheap field read — no JSON parse / validation yet).
+      const rawDevice: unknown = (raw as { device_id?: unknown } | null)
+        ?.device_id;
+      const producer: string =
+        typeof rawDevice === "string" && rawDevice.length > 0
+          ? rawDevice
+          : (deps.peerDeviceId ?? "unknown");
+
+      // --- TD-006 Tier 2 (durable): hard block drops EVERYTHING from this
+      // producer BEFORE validation/parsing — bounded storage, near-zero
+      // cost; nothing is quarantined, skipped, or listed while blocked.
+      // Requests FROM the peer are still answered (serveRequests is
+      // untouched; this gate is receive-of-data only).
+      if (isHardBlocked(deps.db, producer)) continue;
+
+      // --- TD-006 Tier 1 Level 2/3 (in-memory): throttle/suspend intake
+      // drop. No quarantine rows, no skip entries, no per-packet UI
+      // entries — one aggregated drop counter. Dropped arrivals still feed
+      // the Tier-2 flood window (burst resistance, evaluated on ARRIVAL).
+      if (misbehavior.isIntakeDropped(producer)) {
+        misbehavior.recordDropped(producer);
+        stats.receivedDroppedIntake++;
+        continue;
+      }
+
       // TD-001 (7): a seq that already carries a skip row is a duplicate
       // re-delivery of a previously quarantined record — drop silently and
       // merge clocks (DC-02 §7.1); never create a second quarantine row.
@@ -683,6 +747,9 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
           mergeDeviceClock(deps.db, cc as Record<string, number>);
         }
         stats.receivedDuplicate++;
+        // TD-006: re-delivery of an already-skipped record is a normal
+        // arrival (feeds the ratio denominator, never the invalid count).
+        misbehavior.recordOk(producer);
         continue;
       }
       let record: ChangeRecord;
@@ -700,27 +767,32 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
         });
         // TD-001 (3): the quarantined seq is resolved for sequence progress
         // so later valid seqs can apply and pending above them drains.
-        const producer = (raw as { device_id?: unknown } | null)?.device_id;
+        const skippedProducer = (raw as { device_id?: unknown } | null)?.device_id;
         const seq = (raw as { local_seq?: unknown } | null)?.local_seq;
         if (
-          typeof producer === "string" &&
-          producer.length > 0 &&
+          typeof skippedProducer === "string" &&
+          skippedProducer.length > 0 &&
           typeof seq === "number" &&
           Number.isInteger(seq) &&
           seq > 0
         ) {
-          markSeqSkipped(deps.db, producer, seq);
+          markSeqSkipped(deps.db, skippedProducer, seq);
           // Mirror onto the live knowledge so this session's neededRanges
           // stops re-requesting the skipped position immediately.
           if (!holder.knowledge.skipped) holder.knowledge.skipped = new Map();
-          let set = holder.knowledge.skipped.get(producer);
+          let set = holder.knowledge.skipped.get(skippedProducer);
           if (!set) {
             set = new Set<number>();
-            holder.knowledge.skipped.set(producer, set);
+            holder.knowledge.skipped.set(skippedProducer, set);
           }
           set.add(seq);
         }
         stats.receivedQuarantined++;
+        // TD-006 / DC-16 §2.1-2.2: this is the ONLY feed into the misbehavior
+        // ladder — validation rejections reaching the quarantine branch.
+        // Transport errors and snapshot-delivered records never reach here.
+        misbehavior.recordInvalid(producer);
+        appendInvalidTally(deps.db, producer); // §2.3 durable tally (informative only)
         continue;
       }
       const outcome = applyRemoteChange(
@@ -732,6 +804,9 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
       if (outcome === "applied") stats.receivedApplied++;
       else if (outcome === "buffered") stats.receivedBuffered++;
       else stats.receivedDuplicate++;
+      // TD-006: a non-rejected outcome is a normal arrival — feeds the
+      // window's ratio denominator (and can drive clean-window recovery).
+      misbehavior.recordOk(producer);
     }
   }
 

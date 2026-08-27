@@ -37,7 +37,20 @@ import {
   makeEntityMutator,
   createSyncEngine,
 } from "./sync_service.ts";
-import { listQuarantine, countQuarantined } from "../database.ts";
+import {
+  listQuarantine,
+  countQuarantined,
+  listQuarantineStats,
+  listHardBlocks,
+  unhardBlockProducer,
+  listPeerInvalidTally,
+} from "../database.ts";
+// TD-006 / DC-16: Tier-1 tracker (in-memory) + state surface for the UI.
+import {
+  PeerMisbehaviorTracker,
+  LADDER_LABELS,
+  type PeerTier1State,
+} from "../../sync/misbehavior.ts";
 
 type Json = Record<string, unknown>;
 
@@ -49,6 +62,12 @@ export type Dispatcher = (op: string, args: Json) => unknown;
  */
 export class SyncManager {
   readonly identity;
+  /**
+   * TD-006 / DC-16: process-wide Tier-1 tracker, shared by every engine
+   * session this sidecar runs, so ladder state persists across sessions.
+   * In-memory ONLY — a sidecar restart fails OPEN back to Level 0 (§2.3).
+   */
+  readonly misbehavior = new PeerMisbehaviorTracker();
   private host: { actualPort: number; close(): void } | null = null;
 
   constructor(
@@ -95,6 +114,7 @@ export class SyncManager {
       db: this.core.db,
       selfDeviceId: this.identity.deviceId,
       mutateEntity: makeEntityMutator(),
+      misbehavior: this.misbehavior,
     });
     const stats = await engine.runSession(session.transport);
     session.done();
@@ -113,6 +133,86 @@ export class SyncManager {
     void this.runEngineSession(session).catch(() => {
       /* fail-closed: logged by transport; session is dead */
     });
+  }
+
+  // ------------------------------------------------------------------
+  // TD-006 / DC-16 §4: peer-state visibility + explicit recovery actions
+  // ------------------------------------------------------------------
+
+  /**
+   * Per-peer misbehavior state for the UI (Sync-Errors badge + Paired
+   * Devices). Merge of: paired peers, live Tier-1 ladder state, Tier-2
+   * durable hard blocks, and the §2.3 durable invalid tally (history).
+   */
+  peerStateSnapshot(): Array<
+    PeerTier1State & {
+      paired: boolean;
+      display_name: string | null;
+      paired_at: number | null;
+      ladder_label: string;
+      hard_block:
+        | {
+            first_triggered_at: number;
+            last_triggered_at: number;
+            trigger_count: number;
+          }
+        | null;
+      tally: { total_invalid: number; last_invalid_at: number } | null;
+    }
+  > {
+    const peers = listTrustedPeers(this.core.db);
+    const blocks = new Map(listHardBlocks(this.core.db).map((b) => [b.producer_device_id, b]));
+    const tally = new Map(
+      listPeerInvalidTally(this.core.db).map((t) => [t.producer_device_id, t]),
+    );
+    const known = new Set<string>([
+      ...peers.map((p) => p.device_id),
+      ...this.misbehavior.knownPeers(),
+      ...blocks.keys(),
+      ...tally.keys(),
+    ]);
+    const out = [];
+    for (const id of Array.from(known).sort()) {
+      const paired = peers.some((p) => p.device_id === id);
+      const peer = peers.find((p) => p.device_id === id);
+      const t1 = this.misbehavior.getState(id);
+      const b = blocks.get(id) ?? null;
+      const tl = tally.get(id) ?? null;
+      out.push({
+        ...t1,
+        paired,
+        display_name: peer?.display_name ?? null,
+        paired_at: peer ? peer.paired_at * 1000 : null,
+        ladder_label: LADDER_LABELS[t1.level],
+        hard_block: b
+          ? {
+              first_triggered_at: b.first_triggered_at,
+              last_triggered_at: b.last_triggered_at,
+              trigger_count: b.trigger_count,
+            }
+          : null,
+        tally: tl
+          ? { total_invalid: tl.total_invalid, last_invalid_at: tl.last_invalid_at }
+          : null,
+      });
+    }
+    return out;
+  }
+
+  /** §4.2 Tier-1 manual override: one click, back to Level 0 immediately. */
+  resetPeerState(deviceId: string): void {
+    this.misbehavior.resetPeer(deviceId);
+  }
+
+  /**
+   * §4.2 Tier-2 Unblock (the UI enforces the two-step confirmation; this is
+   * the actual action). Clears the durable row and returns the peer to
+   * Tier-1 Level 0 observation.
+   */
+  unblockPeer(deviceId: string): boolean {
+    const cleared = unhardBlockProducer(this.core.db, deviceId);
+    this.misbehavior.resetPeer(deviceId);
+    return cleared;
   }
 }
 
@@ -213,6 +313,40 @@ export function makeSyncDispatcher(
           total: countQuarantined(core.db),
         };
       }
+      // TD-005: active/resolved/total counts for the Sync-Errors badge
+      // (badge counts ACTIVE only; resolved rows are archived diagnostics).
+      case "quarantine_stats": {
+        return listQuarantineStats(core.db);
+      }
+      // --- TD-006 / DC-16 §4: peer misbehavior visibility + recovery ------
+      // Read-only per-peer state (Sync-Errors badge section + Paired Devices).
+      case "peer_state": {
+        return { peers: sync.peerStateSnapshot() };
+      }
+      // O4 Paired Devices list: identity id, display name, paired-since,
+      // last-seen (null: not tracked), Tier-1 + Tier-2 state per device.
+      case "list_paired_devices": {
+        return {
+          self_device_id: sync.identity.deviceId,
+          devices: sync.peerStateSnapshot().filter((p) => p.paired),
+        };
+      }
+      // §4.2 Tier-1: "Reset peer state" — one click, no confirmation.
+      case "reset_peer_state": {
+        if (typeof args.device_id !== "string" || args.device_id.length === 0) {
+          throw new Error("device_id required");
+        }
+        sync.resetPeerState(args.device_id);
+        return { ok: true };
+      }
+      // §4.2 Tier-2: "Unblock" — two-step confirmation lives in the UI;
+      // this executes the cleared action and returns to Level 0.
+      case "unblock_peer": {
+        if (typeof args.device_id !== "string" || args.device_id.length === 0) {
+          throw new Error("device_id required");
+        }
+        return { ok: true, cleared: sync.unblockPeer(args.device_id) };
+      }
       default:
         throw new Error(`unknown op: ${op}`);
     }
@@ -268,7 +402,9 @@ function main(): void {
   const combined: Dispatcher = (op, args) =>
     op.startsWith("sync_") || op === "device_info" ||
     op === "pairing_offer" || op === "pairing_accept" ||
-    op === "list_quarantine"
+    op === "list_quarantine" || op === "quarantine_stats" ||
+    op === "peer_state" || op === "list_paired_devices" ||
+    op === "reset_peer_state" || op === "unblock_peer"
       ? syncDispatch(op, args)
       : dispatch(op, args);
   const rl = createInterface({ input: process.stdin });

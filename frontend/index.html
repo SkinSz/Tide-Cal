@@ -19,6 +19,9 @@
       <button id="btn-conflicts" title="No unresolved conflicts">
         <span class="conflicts-label">⚠ Conflicts (0)</span>
       </button>
+      <button id="btn-paired-devices" title="Paired devices">
+        <span class="paired-label">📱 Paired</span>
+      </button>
       <button id="btn-sync-errors" title="No quarantined records">
         <span class="sync-errors-label">⛔ Sync errors (<span id="sync-errors-count">0</span>)</span>
       </button>
@@ -124,9 +127,25 @@
           quarantined (kept verbatim, never applied). Read-only diagnostics.
         </p>
         <div id="sync-errors-list"></div>
+        <div id="peer-state-list"></div>
         <menu>
           <span class="spacer"></span>
           <button type="button" id="sync-errors-close">Close</button>
+        </menu>
+      </div>
+    </dialog>
+
+    <dialog id="paired-devices-dialog">
+      <div class="dlg-body devices-dlg">
+        <h2>Paired devices</h2>
+        <p class="muted">
+          Devices paired with this one, with their sync-behavior state.
+          Read-only except the explicit actions below.
+        </p>
+        <div id="paired-devices-list"></div>
+        <menu>
+          <span class="spacer"></span>
+          <button type="button" id="paired-devices-close">Close</button>
         </menu>
       </div>
     </dialog>

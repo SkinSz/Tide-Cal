@@ -2,7 +2,7 @@
 // One source of truth for table creation. Encryption-at-rest is applied at
 // connection level (SQLCipher key pragma) by the caller, not here.
 
-export const SCHEMA_VERSION = 2; // v2: TD-001 skipped_seqs (quarantine-and-skip)
+export const SCHEMA_VERSION = 4; // v2: TD-001 skipped_seqs; v3: TD-005 quarantine lifecycle (resolved_at_hlc, resolved_reason); v4: TD-006/DC-16 hard_blocks + peer_invalid_tally
 
 export const DDL = `
 CREATE TABLE calendars (
@@ -187,7 +187,11 @@ CREATE TABLE quarantine (
     quarantine_reason TEXT NOT NULL,
     received_at_hlc   INTEGER NOT NULL,
     sender_device_id  TEXT NOT NULL,
-    raw_record        TEXT NOT NULL
+    raw_record        TEXT NOT NULL,
+    -- TD-005 lifecycle: NULL = still active. Rows are NEVER deleted;
+    -- resolution is archival, written only when the record applies.
+    resolved_at_hlc   INTEGER,
+    resolved_reason   TEXT
 );
 
 -- TD-001: producer seqs that were quarantined and are thereby resolved for
@@ -197,6 +201,26 @@ CREATE TABLE skipped_seqs (
     producer_device_id TEXT NOT NULL,
     local_seq          INTEGER NOT NULL CHECK (local_seq > 0),
     PRIMARY KEY (producer_device_id, local_seq)
+);
+
+-- TD-006 / DC-16 §2.4 Tier 2: DURABLE hard block (NOT self-clearing).
+-- Survives restart; removed ONLY by explicit user Unblock (§4.2) or
+-- unpair/revocation. While a row exists, intake drops everything from that
+-- producer before validation/parsing.
+CREATE TABLE hard_blocks (
+    producer_device_id TEXT PRIMARY KEY,
+    first_triggered_at INTEGER NOT NULL,
+    last_triggered_at  INTEGER NOT NULL,
+    trigger_count      INTEGER NOT NULL CHECK (trigger_count > 0)
+);
+
+-- TD-006 / DC-16 §2.3: small durable per-producer tally (total invalid +
+-- last-seen). Informs UI history across restarts ONLY; it NEVER triggers
+-- blocking on its own — thresholds on the live in-memory window decide.
+CREATE TABLE peer_invalid_tally (
+    producer_device_id TEXT PRIMARY KEY,
+    total_invalid      INTEGER NOT NULL CHECK (total_invalid >= 0),
+    last_invalid_at    INTEGER NOT NULL
 );
 
 CREATE TABLE identity (

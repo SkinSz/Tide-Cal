@@ -4,6 +4,7 @@ import { initDialog } from "./dialog.ts";
 import { initConflicts } from "./conflicts.ts";
 import { initDevices } from "./devices.ts";
 import { initSyncErrors } from "./sync_errors.ts";
+import { initPairedDevices } from "./paired_devices.ts";
 
 function wire(id: string, fn: () => void): void {
   document.getElementById(id)?.addEventListener("click", fn);
@@ -33,5 +34,6 @@ initDialog();
 initConflicts();
 initDevices();
 initSyncErrors();
+initPairedDevices();
 if (getViewMode() === "week") setMode("week");
 else setMode("month");

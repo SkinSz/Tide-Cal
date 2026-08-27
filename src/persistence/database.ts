@@ -63,6 +63,37 @@ function initializeSchema(db: Database.Database): void {
           local_seq          INTEGER NOT NULL CHECK (local_seq > 0),
           PRIMARY KEY (producer_device_id, local_seq))`);
       }
+      if (row!.version < 3) {
+        // TD-005: quarantine lifecycle — durable resolved/active distinction.
+        // NULL columns = row still active. Rows are NEVER deleted. Column
+        // guards keep this safe if a sibling v3 migration already applied
+        // overlapping changes (collision coordination).
+        const cols = (
+          db.prepare("PRAGMA table_info(quarantine)").all() as Array<
+            { name: string }
+          >
+        ).map((c) => c.name);
+        if (!cols.includes("resolved_at_hlc")) {
+          db.exec("ALTER TABLE quarantine ADD COLUMN resolved_at_hlc INTEGER");
+        }
+        if (!cols.includes("resolved_reason")) {
+          db.exec("ALTER TABLE quarantine ADD COLUMN resolved_reason TEXT");
+        }
+      }
+      if (row!.version < 4) {
+        // TD-006 / DC-16: Tier-2 durable hard_blocks + §2.3 durable tally.
+        // CREATE TABLE IF NOT EXISTS keeps this safe if a sibling migration
+        // already created the tables (collision coordination).
+        db.exec(`CREATE TABLE IF NOT EXISTS hard_blocks (
+          producer_device_id TEXT PRIMARY KEY,
+          first_triggered_at INTEGER NOT NULL,
+          last_triggered_at  INTEGER NOT NULL,
+          trigger_count      INTEGER NOT NULL CHECK (trigger_count > 0))`);
+        db.exec(`CREATE TABLE IF NOT EXISTS peer_invalid_tally (
+          producer_device_id TEXT PRIMARY KEY,
+          total_invalid      INTEGER NOT NULL CHECK (total_invalid >= 0),
+          last_invalid_at    INTEGER NOT NULL)`);
+      }
       db.prepare("UPDATE schema_version SET version = ?").run(SCHEMA_VERSION);
     });
     tx();
@@ -476,11 +507,17 @@ export interface QuarantineRow {
   sender_device_id: string;
   /** raw record, stored JSON.stringify-verbatim (DC-04 TR-7) */
   raw_record: string;
+  /** TD-005 lifecycle: epoch-ms when the record applied successfully; NULL = active */
+  resolved_at_hlc: number | null;
+  /** TD-005: why the row was resolved (e.g. "revalidated_on_restart"); NULL = active */
+  resolved_reason: string | null;
 }
 
 /**
  * Option A "Sync Errors" surface (TD-001 §2): flat read-only list of
  * quarantine rows, newest first. Diagnostics only — no retry/delete.
+ * TD-005: rows additionally carry the lifecycle flag (resolved_at_hlc /
+ * resolved_reason); the list itself remains unfiltered (active + resolved).
  */
 export function listQuarantine(
   db: Database.Database,
@@ -489,8 +526,212 @@ export function listQuarantine(
   return db
     .prepare<[number], QuarantineRow>(
       `SELECT quarantine_id, quarantine_reason, received_at_hlc,
-              sender_device_id, raw_record
+              sender_device_id, raw_record,
+              resolved_at_hlc, resolved_reason
        FROM quarantine ORDER BY quarantine_id DESC LIMIT ?`,
     )
     .all(opts?.limit ?? 200);
+}
+
+// ---------------------------------------------------------------------------
+// TD-005 — quarantine lifecycle: durable resolved/active distinction
+// ---------------------------------------------------------------------------
+
+/**
+ * TD-005: mark a quarantine row resolved (archive, never delete). Idempotent:
+ * an already-resolved row keeps its ORIGINAL resolution timestamp/reason.
+ * Call from wherever an apply of a formerly-quarantined record succeeds —
+ * the restart-time revalidation pass (revalidateQuarantine) is the primary
+ * integration point (see reconcileQuarantineResolutions below).
+ */
+export function markQuarantineResolved(
+  db: Database.Database,
+  quarantineId: number,
+  reason: string,
+): boolean {
+  const info = db
+    .prepare(
+      `UPDATE quarantine
+       SET resolved_at_hlc = ?, resolved_reason = ?
+       WHERE quarantine_id = ? AND resolved_at_hlc IS NULL`,
+    )
+    .run(Date.now(), reason, quarantineId);
+  return info.changes > 0;
+}
+
+/**
+ * TD-005: derive resolution flags for ACTIVE quarantine rows by checking
+ * whether each quarantined record's change now exists in the durable changes
+ * table (i.e. it was applied — e.g. by revalidateQuarantine at restart).
+ * Idempotent: resolved rows are skipped, so double-running is a no-op.
+ * Returns { examined, marked }.
+ *
+ * INTEGRATION NOTE: `revalidateQuarantine` lives in src/sync/sync_engine.ts
+ * (owned by the TD-006 agent in this window). After a revalidation pass that
+ * reports revalidated > 0, sync_engine should call:
+ *   reconcileQuarantineResolutions(db)
+ * — a one-line hook — so newly-applied quarantine rows are marked resolved.
+ */
+export function reconcileQuarantineResolutions(
+  db: Database.Database,
+): { examined: number; marked: number } {
+  const rows = db
+    .prepare<
+      [],
+      { quarantine_id: number; raw_record: string }
+    >(
+      "SELECT quarantine_id, raw_record FROM quarantine WHERE resolved_at_hlc IS NULL",
+    )
+    .all();
+  const exists = db.prepare("SELECT 1 FROM changes WHERE change_id = ?");
+  let marked = 0;
+  for (const row of rows) {
+    let deviceId: unknown;
+    let localSeq: unknown;
+    try {
+      const raw = JSON.parse(row.raw_record) as {
+        device_id?: unknown;
+        local_seq?: unknown;
+      };
+      deviceId = raw.device_id;
+      localSeq = raw.local_seq;
+    } catch {
+      continue; // unparsable raw record: cannot derive a change_id
+    }
+    if (typeof deviceId !== "string") continue;
+    if (typeof localSeq !== "number" || !Number.isInteger(localSeq)) continue;
+    const changeIdStr = `${deviceId}:${localSeq}`; // matches change_record.ts changeId()
+    if (exists.get(changeIdStr)) {
+      if (markQuarantineResolved(db, row.quarantine_id, "revalidated_on_restart")) {
+        marked++;
+      }
+    }
+  }
+  return { examined: rows.length, marked };
+}
+
+/**
+ * TD-005: badge/dialog stats. The badge counts ACTIVE rows only — resolved
+ * rows are archived diagnostics, not pending problems.
+ */
+export function listQuarantineStats(
+  db: Database.Database,
+): { active: number; resolved: number; total: number } {
+  const row = db
+    .prepare<
+      [],
+      { active: number; resolved: number; total: number }
+    >(
+      `SELECT SUM(CASE WHEN resolved_at_hlc IS NULL THEN 1 ELSE 0 END) AS active,
+              SUM(CASE WHEN resolved_at_hlc IS NOT NULL THEN 1 ELSE 0 END) AS resolved,
+              COUNT(*) AS total
+       FROM quarantine`,
+    )
+    .get();
+  return {
+    active: row?.active ?? 0,
+    resolved: row?.resolved ?? 0,
+    total: row?.total ?? 0,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// TD-006 / DC-16 — Tier-2 durable hard blocks + §2.3 durable invalid tally
+// ---------------------------------------------------------------------------
+
+export interface HardBlockRow {
+  producer_device_id: string;
+  first_triggered_at: number;
+  last_triggered_at: number;
+  trigger_count: number;
+}
+
+/** Is this producer currently hard-blocked (durable, NOT self-clearing)? */
+export function isHardBlocked(
+  db: Database.Database,
+  producerDeviceId: string,
+): boolean {
+  return !!db
+    .prepare("SELECT 1 FROM hard_blocks WHERE producer_device_id = ?")
+    .get(producerDeviceId);
+}
+
+/**
+ * Record/refresh a Tier-2 hard block. Idempotent upsert: the FIRST trigger
+ * timestamp and the cumulative trigger_count are preserved across re-triggers
+ * so the UI can state why/when the block happened (DC-16 §4.2).
+ */
+export function hardBlockProducer(
+  db: Database.Database,
+  producerDeviceId: string,
+): void {
+  const now = Date.now();
+  db.prepare(
+    `INSERT INTO hard_blocks
+       (producer_device_id, first_triggered_at, last_triggered_at, trigger_count)
+     VALUES (?, ?, ?, 1)
+     ON CONFLICT(producer_device_id) DO UPDATE SET
+       last_triggered_at = excluded.last_triggered_at,
+       trigger_count = trigger_count + 1`,
+  ).run(producerDeviceId, now, now);
+}
+
+/** §4.2 Unblock: explicit user action ONLY — clears the durable row. */
+export function unhardBlockProducer(
+  db: Database.Database,
+  producerDeviceId: string,
+): boolean {
+  const info = db
+    .prepare("DELETE FROM hard_blocks WHERE producer_device_id = ?")
+    .run(producerDeviceId);
+  return info.changes > 0;
+}
+
+/** All durable hard blocks (Paired Devices / peer-state surface). */
+export function listHardBlocks(db: Database.Database): HardBlockRow[] {
+  return db
+    .prepare<
+      [],
+      HardBlockRow
+    >(`SELECT producer_device_id, first_triggered_at, last_triggered_at,
+              trigger_count
+       FROM hard_blocks ORDER BY last_triggered_at DESC`)
+    .all();
+}
+
+export interface PeerInvalidTallyRow {
+  producer_device_id: string;
+  total_invalid: number;
+  last_invalid_at: number;
+}
+
+/**
+ * §2.3 durable tally: appended at the same time quarantine rows are written.
+ * Informs UI history across restarts ONLY — it NEVER triggers blocking.
+ */
+export function appendInvalidTally(
+  db: Database.Database,
+  producerDeviceId: string,
+): void {
+  db.prepare(
+    `INSERT INTO peer_invalid_tally
+       (producer_device_id, total_invalid, last_invalid_at)
+     VALUES (?, 1, ?)
+     ON CONFLICT(producer_device_id) DO UPDATE SET
+       total_invalid = total_invalid + 1,
+       last_invalid_at = excluded.last_invalid_at`,
+  ).run(producerDeviceId, Date.now());
+}
+
+/** Durable tally rows (one per producer that ever sent an invalid record). */
+export function listPeerInvalidTally(
+  db: Database.Database,
+): PeerInvalidTallyRow[] {
+  return db
+    .prepare<
+      [],
+      PeerInvalidTallyRow
+    >(`SELECT producer_device_id, total_invalid, last_invalid_at
+       FROM peer_invalid_tally ORDER BY last_invalid_at DESC`)
+    .all();
 }

@@ -12,6 +12,10 @@ export interface QuarantineRow {
   received_at_hlc: number;
   sender_device_id: string;
   raw_record: string;
+  /** TD-005 lifecycle: epoch-ms of resolution; null/undefined = still active */
+  resolved_at_hlc?: number | null;
+  /** TD-005: why the row was resolved; null/undefined = still active */
+  resolved_reason?: string | null;
 }
 
 /** One display row of the Sync Errors dialog. */
@@ -25,6 +29,10 @@ export interface SyncErrorView {
   reason: string;
   received_at_hlc: number;
   raw: string;
+  /** TD-005: true once the row is resolved (archived, not deleted) */
+  resolved: boolean;
+  /** TD-005: resolution reason (e.g. "revalidated_on_restart"); null while active */
+  resolved_reason: string | null;
 }
 
 /**
@@ -55,6 +63,8 @@ export function shapeQuarantineRows(rows: QuarantineRow[]): SyncErrorView[] {
       reason: r.quarantine_reason,
       received_at_hlc: r.received_at_hlc,
       raw: r.raw_record,
+      resolved: r.resolved_at_hlc != null,
+      resolved_reason: r.resolved_reason ?? null,
     };
   });
 }
@@ -67,6 +77,121 @@ function el<T extends HTMLElement>(id: string): T {
   return dlg().querySelector(`#${id}`) as T;
 }
 
+// ---------------------------------------------------------------------------
+// TD-006 / DC-16 §4.1: per-peer misbehavior state in the Sync-Errors surface
+// (extended badge/dialog, NOT a new screen). Level 0 peers add nothing —
+// healthy peers stay silent (no noise).
+// ---------------------------------------------------------------------------
+
+/** Wire shape of one entry of the `peer_state` op result (sidecar). */
+export interface PeerStateRow {
+  device_id: string;
+  level: number;
+  recommend_unpair: boolean;
+  window_invalid: number;
+  window_total: number;
+  window_ratio: number;
+  dropped_while_throttled: number;
+  paired: boolean;
+  display_name: string | null;
+  paired_at: number | null;
+  ladder_label: string;
+  hard_block: {
+    first_triggered_at: number;
+    last_triggered_at: number;
+    trigger_count: number;
+  } | null;
+  tally: { total_invalid: number; last_invalid_at: number } | null;
+}
+
+/** One display row of the per-peer state section. */
+export interface PeerStateView {
+  device_id: string;
+  display: string;
+  /** DC-16 §3 ladder level 0-3 (+ hard-block flag rendered separately) */
+  level: number;
+  label: string;
+  /** true when the peer must appear in the UI (Level 1+ or hard-blocked) */
+  notable: boolean;
+  /** human one-liner: level, window counts, drop counter, hard block */
+  summary: string;
+  /** L4 RECOMMENDATION only — never an executed state (DC-16 D7) */
+  recommend_unpair: boolean;
+}
+
+/** Pure shaping (unit-testable without DOM). Verbatim numbers, no spin. */
+export function shapePeerStates(rows: PeerStateRow[]): PeerStateView[] {
+  return rows.map((r) => {
+    const hardBlocked = r.hard_block !== null;
+    const notable = r.level > 0 || hardBlocked;
+    const parts: string[] = [];
+    if (r.level > 0 || hardBlocked) {
+      parts.push(`level ${r.level} (${r.ladder_label})`);
+      parts.push(
+        `window: ${r.window_invalid} invalid / ${r.window_total} received` +
+          ` (${Math.round(r.window_ratio * 100)}%)`,
+      );
+      if (r.dropped_while_throttled > 0) {
+        parts.push(`${r.dropped_while_throttled} dropped while throttled`);
+      }
+      if (hardBlocked && r.hard_block) {
+        parts.push(
+          `HARD BLOCKED since ${new Date(r.hard_block.first_triggered_at).toISOString()}` +
+            ` (triggers: ${r.hard_block.trigger_count})`,
+        );
+      }
+    }
+    return {
+      device_id: r.device_id,
+      display:
+        r.display_name ??
+        (r.device_id.length > 16 ? r.device_id.slice(0, 16) + "…" : r.device_id),
+      level: r.level,
+      label: r.ladder_label,
+      notable,
+      summary: parts.join(" — "),
+      recommend_unpair: r.recommend_unpair === true,
+    };
+  });
+}
+
+/** Render the per-peer state section (notable peers only; silence at L0). */
+function renderPeerStates(): void {
+  const box = el<HTMLDivElement>("peer-state-list");
+  box.innerHTML = "";
+  void (async () => {
+    let rows: PeerStateRow[] = [];
+    try {
+      rows = (await syncOp<{ peers: PeerStateRow[] }>("peer_state")).peers;
+    } catch {
+      return; // shell unavailable: leave the section empty (honest degrade)
+    }
+    const views = shapePeerStates(rows).filter((v) => v.notable);
+    if (views.length === 0) return; // DC-16 §4.1: Level 0 adds nothing
+    const heading = document.createElement("h3");
+    heading.textContent = "Peer state";
+    box.appendChild(heading);
+    for (const v of views) {
+      const row = document.createElement("div");
+      row.className = "sync-error-row peer-state-row";
+      const name = document.createElement("strong");
+      name.textContent = v.display;
+      const state = document.createElement("code");
+      state.className = "muted";
+      state.textContent = v.summary;
+      row.append(name, state);
+      if (v.recommend_unpair) {
+        const rec = document.createElement("div");
+        rec.className = "muted";
+        rec.textContent =
+          "Recommendation: unpair this device via the pairing/revocation flow (requires your confirmation; nothing happens automatically).";
+        row.appendChild(rec);
+      }
+      box.appendChild(row);
+    }
+  })();
+}
+
 async function fetchQuarantine(): Promise<{
   rows: QuarantineRow[];
   total: number;
@@ -74,23 +199,45 @@ async function fetchQuarantine(): Promise<{
   return syncOp<{ rows: QuarantineRow[]; total: number }>("list_quarantine");
 }
 
+interface QuarantineStats {
+  active: number;
+  resolved: number;
+  total: number;
+}
+
+/**
+ * TD-005: badge counts ACTIVE quarantine rows only — resolved rows are
+ * archived diagnostics, not pending problems. Falls back to the pre-TD-005
+ * total (list_quarantine) when the stats op is unavailable.
+ */
+async function fetchQuarantineStats(): Promise<QuarantineStats> {
+  try {
+    return await syncOp<QuarantineStats>("quarantine_stats");
+  } catch {
+    // Older sidecar without quarantine_stats: keep the badge working.
+    const { total } = await fetchQuarantine();
+    return { active: total, resolved: 0, total };
+  }
+}
+
 /** Update the toolbar badge count (called on init + dialog close + syncs). */
 export async function refreshSyncErrorsBadge(): Promise<void> {
   const btn = document.getElementById("btn-sync-errors");
   if (!btn) return;
-  let total = 0;
+  let stats: QuarantineStats;
   try {
-    total = (await fetchQuarantine()).total;
+    stats = await fetchQuarantineStats();
   } catch (err) {
-    console.warn("[tide] list_quarantine unavailable:", err);
+    console.warn("[tide] quarantine stats unavailable:", err);
     el<HTMLElement>("sync-errors-count").textContent = "?";
     return;
   }
-  el<HTMLElement>("sync-errors-count").textContent = String(total);
+  el<HTMLElement>("sync-errors-count").textContent = String(stats.active);
   btn.title =
-    total > 0
-      ? `${total} quarantined record(s)`
-      : "No quarantined records";
+    stats.active > 0
+      ? `${stats.active} active quarantined record(s)` +
+        (stats.resolved > 0 ? `, ${stats.resolved} resolved` : "")
+      : "No active quarantined records";
 }
 
 function renderList(rows: QuarantineRow[]): void {
@@ -101,31 +248,59 @@ function renderList(rows: QuarantineRow[]): void {
       '<p class="muted">No quarantined records. Sync is healthy.</p>';
     return;
   }
-  for (const view of shapeQuarantineRows(rows)) {
-    const row = document.createElement("div");
-    row.className = "sync-error-row";
-
-    const head = document.createElement("div");
-    head.className = "peer-row";
-    const title = document.createElement("strong");
-    title.textContent = `#${view.quarantine_id} — ${view.producer} seq ${
-      view.seq >= 0 ? String(view.seq) : "?"
-    }`;
-    const reason = document.createElement("code");
-    reason.className = "muted";
-    reason.textContent = view.reason; // verbatim reason code
-    head.append(title, reason);
-
+  const views = shapeQuarantineRows(rows);
+  const active = views.filter((v) => !v.resolved);
+  const resolved = views.filter((v) => v.resolved);
+  if (active.length === 0 && resolved.length > 0) {
+    list.innerHTML =
+      '<p class="muted">No active quarantined records. Sync is healthy.</p>';
+  }
+  for (const view of active) list.appendChild(renderErrorRow(view));
+  if (resolved.length > 0) {
+    // TD-005: resolved rows collapse under an archive section — visible,
+    // searchable history, but out of the way of live problems.
     const details = document.createElement("details");
     const summary = document.createElement("summary");
-    summary.textContent = "raw metadata";
-    const pre = document.createElement("pre");
-    pre.textContent = view.raw;
-    details.append(summary, pre);
-
-    row.append(head, details);
-    list.appendChild(row);
+    summary.className = "muted";
+    summary.textContent = `Resolved (${resolved.length})`;
+    details.appendChild(summary);
+    for (const view of resolved) details.appendChild(renderErrorRow(view));
+    list.appendChild(details);
   }
+}
+
+function renderErrorRow(view: SyncErrorView): HTMLDivElement {
+  const row = document.createElement("div");
+  row.className = "sync-error-row";
+
+  const head = document.createElement("div");
+  head.className = "peer-row";
+  const title = document.createElement("strong");
+  title.textContent = `#${view.quarantine_id} — ${view.producer} seq ${
+    view.seq >= 0 ? String(view.seq) : "?"
+  }`;
+  const reason = document.createElement("code");
+  reason.className = "muted";
+  reason.textContent = view.reason; // verbatim reason code
+  head.append(title, reason);
+
+  const details = document.createElement("details");
+  const summary = document.createElement("summary");
+  summary.textContent = "raw metadata";
+  const pre = document.createElement("pre");
+  pre.textContent = view.raw;
+  details.append(summary, pre);
+
+  row.append(head, details);
+  if (view.resolved) {
+    // TD-005: show both the original quarantine reason (above) and how the
+    // row was resolved. Archive only — no retry/delete actions exist.
+    const res = document.createElement("div");
+    res.className = "muted";
+    res.textContent = `resolved: ${view.resolved_reason ?? "unknown"}`;
+    row.appendChild(res);
+  }
+  return row;
 }
 
 export function initSyncErrors(): void {
@@ -139,6 +314,7 @@ export function initSyncErrors(): void {
           console.warn("[tide] list_quarantine unavailable:", err);
           renderList([]);
         }
+        renderPeerStates(); // TD-006 §4.1: per-peer ladder / hard-block state
         dlg().showModal();
       })();
     });
