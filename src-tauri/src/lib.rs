@@ -112,11 +112,22 @@ async fn sync_op(
     op: String,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    const ALLOWED: [&str; 4] = [
+    const ALLOWED: [&str; 13] = [
         "device_info",
         "pairing_offer",
         "pairing_accept",
         "sync_now",
+        // TD-005/DC-16 quarantine + peer-misbehavior surface (sync_errors,
+        // paired_devices dialogs):
+        "list_quarantine",
+        "quarantine_stats",
+        "retry_quarantine",
+        "delete_quarantine",
+        "peer_state",
+        "list_paired_devices",
+        "reset_peer_state",
+        "unblock_peer",
+        "list_series",
     ];
     if !ALLOWED.contains(&op.as_str()) {
         return Err(format!("op not allowed over this command: {op}"));

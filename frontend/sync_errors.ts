@@ -5,6 +5,7 @@
 // Reason codes are shown VERBATIM; raw metadata is expandable via <details>.
 // Data comes through the Tauri `sync_op` passthrough (no new Rust commands).
 import { syncOp } from "./devices.ts";
+import { resolveDeviceLabel, type PairedDeviceEntry } from "./device-label.ts";
 
 export interface QuarantineRow {
   quarantine_id: number;
@@ -25,6 +26,8 @@ export interface SyncErrorView {
   producer: string;
   /** producer local_seq parsed out of raw_record (-1 when unparsable) */
   seq: number;
+  /** full sender device id (resolved to a display label at render time) */
+  sender: string;
   /** reason code VERBATIM (never interpreted/reworded) */
   reason: string;
   /** TD-005 remainder: short plain-language sentence for the reason code */
@@ -102,6 +105,77 @@ export function humanReason(code: string): string {
 }
 
 /**
+ * Owner-approved card redesign (2026-08-27): severity glyph in the headline.
+ * "Permanent" = the record is structurally incompatible with this version
+ * (unrecognized op/type/field, or ID mismatch) — Retry can never fix it.
+ * Everything else (clock/seq/timestamp malformations, unknown codes) is
+ * treated as possibly-transient: ⚠. Unknown codes stay ⚠ — we never claim
+ * permanence we can't prove.
+ */
+export function isPermanentReason(code: string): boolean {
+  if (
+    code === "invalid_member_id" ||
+    code === "bad_operation" ||
+    code === "bad_entity_type" ||
+    code === "id_mismatch"
+  ) {
+    return true;
+  }
+  const m = /^invalid_change_record:(.+)$/.exec(code);
+  if (!m) return false;
+  const d = m[1]!;
+  return (
+    ["invalid_member_id", "bad_operation", "bad_entity_type", "id_mismatch"].includes(d) ||
+    /^invalid operation /.test(d) ||
+    /^invalid entity_type /.test(d) ||
+    (d.startsWith("change_id ") && d.includes("!=")) ||
+    d.includes("non-finite number")
+  );
+}
+
+/**
+ * Relative timestamp for the card headline ("2h ago"); the absolute local
+ * time rides along for the title attribute (hover). Pure in `now` so tests
+ * are deterministic.
+ */
+export function relativeTime(
+  ms: number,
+  now: number = Date.now(),
+): { rel: string; abs: string } {
+  const abs = new Date(ms).toLocaleString();
+  if (!Number.isFinite(ms)) return { rel: "", abs };
+  const s = Math.round((now - ms) / 1000);
+  if (s < 45) return { rel: "just now", abs };
+  const m = Math.round(s / 60);
+  if (m < 60) return { rel: `${m}m ago`, abs };
+  const h = Math.round(m / 60);
+  if (h < 24) return { rel: `${h}h ago`, abs };
+  const d = Math.round(h / 24);
+  return { rel: `${d}d ago`, abs };
+}
+
+/**
+ * Affected-data line for the card context: best-effort extraction of the
+ * event title (payload.value of a field_path="title" upsert/set, or any
+ * string payload.value) from the raw record. Unparsable / titleless records
+ * degrade to the entity_id, then to "" (caller omits the line).
+ */
+export function affectedData(raw: string): string {
+  try {
+    const r = JSON.parse(raw) as {
+      payload?: { value?: unknown };
+      entity_id?: unknown;
+    };
+    const v = r.payload?.value;
+    if (typeof v === "string" && v.trim()) return v;
+    if (typeof r.entity_id === "string" && r.entity_id) return r.entity_id;
+  } catch {
+    /* unparsable raw record: no context line */
+  }
+  return "";
+}
+
+/**
  * Pure shaping of quarantine rows for display (unit-testable without DOM).
  * Nothing here interprets the record — producer/seq are read from the raw
  * record when it is shape-compatible, else shown as unavailable.
@@ -126,6 +200,7 @@ export function shapeQuarantineRows(rows: QuarantineRow[]): SyncErrorView[] {
       quarantine_id: r.quarantine_id,
       producer: producer ? producer.slice(0, 16) + "…" : "(unknown)",
       seq,
+      sender: r.sender_device_id,
       reason: r.quarantine_reason,
       reason_human: humanReason(r.quarantine_reason),
       received_at_hlc: r.received_at_hlc,
@@ -308,8 +383,31 @@ export async function refreshSyncErrorsBadge(): Promise<void> {
 }
 
 function renderList(rows: QuarantineRow[]): void {
+  void renderListAsync(rows);
+}
+
+/**
+ * Owner-approved card redesign (2026-08-27): cards under an "Active (N)"
+ * header, resolved rows collapsed below. Device labels come from
+ * device_info (paired display names + our own id); on failure the label
+ * helper degrades to truncated ids.
+ */
+async function renderListAsync(rows: QuarantineRow[]): Promise<void> {
   const list = el<HTMLDivElement>("sync-errors-list");
   list.innerHTML = "";
+  let paired: PairedDeviceEntry[] | null = null;
+  let selfId: string | null = null;
+  try {
+    const info = await syncOp<{
+      device_id: string;
+      paired_peers: PairedDeviceEntry[];
+    }>("device_info");
+    paired = info.paired_peers;
+    selfId = info.device_id;
+  } catch {
+    /* label degrade: truncated ids instead of display names */
+  }
+  const label = (id: string): string => resolveDeviceLabel(id, paired, selfId);
   if (rows.length === 0) {
     list.innerHTML =
       '<p class="muted">No quarantined records. Sync is healthy.</p>';
@@ -321,8 +419,12 @@ function renderList(rows: QuarantineRow[]): void {
   if (active.length === 0 && resolved.length > 0) {
     list.innerHTML =
       '<p class="muted">No active quarantined records. Sync is healthy.</p>';
+  } else {
+    const heading = document.createElement("h3");
+    heading.textContent = `Active (${active.length})`;
+    list.appendChild(heading);
+    for (const view of active) list.appendChild(renderErrorCard(view, label));
   }
-  for (const view of active) list.appendChild(renderErrorRow(view));
   if (resolved.length > 0) {
     // TD-005: resolved rows collapse under an archive section — visible,
     // searchable history, but out of the way of live problems.
@@ -331,58 +433,82 @@ function renderList(rows: QuarantineRow[]): void {
     summary.className = "muted";
     summary.textContent = `Resolved (${resolved.length})`;
     details.appendChild(summary);
-    for (const view of resolved) details.appendChild(renderErrorRow(view));
+    for (const view of resolved)
+      details.appendChild(renderErrorCard(view, label));
     list.appendChild(details);
   }
 }
 
-function renderErrorRow(view: SyncErrorView): HTMLDivElement {
-  const row = document.createElement("div");
-  row.className = "sync-error-row";
+/** Owner-approved card layout: human headline, context line, contained details. */
+function renderErrorCard(
+  view: SyncErrorView,
+  label: (id: string) => string,
+): HTMLDivElement {
+  const card = document.createElement("div");
+  card.className = "sync-error-card";
 
+  // Headline: severity glyph + plain-language reason + relative timestamp.
   const head = document.createElement("div");
-  head.className = "peer-row";
+  head.className = "sync-error-head";
   const title = document.createElement("strong");
-  title.textContent = `#${view.quarantine_id} — ${view.producer} seq ${
-    view.seq >= 0 ? String(view.seq) : "?"
-  }`;
-  const reason = document.createElement("code");
-  reason.className = "muted";
-  reason.textContent = view.reason; // verbatim reason code — never hidden
-  head.append(title, reason);
+  title.className = "reason-human";
+  title.textContent = isPermanentReason(view.reason)
+    ? `✖ ${view.reason_human}`
+    : `⚠ ${view.reason_human}`;
+  const when = relativeTime(view.received_at_hlc);
+  const time = document.createElement("span");
+  time.className = "muted sync-error-time";
+  time.textContent = when.rel;
+  time.title = when.abs; // absolute local time on hover
+  head.append(title, time);
 
-  // TD-005 remainder: plain-language sentence above the raw code.
-  const human = document.createElement("div");
-  human.className = "reason-human";
-  human.textContent = view.reason_human;
+  // Context line: sender device label + affected data (best effort).
+  const ctx = document.createElement("div");
+  ctx.className = "muted sync-error-context";
+  const affected = affectedData(view.raw);
+  // Owner note (smoke test): id + seq side-by-side read as one jumble —
+  // stack them on their own line so they parse as separate facts.
+  ctx.textContent = `From: ${label(view.sender)}` + (affected ? ` — “${affected}”` : "");
+  const metaIds = document.createElement("div");
+  metaIds.className = "muted sync-error-ids";
+  metaIds.textContent = `#${view.quarantine_id}` + (view.seq >= 0 ? ` · seq ${view.seq}` : "");
+  ctx.appendChild(metaIds);
 
+  // Technical reason code + raw metadata demoted into a collapsed, contained
+  // details block — must never widen the dialog (CSS containment in style.css).
   const details = document.createElement("details");
+  details.className = "sync-error-details";
   const summary = document.createElement("summary");
-  summary.textContent = "raw metadata";
+  summary.textContent = "Technical details";
+  const code = document.createElement("code");
+  code.className = "muted";
+  code.textContent = view.reason; // verbatim reason code — never hidden
   const pre = document.createElement("pre");
   pre.textContent = view.raw;
-  details.append(summary, pre);
+  details.append(summary, code, pre);
 
-  row.append(head, human, details);
+  card.append(head, ctx, details);
   if (view.resolved) {
     // TD-005: show both the original quarantine reason (above) and how the
-    // row was resolved. Archive only — no retry/delete actions exist.
+    // row was resolved. Archive only — no retry/discard actions.
     const res = document.createElement("div");
     res.className = "muted";
     res.textContent = `resolved: ${RESOLVED_HINTS[view.resolved_reason ?? ""] ?? view.resolved_reason ?? "unknown"}`;
-    row.appendChild(res);
-    return row;
+    card.appendChild(res);
+    return card;
   }
 
   // --- TD-005 remainder: per-item actions on ACTIVE rows only ------------
   const actions = document.createElement("div");
   actions.className = "sync-error-actions";
+  let revertTimer: ReturnType<typeof setTimeout> | undefined;
 
   const retry = document.createElement("button");
   retry.type = "button";
   retry.textContent = "Retry";
   retry.title = "Re-check this record now and apply it if it has become valid.";
   retry.addEventListener("click", () => {
+    clearTimeout(revertTimer);
     retry.disabled = true;
     retry.textContent = "Retrying…";
     void (async () => {
@@ -408,13 +534,15 @@ function renderErrorRow(view: SyncErrorView): HTMLDivElement {
     })();
   });
 
-  const del = document.createElement("button");
-  del.type = "button";
-  del.textContent = "Delete";
-  del.title = "Give up on this record permanently.";
-  del.addEventListener("click", () => {
-    // DC-15 §3.5 two-step confirmation (destructive action):
-    // state what happens, require an explicit second click.
+  const discard = document.createElement("button");
+  discard.type = "button";
+  discard.textContent = "Discard";
+  discard.title = "Give up on this record permanently.";
+  discard.addEventListener("click", () => {
+    // DC-15 §3.5 two-step confirmation (destructive action), in-app:
+    // state what happens, require an explicit second click, revert after a
+    // timeout so the armed state never lingers.
+    clearTimeout(revertTimer);
     const warn = document.createElement("span");
     warn.className = "delete-warning";
     warn.textContent =
@@ -422,8 +550,9 @@ function renderErrorRow(view: SyncErrorView): HTMLDivElement {
       "It will NEVER be applied, and the sender will not be notified.";
     const confirmBtn = document.createElement("button");
     confirmBtn.type = "button";
-    confirmBtn.textContent = "Confirm delete";
+    confirmBtn.textContent = "Confirm discard?";
     confirmBtn.addEventListener("click", () => {
+      clearTimeout(revertTimer);
       confirmBtn.disabled = true;
       void (async () => {
         let note: string;
@@ -434,7 +563,7 @@ function renderErrorRow(view: SyncErrorView): HTMLDivElement {
           });
           note = "Record given up on. Later records from this device still sync.";
         } catch (err) {
-          note = `Delete failed: ${err instanceof Error ? err.message : String(err)}`;
+          note = `Discard failed: ${err instanceof Error ? err.message : String(err)}`;
         }
         const noteEl = document.createElement("span");
         noteEl.className = "muted";
@@ -447,14 +576,16 @@ function renderErrorRow(view: SyncErrorView): HTMLDivElement {
     cancelBtn.type = "button";
     cancelBtn.textContent = "Cancel";
     cancelBtn.addEventListener("click", () => {
-      actions.replaceChildren(retry, del);
+      clearTimeout(revertTimer);
+      actions.replaceChildren(retry, discard);
     });
     actions.replaceChildren(warn, confirmBtn, cancelBtn);
+    revertTimer = setTimeout(() => actions.replaceChildren(retry, discard), 8000);
   });
 
-  actions.append(retry, del);
-  row.appendChild(actions);
-  return row;
+  actions.append(retry, discard);
+  card.appendChild(actions);
+  return card;
 }
 
 /** Plain-language labels for resolved_reason codes (verbatim fallback). */
@@ -485,6 +616,12 @@ export function initSyncErrors(): void {
           console.warn("[tide] list_quarantine unavailable:", err);
           renderList([]);
         }
+        // Badge FIX (2026-08-27): the badge only refreshed at app init and on
+        // dialog close, so rows that appeared after init (seeding, incoming
+        // sync while the app idles) left it stale — the smoke test saw badge
+        // "0" over a dialog full of rows. Re-sync the badge every time the
+        // surface is opened so it converges with the list the user sees.
+        void refreshSyncErrorsBadge();
         renderPeerStates(); // TD-006 §4.1: per-peer ladder / hard-block state
         dlg().showModal();
       })();

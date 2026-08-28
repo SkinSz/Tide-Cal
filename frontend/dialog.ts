@@ -22,6 +22,72 @@ function field<T extends HTMLElement>(id: string): T {
   return dlg().querySelector(`#${id}`) as T;
 }
 
+/**
+ * In-app inline error line (replaces native alert() popups — owner flagged
+ * the WebKit "javascript - HTTP URL" chrome as unacceptable). Shows above
+ * the dialog footer; cleared on the next open/save.
+ */
+function showInlineError(msg: string): void {
+  removeInlineErrorEl();
+  const div = document.createElement("div");
+  div.className = "dialog-error";
+  div.setAttribute("role", "alert");
+  div.textContent = msg;
+  const menu = dlg().querySelector("menu");
+  menu?.parentElement?.insertBefore(div, menu);
+}
+
+function removeInlineErrorEl(): void {
+  // Tolerant removal: minimal test DOM stubs return node-like objects
+  // without .remove(), and this must be a no-op there.
+  const e = dlg().querySelector(".dialog-error") as
+    | { remove?: () => void }
+    | null;
+  if (e && typeof e.remove === "function") e.remove();
+}
+
+function clearInlineError(): void {
+  removeInlineErrorEl();
+}
+
+/**
+ * Two-step inline destructive confirmation for Delete (same pattern as the
+ * Sync-Errors "Discard" flow): first click arms ("Confirm delete?" + warning
+ * line), second click executes; reverts after a timeout or Cancel.
+ */
+function armDeleteConfirm(
+  btn: HTMLButtonElement,
+  onConfirmed: () => void,
+): void {
+  if (btn.dataset.armed === "1") {
+    btn.dataset.armed = "";
+    clearDeleteArm(btn);
+    onConfirmed();
+    return;
+  }
+  btn.dataset.armed = "1";
+  btn.textContent = "Confirm delete?";
+  const warn = document.createElement("span");
+  warn.className = "delete-warning";
+  warn.textContent = "This event will be permanently deleted on this device.";
+  btn.after(warn);
+  btn.dataset.revertTimer = window.setTimeout(() => clearDeleteArm(btn), 8000).toString();
+}
+
+function clearDeleteArm(btn: HTMLButtonElement): void {
+  btn.dataset.armed = "";
+  if (btn.dataset.revertTimer) {
+    clearTimeout(Number(btn.dataset.revertTimer));
+    btn.dataset.revertTimer = "";
+  }
+  btn.textContent = "Delete";
+  const warns = btn.parentElement?.querySelectorAll(".delete-warning") ?? [];
+  for (const w of warns) {
+    if (typeof (w as { remove?: () => void }).remove === "function")
+      (w as HTMLElement).remove();
+  }
+}
+
 const pad = (n: number): string => String(n).padStart(2, "0");
 
 /** Local YYYY-MM-DD for an epoch-ms instant. */
@@ -132,6 +198,7 @@ function closeTimeMenus(): void {
 
 function openFor(date: Date, existing?: CalendarEvent): void {
   const d = new Date(date);
+  clearInlineError();
 
   field<HTMLInputElement>("ev-id").value = existing?.id ?? "";
   field<HTMLInputElement>("ev-title").value = existing?.title ?? "";
@@ -214,6 +281,8 @@ export function initDialog(): void {
     openFor(getSelectedDate());
   });
 
+  // Edit dialog: fired on event DOUBLE-click only (calendar.ts). Single click
+  // selects (tide:eventselect) per the owner UX rule.
   document.addEventListener("tide:eventclick", (e) => {
     openFor(new Date(), (e as CustomEvent<CalendarEvent>).detail);
   });
@@ -267,22 +336,29 @@ export function initDialog(): void {
         dlg().close();
         document.dispatchEvent(new CustomEvent("tide:refresh"));
       } catch (err) {
-        alert(`Failed to save event: ${String(err)}`);
+        showInlineError(`Failed to save event: ${String(err)}`);
       }
     });
 
   document
     .getElementById("ev-delete")
-    ?.addEventListener("click", async () => {
+    ?.addEventListener("click", () => {
+      const btn = document.getElementById("ev-delete") as HTMLButtonElement;
       const id = field<HTMLInputElement>("ev-id").value;
-      if (!id || !confirm("Delete this event?")) return;
-      try {
-        await deleteEvent(id);
-        dlg().close();
-        document.dispatchEvent(new CustomEvent("tide:refresh"));
-      } catch (err) {
-        alert(`Failed to delete event: ${String(err)}`);
-      }
+      if (!id) return;
+      // Two-step in-app confirmation (no native confirm() — owner flagged
+      // the WebKit popup chrome). Second click executes the delete.
+      armDeleteConfirm(btn, () => {
+        void (async () => {
+          try {
+            await deleteEvent(id);
+            dlg().close();
+            document.dispatchEvent(new CustomEvent("tide:refresh"));
+          } catch (err) {
+            showInlineError(`Failed to delete event: ${String(err)}`);
+          }
+        })();
+      });
     });
 
   document

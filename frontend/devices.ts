@@ -6,17 +6,15 @@
 // module degrades honestly: buttons are disabled with a note.
 type Json = Record<string, unknown>;
 
+import { invoke } from "@tauri-apps/api/core";
+
 /** Tauri `sync_op` passthrough; shared by the Devices and Sync Errors views. */
 export async function syncOp<T = Json>(op: string, args: Json = {}): Promise<T> {
-  const w = globalThis as unknown as {
-    __TAURI_INTERNALS__?: unknown;
-    __TAURI__?: { invoke?: (cmd: string, args?: Json) => Promise<unknown> };
-  };
-  const invoke =
-    (globalThis as unknown as {
-      __tauriInvoke?: (cmd: string, args?: Json) => Promise<unknown>;
-    }).__tauriInvoke ?? w.__TAURI__?.invoke;
-  if (!invoke) throw new Error("not running inside the Tide desktop shell");
+  // Same IPC mechanism as store.ts. In a plain browser (vite dev without the
+  // shell) __TAURI_INTERNALS__ is absent -> degrade honestly.
+  if (!("__TAURI_INTERNALS__" in globalThis)) {
+    throw new Error("not running inside the Tide desktop shell");
+  }
   return (await invoke("sync_op", { op, args })) as T;
 }
 
@@ -48,9 +46,10 @@ async function renderDeviceInfo(): Promise<void> {
     (
       el<HTMLElement>("self-device-id") as HTMLElement
     ).textContent = `${info.device_id.slice(0, 18)}…`;
-    el<HTMLElement>("self-listen-port").textContent = String(
-      info.listening_port,
-    );
+    // Owner (smoke test 2026-08-27): the listening port is dev noise —
+    // hidden from the UI (still available in logs/debug).
+    const portEl = el<HTMLElement>("self-listen-port");
+    if (portEl.parentElement) portEl.parentElement.hidden = true;
     const list = el<HTMLDivElement>("peers-list");
     list.innerHTML = "";
     if (info.paired_peers.length === 0) {

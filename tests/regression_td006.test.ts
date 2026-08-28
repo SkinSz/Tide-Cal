@@ -571,7 +571,7 @@ describe("TD-006 dispatcher ops (peer_state / reset / unblock / list_paired_devi
     expect(() => dispatch("reset_peer_state", {})).toThrow();
   });
 
-  test("peer_state + list_paired_devices expose ladder level, hard block, tally", () => {
+  test("peer_state + list_paired_devices expose ladder level, hard block, tally", async () => {
     const { core, sync, dispatch } = makeManager();
     seedPeer(core.db);
     hardBlockProducer(core.db, BAD);
@@ -579,7 +579,7 @@ describe("TD-006 dispatcher ops (peer_state / reset / unblock / list_paired_devi
     appendInvalidTally(core.db, BAD); // §2.3 durable tally (engine appends this)
 
     const line = JSON.parse(
-      handleLine(
+      await handleLine(
         dispatch,
         JSON.stringify({ id: 9, op: "list_paired_devices", args: {} }),
       ),
@@ -661,7 +661,9 @@ describe("TD-006 UI shaping (pure layers)", () => {
       },
     ]);
     const v = devices[0]!;
-    expect(v.display).toBe("Paired device"); // no display name set
+    // Redesign 2026-08-27: unlabeled devices now show the truncated id
+    // (honest) instead of a generic invented placeholder.
+    expect(v.display).toBe("x519deadbeef0123…");
     expect(v.truncated_id).toBe("x519deadbeef0123…");
     expect(v.hard_blocked).toBe(true);
     expect(v.hard_block_summary).toContain("2 trigger(s)");

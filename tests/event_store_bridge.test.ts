@@ -188,25 +188,25 @@ describe("frontend/store.ts injected domain-core bridge", () => {
 });
 
 describe("sidecar protocol", () => {
-  test("request/response round-trip incl. error case", () => {
+  test("request/response round-trip incl. error case", async () => {
     const core = new EventCore(dbPath);
     const dispatch = makeDispatcher(core);
 
-    const ping = JSON.parse(handleLine(dispatch, '{"id":1,"op":"ping"}'));
+    const ping = JSON.parse(await handleLine(dispatch, '{"id":1,"op":"ping"}'));
     expect(ping.ok).toBe(true);
     expect(ping.result.pong).toBe(true);
 
     const created = JSON.parse(
-      handleLine(dispatch, JSON.stringify({ id: 2, op: "create_event", args: { input: INPUT } })),
+      await handleLine(dispatch, JSON.stringify({ id: 2, op: "create_event", args: { input: INPUT } })),
     );
     expect(created.ok).toBe(true);
     expect(created.result.title).toBe("Dentist");
 
-    const listed = JSON.parse(handleLine(dispatch, '{"id":3,"op":"list_events"}'));
+    const listed = JSON.parse(await handleLine(dispatch, '{"id":3,"op":"list_events"}'));
     expect(listed.ok).toBe(true);
     expect(listed.result).toHaveLength(1);
 
-    const bad = JSON.parse(handleLine(dispatch, '{"id":4,"op":"nope"}'));
+    const bad = JSON.parse(await handleLine(dispatch, '{"id":4,"op":"nope"}'));
     expect(bad.ok).toBe(false);
     expect(bad.error).toMatch(/unknown op/);
     core.db.close();

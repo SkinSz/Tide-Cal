@@ -195,7 +195,7 @@ describe("TD-005 remainder: per-item delete (give up)", () => {
     expect(outcome).toBe("applied"); // seq 2 did NOT stall behind seq 1
   });
 
-  test("RPC-level: dispatcher refuses delete_quarantine without confirm flag", () => {
+  test("RPC-level: dispatcher refuses delete_quarantine without confirm flag", async () => {
     const core = new EventCore(join(dir, "core.db"), SELF);
     const identity = loadOrCreateIdentity(dir);
     const sync = new SyncManager(core, identity, dir);
@@ -208,13 +208,13 @@ describe("TD-005 remainder: per-item delete (give up)", () => {
     const id = listQuarantine(core.db)[0]!.quarantine_id;
 
     const refused = JSON.parse(
-      handleLine(dispatch, JSON.stringify({ id: 1, op: "delete_quarantine", args: { quarantine_id: id } })),
+      await handleLine(dispatch, JSON.stringify({ id: 1, op: "delete_quarantine", args: { quarantine_id: id } })),
     ) as { ok: boolean; error: string };
     expect(refused.ok).toBe(false);
     expect(refused.error).toMatch(/confirm/);
 
     const ok = JSON.parse(
-      handleLine(dispatch, JSON.stringify({ id: 2, op: "delete_quarantine", args: { quarantine_id: id, confirm: true } })),
+      await handleLine(dispatch, JSON.stringify({ id: 2, op: "delete_quarantine", args: { quarantine_id: id, confirm: true } })),
     ) as { ok: boolean; result: { ok: boolean; skip_row_present: boolean } };
     expect(ok.ok).toBe(true);
     expect(ok.result.ok).toBe(true);

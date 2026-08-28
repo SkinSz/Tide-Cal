@@ -22,8 +22,14 @@ import {
 import { loadOrCreateIdentity } from "../src/network/sync_runtime.ts";
 import {
   shapeQuarantineRows,
+  relativeTime,
+  isPermanentReason,
+  affectedData,
   type QuarantineRow,
 } from "../frontend/sync_errors.ts";
+import {
+  resolveDeviceLabel,
+} from "../frontend/device-label.ts";
 import type { Database } from "better-sqlite3";
 
 let dir: string;
@@ -85,7 +91,7 @@ describe("listQuarantine (database surface)", () => {
 });
 
 describe("list_quarantine dispatcher op", () => {
-  test("returns {rows, total} through makeSyncDispatcher + handleLine", () => {
+  test("returns {rows, total} through makeSyncDispatcher + handleLine", async () => {
     const core = new EventCore(join(dir, "core.db"), "d-self");
     seedQuarantine(core.db); // the SyncManager reads core.db, not the outer db
     const identity = loadOrCreateIdentity(dir);
@@ -101,7 +107,7 @@ describe("list_quarantine dispatcher op", () => {
 
     // And through the stdio JSON-RPC envelope (sidecar wire shape).
     const line = JSON.parse(
-      handleLine(dispatch, JSON.stringify({ id: 7, op: "list_quarantine", args: {} })),
+      await handleLine(dispatch, JSON.stringify({ id: 7, op: "list_quarantine", args: {} })),
     );
     expect(line.ok).toBe(true);
     expect(line.id).toBe(7);
@@ -151,5 +157,99 @@ describe("Sync Errors display shaping (pure layer)", () => {
 
   test("empty quarantine shapes to an empty view list", () => {
     expect(shapeQuarantineRows([])).toEqual([]);
+  });
+
+  test("views carry the full sender id for label resolution", () => {
+    const views = shapeQuarantineRows([
+      {
+        quarantine_id: 1,
+        quarantine_reason: "bad_seq",
+        received_at_hlc: 1,
+        sender_device_id: "dev-f6d77e6c-156xxxx",
+        raw_record: "{}",
+      },
+    ]);
+    expect(views[0]!.sender).toBe("dev-f6d77e6c-156xxxx");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Owner-approved card redesign (2026-08-27): pure shaping helpers
+// ---------------------------------------------------------------------------
+describe("Sync-Errors card redesign helpers", () => {
+  test("relativeTime: deterministic buckets + absolute hover timestamp", () => {
+    const now = Date.UTC(2026, 7, 27, 20, 0, 0);
+    expect(relativeTime(now - 10_000, now).rel).toBe("just now");
+    expect(relativeTime(now - 2 * 60_000, now).rel).toBe("2m ago");
+    expect(relativeTime(now - 2 * 3_600_000, now).rel).toBe("2h ago");
+    expect(relativeTime(now - 3 * 86_400_000, now).rel).toBe("3d ago");
+    // Absolute time always present for the title attribute.
+    expect(relativeTime(now - 2 * 3_600_000, now).abs).toContain("2026");
+  });
+
+  test("isPermanentReason: structural incompatibility vs transient", () => {
+    // Permanent: retry can never fix these.
+    expect(isPermanentReason("invalid_change_record:bad_operation")).toBe(true);
+    expect(isPermanentReason("bad_operation")).toBe(true);
+    expect(isPermanentReason("id_mismatch")).toBe(true);
+    expect(isPermanentReason("invalid_change_record:invalid operation upsert")).toBe(true);
+    expect(
+      isPermanentReason("invalid_change_record:change_id a:1 != b:2"),
+    ).toBe(true);
+    // Transient / unknown: ⚠ (retry might help; never claim unprovable permanence).
+    expect(
+      isPermanentReason(
+        "invalid_change_record: causality_clock must be an object",
+      ),
+    ).toBe(false);
+    expect(isPermanentReason("bad_seq")).toBe(false);
+    expect(isPermanentReason("some_future_code")).toBe(false);
+  });
+
+  test("affectedData: event title from payload.value, entity_id fallback, honest empty", () => {
+    expect(
+      affectedData(
+        JSON.stringify({ payload: { value: "Dentist" }, entity_id: "evt-1" }),
+      ),
+    ).toBe("Dentist");
+    expect(affectedData(JSON.stringify({ entity_id: "evt-1" }))).toBe("evt-1");
+    expect(affectedData("not json")).toBe("");
+    expect(affectedData(JSON.stringify({ payload: { value: 42 } }))).toBe("");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Device-label helper (owner-approved UX package): adopted across sync surfaces
+// ---------------------------------------------------------------------------
+describe("resolveDeviceLabel", () => {
+  const paired = [
+    { device_id: "dev-paired-abcdef", display_name: "Laptop" },
+  ];
+
+  test("paired display_name wins", () => {
+    expect(resolveDeviceLabel("dev-paired-abcdef", paired)).toBe("Laptop");
+  });
+
+  test("self id resolves to 'This device' when not in the paired list", () => {
+    expect(resolveDeviceLabel("dev-self", paired, "dev-self")).toBe(
+      "This device",
+    );
+  });
+
+  test("fallback: truncated id, never invented names", () => {
+    expect(resolveDeviceLabel("dev-f6d77e6c-156abcdef", paired, "dev-self")).toBe(
+      "dev-f6d77e6c-156…",
+    );
+    expect(resolveDeviceLabel("short-id")).toBe("short-id");
+  });
+
+  test("empty paired display_name falls through to the id", () => {
+    expect(
+      resolveDeviceLabel(
+        "dev-x",
+        [{ device_id: "dev-x", display_name: "" }],
+        "dev-self",
+      ),
+    ).toBe("dev-x");
   });
 });

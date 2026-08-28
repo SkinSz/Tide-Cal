@@ -95,6 +95,7 @@ main { flex: 1; overflow: auto; padding: 8px; }
   text-overflow: ellipsis;
 }
 .chip-allday { background: var(--accent); color: #08131c; font-weight: 600; }
+.chip-selected { outline: 2px solid var(--accent); outline-offset: 1px; }
 .chip:hover { filter: brightness(1.15); }
 
 /* Dialog */
@@ -123,8 +124,13 @@ dialog textarea {
   font: inherit;
   font-size: 0.85rem;
 }
-dialog menu { display: flex; gap: 8px; margin: 16px 0 0; padding: 0; }
-dialog menu .spacer { flex: 1; }
+dialog menu { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0 0; padding: 0; }
+dialog menu .spacer { flex: 1 1 auto; }
+/* Smoke-test fix: the delete confirm warning (width:100% inside a flex menu)
+   forced the event dialog to jump ~2x wider. Cap the dialog and let the
+   warning wrap instead of stretching the row. */
+#event-dialog { max-width: min(92vw, 560px); }
+#event-dialog menu .delete-warning { min-width: 100%; }
 
 /* Conflicts (DC-14 surface) */
 #btn-conflicts.has-conflicts { border-color: var(--danger); color: var(--danger); }
@@ -200,7 +206,15 @@ dialog menu .spacer { flex: 1; }
   overflow: hidden;
   z-index: 1;
 }
-.lane-chip { margin-bottom: 3px; }
+.lane-chip {
+  margin-bottom: 3px;
+  /* Smoke-test fix: all-day chips are appended BEFORE the absolute
+     .hour-cell click-catcher bands; without positioning+z-index the
+     transparent hour cells painted on top and swallowed every click
+     (owner report: all-day events unselectable in week view). */
+  position: relative;
+  z-index: 2;
+}
 
 /* Hour guide lines through the day columns (week view) */
 .hour-line {
@@ -337,6 +351,57 @@ dialog menu .spacer { flex: 1; }
 
 /* TD-005 remainder: Sync-Errors per-row human reason + Retry/Delete actions */
 .reason-human { font-size: 0.8rem; margin-top: 2px; }
+
+/* Owner-approved card redesign (2026-08-27): card-per-error layout, contained
+   technical details, constrained dialog width. The raw metadata <pre> must
+   NEVER widen the dialog: max-width + overflow + break-all containment. */
+#sync-errors-dialog .dlg-body {
+  max-width: min(92vw, 760px);
+  max-height: 85vh;
+  overflow: auto;
+}
+.sync-error-card {
+  border: 1px solid var(--border, #444);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 8px 0;
+}
+.sync-error-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: baseline;
+  justify-content: space-between;
+}
+.sync-error-head .reason-human { font-size: 0.9rem; margin-top: 0; }
+.sync-error-context { font-size: 0.78rem; margin-top: 2px; }
+.sync-error-ids { margin-top: 2px; font-size: 0.72rem; opacity: 0.8; }
+.sync-error-details {
+  margin-top: 4px;
+  max-width: 100%;
+  overflow: hidden;
+}
+.sync-error-details summary {
+  cursor: pointer;
+  font-size: 0.78rem;
+  color: var(--muted, #9a9a9a);
+}
+.sync-error-details code {
+  display: block;
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+.sync-error-details pre {
+  margin: 4px 0 0;
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  overflow-wrap: anywhere;
+  max-width: 100%;
+}
+.sync-error-actions { justify-content: flex-end; }
 .sync-error-actions {
   display: flex;
   flex-wrap: wrap;
@@ -351,6 +416,15 @@ dialog menu .spacer { flex: 1; }
   font-size: 0.78rem;
   width: 100%;
   white-space: normal;
+}
+
+/* In-app inline error line (replaces native alert() popups). */
+.dialog-error {
+  color: var(--danger);
+  font-size: 0.8rem;
+  margin: 6px 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 /* Recurrence surfacing (DC-12 §2, display-only): series indicator + override

@@ -7,6 +7,7 @@
 //     revocation flow (no new unpair mechanism is created; D4/§5.4)
 // Data + actions ride the existing `sync_op` passthrough (no Rust changes).
 import { syncOp } from "./devices.ts";
+import { truncatedDeviceId } from "./device-label.ts";
 import type { PeerStateRow } from "./sync_errors.ts";
 
 export type PairedDeviceRow = PeerStateRow;
@@ -30,8 +31,8 @@ export interface PairedDeviceView {
 export function shapePairedDevices(rows: PairedDeviceRow[]): PairedDeviceView[] {
   return rows.map((r) => ({
     device_id: r.device_id,
-    display: r.display_name ?? "Paired device",
-    truncated_id: r.device_id.slice(0, 16) + "…",
+    display: r.display_name ?? truncatedDeviceId(r.device_id),
+    truncated_id: truncatedDeviceId(r.device_id),
     paired_at: r.paired_at,
     level: r.level,
     label: r.ladder_label,

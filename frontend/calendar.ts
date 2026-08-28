@@ -187,7 +187,26 @@ function eventChip(
   chip.textContent = allDayStyle ? ev.title : `${fmtTime(ev.startMs)} ${ev.title}`;
   chip.title = ev.title;
   decorateRecurrence(chip, ev, series);
+  // UX contract (owner rule): single-click SELECTS, double-click OPENS the
+  // edit dialog. Never open on single click.
+  chip.addEventListener("click", (e) => {
+    e.stopPropagation();
+    selectChip(chip);
+    document.dispatchEvent(new CustomEvent("tide:eventselect", { detail: ev }));
+  });
+  chip.addEventListener("dblclick", (e) => {
+    e.stopPropagation();
+    onEventClick(ev);
+  });
   return chip;
+}
+
+/** Visual selection: exactly one chip highlighted at a time. */
+function selectChip(chip: HTMLElement): void {
+  document
+    .querySelectorAll<HTMLElement>(".chip.chip-selected")
+    .forEach((el) => el.classList.remove("chip-selected"));
+  chip.classList.add("chip-selected");
 }
 
 function dayColumn(
@@ -217,10 +236,6 @@ function dayColumn(
     return s <= endOfDay(cell.date) && en >= startOfDay(cell.date);
   })) {
     const chip = eventChip(ev, ev.allDay || !sameDay(new Date(ev.startMs), cell.date), series);
-    chip.addEventListener("click", (e) => {
-      e.stopPropagation();
-      onEventClick(ev);
-    });
     list.appendChild(chip);
   }
   col.appendChild(list);
@@ -230,6 +245,16 @@ function dayColumn(
     render();
     document.dispatchEvent(
       new CustomEvent("tide:dayclick", { detail: cell.date.toISOString() }),
+    );
+  });
+  // Month view: double-click an empty day -> new-event dialog for that day
+  // (chip dblclicks stopPropagation above and open the edit dialog instead).
+  col.addEventListener("dblclick", (e) => {
+    const target = e.target as HTMLElement;
+    if (target.closest(".chip")) return;
+    selectedDate = startOfDay(cell.date);
+    document.dispatchEvent(
+      new CustomEvent("tide:neweventat", { detail: cell.date.toISOString() }),
     );
   });
   return col;
@@ -356,10 +381,6 @@ function weekDayColumn(
       new Date(e.endMs - 1) >= startOfDay(cell.date),
   )) {
     const chip = eventChip(ev, true, series);
-    chip.addEventListener("click", (e) => {
-      e.stopPropagation();
-      onEventClick(ev);
-    });
     chip.classList.add("lane-chip");
     col.appendChild(chip);
   }
@@ -385,10 +406,6 @@ function weekDayColumn(
     chip.style.top = `${topPct}%`;
     chip.style.height = `${heightPct}%`;
     chip.textContent = `${fmtTime(ev.startMs)} ${ev.title}`;
-    chip.addEventListener("click", (e) => {
-      e.stopPropagation();
-      onEventClick(ev);
-    });
     col.appendChild(chip);
   }
   void onEventClick;

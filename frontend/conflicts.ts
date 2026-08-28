@@ -273,7 +273,15 @@ async function actResolve(
   try {
     await store().resolve(detail.conflict_id, option);
   } catch (err) {
-    alert(`Failed to resolve conflict: ${String(err)}`);
+    // In-app inline error (no native alert() — owner flagged the WebKit
+    // popup chrome). Shown above the conflict detail; cleared on re-render.
+    const old = dlg().querySelector(".dialog-error");
+    old?.remove();
+    const div = document.createElement("div");
+    div.className = "dialog-error";
+    div.setAttribute("role", "alert");
+    div.textContent = `Failed to resolve conflict: ${String(err)}`;
+    el<HTMLDivElement>("conflict-detail").before(div);
     return;
   }
   await renderList(); // re-renders empty detail + refreshes badge

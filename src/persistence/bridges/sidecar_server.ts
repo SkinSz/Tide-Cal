@@ -94,13 +94,31 @@ export class SyncManager {
 
   ensureListener(port?: number): number {
     if (!this.host) {
+      // Root-cause fix (2026-08-27 smoke test): serveSync rejects with
+      // EADDRINUSE when the default sync port is already held (typically by
+      // a sidecar from a previous session that outlived its GUI). The old
+      // fire-and-forget chain had no catch, so the rejection went unhandled
+      // and Node exited with code 1 — killing the sidecar and taking every
+      // RPC surface down with it. Now: log, leave this.host null, and retry
+      // on the next ensureListener() call.
       void serveSync(
         this.identity.privateKey,
         port ?? SYNC_DEFAULT_PORT,
         (session) => this.onInbound(session),
-      ).then((h) => {
-        this.host = h;
-      });
+      ).then(
+        (h) => {
+          this.host = h;
+        },
+        (err: unknown) => {
+          console.error(
+            `[tide] sync listener failed to start on port ${port ?? SYNC_DEFAULT_PORT}:`,
+            err instanceof Error ? err.message : err,
+          );
+          console.error(
+            "[tide] sync inbound connections are unavailable until the port frees up; the calendar itself is unaffected.",
+          );
+        },
+      );
       // First listener creation is async; port is served shortly after.
       return port ?? SYNC_DEFAULT_PORT;
     }
@@ -396,16 +414,23 @@ export function makeSyncDispatcher(
   };
 }
 
-export function handleLine(dispatcher: Dispatcher, line: string): string {
+export async function handleLine(
+  dispatcher: Dispatcher,
+  line: string,
+): Promise<string> {
   let response: Json;
   try {
     const req = JSON.parse(line) as { id?: unknown; op?: string; args?: Json };
     if (typeof req.op !== "string") throw new Error("missing op");
     try {
+      // Await async op results BEFORE building the envelope: JSON.stringify
+      // serializes a raw Promise as {}, which silently dropped results for
+      // async ops (pairing_offer, pairing_accept, sync_now, ...). await also
+      // propagates rejections into the catch below → ok:false.
       response = {
         id: req.id ?? null,
         ok: true,
-        result: dispatcher(req.op, req.args ?? {}),
+        result: await Promise.resolve(dispatcher(req.op, req.args ?? {})),
       };
     } catch (e) {
       response = {
@@ -455,7 +480,9 @@ function main(): void {
   rl.on("line", (line) => {
     const trimmed = line.trim();
     if (!trimmed) return;
-    process.stdout.write(handleLine(combined, trimmed) + "\n");
+    void handleLine(combined, trimmed).then((out) =>
+      process.stdout.write(out + "\n"),
+    );
   });
   rl.on("close", () => {
     // Do NOT process.exit() here: pending async pipe writes would be cut
