@@ -92,6 +92,14 @@ export class SyncManager {
     return this.identity.deviceId;
   }
 
+  /** The port this sidecar will listen on (requested, if binding pending). */
+  private resolvedPort(requested?: number): number {
+    return requested ??
+      (process.env.TIDE_SYNC_PORT
+        ? Number(process.env.TIDE_SYNC_PORT)
+        : SYNC_DEFAULT_PORT);
+  }
+
   ensureListener(port?: number): number {
     if (!this.host) {
       // Root-cause fix (2026-08-27 smoke test): serveSync rejects with
@@ -103,7 +111,7 @@ export class SyncManager {
       // on the next ensureListener() call.
       void serveSync(
         this.identity.privateKey,
-        port ?? SYNC_DEFAULT_PORT,
+        this.resolvedPort(port),
         (session) => this.onInbound(session),
       ).then(
         (h) => {
@@ -111,7 +119,7 @@ export class SyncManager {
         },
         (err: unknown) => {
           console.error(
-            `[tide] sync listener failed to start on port ${port ?? SYNC_DEFAULT_PORT}:`,
+            `[tide] sync listener failed to start on port ${this.resolvedPort(port)}:`,
             err instanceof Error ? err.message : err,
           );
           console.error(
@@ -120,9 +128,24 @@ export class SyncManager {
         },
       );
       // First listener creation is async; port is served shortly after.
-      return port ?? SYNC_DEFAULT_PORT;
+      return this.resolvedPort();
     }
     return this.host.actualPort;
+  }
+
+  /**
+   * Close the sync listener (if any). Called on stdin EOF: the parent GUI
+   * is gone, so nothing can ever drain this listener again. NOTE: this
+   * stops new accepts and drops the listen handle, but established peer
+   * sockets and a pending pairing-offer listener (pairing_manager's own
+   * serveSync host) are NOT touched — the process.exit(0) in the stdin
+   * close handler is what guarantees teardown. Without that exit this
+   * method alone would not drain the loop.
+   * (investigation: docs/proposals/sidecar-orphan-investigation.md)
+   */
+  closeListener(): void {
+    this.host?.close();
+    this.host = null;
   }
 
   /** Run a sync engine session over an authenticated channel. */
@@ -485,8 +508,16 @@ function main(): void {
     );
   });
   rl.on("close", () => {
-    // Do NOT process.exit() here: pending async pipe writes would be cut
-    // off. Closing the DB and letting the event loop drain exits cleanly.
+    // Parent GUI closed our stdin — it is dead or dying (hard kill included:
+    // no Rust Drop runs there, but the pipe still EOFs). Close the sync
+    // listener (hygiene; established sockets are NOT drained — see
+    // SyncManager.closeListener), close the DB, then EXIT unconditionally.
+    // The exit is the actual orphan fix: db.close() is synchronous
+    // (better-sqlite3, WAL checkpoint included) and runs before the
+    // scheduled exit fires; if the DB layer ever becomes async, move
+    // exit into its completion callback.
+    sync.closeListener();
+    setImmediate(() => process.exit(0));
     core.db.close();
   });
 }
