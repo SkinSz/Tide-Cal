@@ -146,6 +146,53 @@ export class SyncManager {
   closeListener(): void {
     this.host?.close();
     this.host = null;
+    // Also kill any pending pairing-offer listener (created by
+    // createPairingOffer on an ephemeral port — outside this.host). An
+    // uncancelled offer is a LIVE pairing surface that survives the GUI.
+    this.cancelPendingOffer("sidecar listener shutdown");
+  }
+
+  /**
+   * Registry of the current pending pairing offer (one at a time — creating
+   * a new offer supersedes the previous one, matching the Devices UI flow).
+   * Tracked so stdin-EOF shutdown and explicit cancel_pairing_offer can
+   * close its listener. The stored promise is already caught by the
+   * dispatcher; cancel() rejects it with a benign error.
+   */
+  private pendingOffer: {
+    result: Promise<unknown>;
+    cancel: () => void;
+  } | null = null;
+
+  trackPairingOffer(offer: {
+    result: Promise<unknown>;
+    cancel: () => void;
+  }): void {
+    // One live offer at a time: a newer offer supersedes (and closes) the
+    // previous listener.
+    this.cancelPendingOffer("superseded by a newer pairing offer");
+    this.pendingOffer = offer;
+  }
+
+  cancelPendingOffer(_reason: string): void {
+    const offer = this.pendingOffer;
+    this.pendingOffer = null;
+    if (!offer) return;
+    try {
+      offer.cancel();
+    } catch {
+      // never throw during shutdown paths
+    }
+  }
+
+  /** True when `offer` is the currently tracked pending offer. */
+  hasPendingOffer(offer: { cancel: () => void }): boolean {
+    return this.pendingOffer === offer;
+  }
+
+  /** Drop the tracking entry without cancelling (ceremony completed). */
+  untrackPairingOffer(offer: { cancel: () => void }): void {
+    if (this.pendingOffer === offer) this.pendingOffer = null;
   }
 
   /** Run a sync engine session over an authenticated channel. */
@@ -307,6 +354,10 @@ export function makeSyncDispatcher(
       case "pairing_offer": {
         // NOTE: synchronous snapshot of an async ceremony — the offer object
         // keeps working after return; result arrives via pairing_status polls.
+        // The offer is TRACKED on the SyncManager: a newer offer supersedes
+        // it, cancel_pairing_offer closes it, and stdin-EOF shutdown closes
+        // it — an uncancelled offer would be a live pairing listener that
+        // survives the GUI (security surface, not just a resource leak).
         const offerPromise = createPairingOffer({
           identity: sync.identity,
           port: typeof args.port === "number" ? args.port : undefined,
@@ -314,8 +365,24 @@ export function makeSyncDispatcher(
             typeof args.name === "string" ? args.name : sync.identity.deviceId.slice(0, 12),
           store: sqlPeerStore(core.db),
         });
-        offerPromise.then((o) => o.result.catch(() => {})).catch(() => {});
+        void offerPromise
+          .then((o) => {
+            sync.trackPairingOffer(o);
+            // Self-untrack when the ceremony completes either way (paired,
+            // errored, or cancelled): nothing left to cancel afterwards.
+            o.result.catch(() => {}).finally(() => {
+              if (sync.hasPendingOffer(o)) sync.untrackPairingOffer(o);
+            });
+            return o;
+          })
+          .catch(() => {});
         return offerPromise.then((o) => ({ qr_text: o.qrText }));
+      }
+      case "cancel_pairing_offer": {
+        // Explicit user cancellation of the pending offer (Devices dialog).
+        // Idempotent: no pending offer is a successful no-op.
+        sync.cancelPendingOffer("user cancel");
+        return { cancelled: true };
       }
       case "pairing_accept": {
         if (typeof args.qr_text !== "string")
@@ -493,6 +560,7 @@ function main(): void {
   const combined: Dispatcher = (op, args) =>
     op.startsWith("sync_") || op === "device_info" ||
     op === "pairing_offer" || op === "pairing_accept" ||
+    op === "cancel_pairing_offer" ||
     op === "list_quarantine" || op === "quarantine_stats" ||
     op === "retry_quarantine" || op === "delete_quarantine" ||
     op === "peer_state" || op === "list_paired_devices" ||

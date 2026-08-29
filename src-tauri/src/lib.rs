@@ -112,10 +112,11 @@ async fn sync_op(
     op: String,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    const ALLOWED: [&str; 13] = [
+    const ALLOWED: [&str; 14] = [
         "device_info",
         "pairing_offer",
         "pairing_accept",
+        "cancel_pairing_offer",
         "sync_now",
         // TD-005/DC-16 quarantine + peer-misbehavior surface (sync_errors,
         // paired_devices dialogs):

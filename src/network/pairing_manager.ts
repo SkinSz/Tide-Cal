@@ -88,6 +88,15 @@ export interface PairingOffer {
   qrText: string;
   /** Resolves after the ceremony completes (or rejects with reason). */
   result: Promise<{ peerDeviceId: string; safetyNumber: string }>;
+  /**
+   * Close the one-shot pairing listener WITHOUT waiting for a scanner.
+   * Callers MUST keep this to cancel an offer (GUI close, superseded by a
+   * newer offer, sidecar shutdown): an uncancelled offer keeps a live
+   * listener that still accepts pairing handshakes — a security surface,
+   * not just a resource leak. Idempotent; after the ceremony self-closes
+   * the host this is a no-op.
+   */
+  cancel: () => void;
 }
 
 /**
@@ -183,7 +192,37 @@ export async function createPairingOffer(opts: {
   });
 
   void activeSession;
-  return { qrText, result };
+  let offerClosed = false;
+  const cancel = (): void => {
+    if (offerClosed) return;
+    offerClosed = true;
+    // Close the listener AND any in-flight ceremony session: without the
+    // session teardown, a scanner that already completed the Noise
+    // handshake could finish the ceremony and persist trust AFTER the
+    // offer was cancelled (blind-review finding, 2026-08-29).
+    host.close();
+    try {
+      activeSession?.done();
+    } catch {
+      // session may already be closed
+    }
+    activeSession = null;
+    rejectOuter(new Error("pairing offer cancelled"));
+  };
+  // Disarm symmetrically: whichever side settles first (resolve from the
+  // ceremony, reject from the ceremony, or cancel) closes the gate so the
+  // others become harmless no-ops afterwards.
+  const originalResolve = resolveOuter;
+  resolveOuter = (v) => {
+    offerClosed = true;
+    originalResolve(v);
+  };
+  const originalReject = rejectOuter;
+  rejectOuter = (e) => {
+    offerClosed = true;
+    originalReject(e);
+  };
+  return { qrText, result, cancel };
 }
 
 // ---------------------------------------------------------------------------
