@@ -1,6 +1,7 @@
 # TIDE DESIGN CONTRACT DC-18
 # iCalendar (.ics) Export — Interoperability Boundary Semantics
-Status: DRAFT — awaiting owner approval
+Status: APPROVED by project owner (2026-08-29). Implementation NOT yet
+        authorized to start — this approval covers the design only.
 
 Depends on: Architecture Spec v0.3 §6 (Calendar Domain), §26 (External
             Calendar Formats); DC-01; DC-07 (SQLite schema, v5)
