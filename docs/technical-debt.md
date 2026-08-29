@@ -125,3 +125,11 @@ stable, blind final verification PASS WITH CONCERNS with zero new issues).
 - **Why it matters:** Verifier-identified residual (owner-approved quota design): an attacker/buggy peer pacing just under both tiers (e.g. 4,900 invalid + 5,100 valid per 10-min window forever) adds quarantine rows indefinitely — ~700k rows/day at that rate. Storage-only issue (each row is small); sync liveness is unaffected (TD-001 ladder handles progression); Sync-Errors UI aggregates.
 - **Resolution path:** TD-005 retention/retention-cap work is the designed answer (prune oldest resolved/low-value quarantine rows when a cap is exceeded — deletion always behind explicit policy, never silent for ACTIVE rows). Fold this scenario into TD-005's retention design when implemented.
 - **Trigger:** with TD-005 retention work, or before any multi-user/large-calendar release.
+
+## TD-009 — Frontend Cancel button for pending pairing offer
+- **ID:** TD-009
+- **Title:** Wire a Cancel button in the Devices dialog to the existing cancel_pairing_offer op
+- **Priority:** 2/10 — LOW (optional/aesthetic: the security gap is CLOSED server-side; the op exists, is allow-listed, and offers are already cleaned up by supersede, ceremony completion, and stdin-EOF shutdown)
+- **Status:** OPEN
+- **Scope:** frontend/devices.ts + frontend/index.html: show a Cancel affordance while a pairing offer is pending (pairing-step-show visible with a code), call syncOp("cancel_pairing_offer"), update UI state. No backend work required.
+- **Origin:** blind review of f441f75 (pairing-offer lifecycle) noted user-initiated cancel is currently unreachable in the UI.
