@@ -371,10 +371,10 @@ export async function refreshSyncErrorsBadge(): Promise<void> {
     stats = await fetchQuarantineStats();
   } catch (err) {
     console.warn("[tide] quarantine stats unavailable:", err);
-    el<HTMLElement>("sync-errors-count").textContent = "?";
+    document.getElementById("sync-errors-count")!.textContent = "?";
     return;
   }
-  el<HTMLElement>("sync-errors-count").textContent = String(stats.active);
+  document.getElementById("sync-errors-count")!.textContent = String(stats.active);
   btn.title =
     stats.active > 0
       ? `${stats.active} active quarantined record(s)` +
