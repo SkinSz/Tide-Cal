@@ -168,6 +168,16 @@ fn resolve_sidecar_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
+            // Runtime window icon: in a dev launch (cargo run) nothing else
+            // sets the GTK window icon, so the taskbar falls back to the
+            // WebKitGTK default ("W"). The bundle icons are embedded at
+            // build time; apply the default one to the main window here.
+            if let (Some(icon), Some(win)) = (
+                app.default_window_icon().cloned(),
+                app.get_webview_window("main"),
+            ) {
+                let _ = win.set_icon(icon);
+            }
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()

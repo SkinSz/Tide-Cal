@@ -80,7 +80,6 @@ async function showPairingCode(): Promise<void> {
     const res = await syncOp<{ qr_text: string }>("pairing_offer", {});
     const out = el<HTMLTextAreaElement>("pairing-code-out");
     out.value = res.qr_text;
-    el<HTMLDivElement>("pairing-step-show").hidden = false;
     log(`pairing offer created — paste the code on the other device.`);
   } catch (err) {
     log(`pairing offer failed: ${String(err)}`);
