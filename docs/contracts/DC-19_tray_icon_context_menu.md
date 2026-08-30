@@ -1,0 +1,178 @@
+# TIDE DESIGN CONTRACT DC-19
+# Tray Icon and Context Menu (Linux First)
+Status: DRAFT — awaiting owner approval (drafted 2026-08-30).
+        Owner directive this contract encodes: NO options/settings button in
+        the app UI; the tray icon's right-click context menu IS the v1
+        settings/configuration surface.
+Depends on: Architecture Spec v0.3 §4 (background/tray operation), §1
+        (Linux first); DC-13 §3-§7 (scheduler actions, settings bounds);
+        DC-08 §5 (sync_now semantics); DC-15 §3 (data layout, packaging
+        constraints)
+Unblocks: DC-13 runtime wrapper implementation (the scheduler consumer);
+        Linux background/tray component; release build with background sync
+Resolves: DC-13 §8 deferred item "Tray icon and settings UI
+        appearance/layout"
+
+==================================================
+1. PURPOSE AND SCOPE
+==================================================
+
+Defines the tray icon's presence, states, context-menu catalog, and the
+exact semantics of every menu action on Linux (KDE Plasma / GNOME via the
+StatusNotifier/AppIndicator protocols). It is the contract the DC-13
+runtime wrapper implements against.
+
+IN SCOPE (v1): tray icon + states, right-click context menu, show/hide
+window, manual sync-now trigger, quit semantics, minimal v1 settings
+submenu (§6).
+
+OUT OF SCOPE (v1): Windows tray (DC-15 §4), notifications/toasts (any OS),
+a full settings dialog, CalDAV, auto-start-on-login management, icon
+theme animation.
+
+==================================================
+2. TRAY PRESENCE AND LIFECYCLE
+==================================================
+
+2.1  The tray icon exists whenever the Tide process is running (DC-13 §5:
+     background operation is the normal state; closing the main window
+     hides it, the process and sidecar stay alive).
+
+2.2  Closing the main window (X button) HIDES the window. It MUST NOT quit
+     the process and MUST NOT terminate the sidecar. Quit is exclusively a
+     menu action (§4.4).
+
+2.3  If the tray icon is not available (compositor without
+     StatusNotifier support), Tide degrades to a normal windowed app:
+     closing the window hides it to the taskbar, and a menu entry is added
+     in-app (see §4.6). The app MUST NOT become unreachable.
+
+==================================================
+3. TRAY ICON STATES
+==================================================
+
+3.1  IDLE (default icon): no session activity.
+
+3.2  SYNCING (alternate icon or overlay badge): at least one engine
+     session is in flight. Source of truth: the sidecar's session stats
+     (sync_op surface); the Rust shell polls or is notified — the polling
+     mechanism is an implementation detail, not contract.
+
+3.3  ERROR-PRESENT (optional state, v1 MAY omit): quarantine/hard-block
+     rows exist. The tray MUST NOT duplicate the Sync-Errors dialog's
+     detail; at most a static marker meaning "check Sync Errors". If
+     omitted in v1, the state is reserved, not forbidden.
+
+3.4  Icon assets ship in the Tauri bundle (DC-15 §3 data layout does not
+     apply — icons are program files, not user data).
+
+==================================================
+4. CONTEXT MENU CATALOG
+==================================================
+
+Right-click opens the menu. Items, in order:
+
+4.1  "Open Tide" — shows and focuses the main window (un-hide from §2.2).
+     If already visible: focus/raise. This item is ALWAYS enabled.
+
+4.2  "Sync now" — triggers an immediate sync pass:
+     - semantics: DC-13 scheduler action immediate-sync with
+       manualSyncBypassesBackoff = true (explicit human intent wins per
+       DC-13 §6.1); routes through the existing sync_now RPC op — no new
+       Rust DB access.
+     - MUST be disabled (greyed) while a session is already in flight for
+       the same peer set, or when no peers are paired. Tooltip/state text
+       is presentation detail.
+     - Triggering it does NOT open the window.
+
+4.3  "Sync Errors" — opens the main window on the existing Sync-Errors
+     dialog (reuse; no new surface). Equivalent to Open Tide + opening the
+     dialog. Optional in v1; recommended (cheap, reuses everything).
+
+4.4  "Quit" — full application exit:
+     - closes the main window,
+     - shuts the sidecar down cleanly (stdin EOF path; the sidecar's own
+       closeListener + exit semantics per tests/sidecar_eof_lifecycle.test.ts
+       MUST be preserved — Quit MUST NOT SIGKILL),
+     - then exits the process.
+     - Quit MUST ask nothing (no confirm dialog); unsaved UI state does
+       not exist (all writes are immediate through the domain core).
+
+4.5  Separator rules: at most one separator between the functional group
+     (4.1-4.3) and Quit. No nested menus beyond §6's optional submenu.
+
+4.6  Fallback menu (§2.3): when no tray is available, the SAME items
+     except Quit appear in an in-app overflow location (toolbar overflow
+     or app menu); Quit remains available via window close + a small
+     in-app Quit entry there. v1 MAY simplify to "window close quits" in
+     this fallback mode ONLY, because without a tray the hide-to-tray
+     lifecycle is meaningless — this fallback quit MUST still do §4.4's
+     clean sidecar shutdown.
+
+==================================================
+5. LINUX PLATFORM NOTES (NORMATIVE FOR v1)
+==================================================
+
+5.1  KDE Plasma (owner's desktop) exposes tray icons via the
+     StatusNotifierItem/AppIndicator protocol. Tauri 2's tray support maps
+     onto libappindicator on Linux; the `tray-icon` Cargo feature MUST be
+     enabled and libappindicator dev packages are a build dependency
+     (packaging: DC-15 §4.1 dependency list).
+
+5.2  GNOME without appindicator extension shows NO tray icon — §2.3's
+     fallback applies. This is acceptable for v1.
+
+5.3  Left-click behavior on Linux is NOT reliably distinguishable from
+     right-click under AppIndicator; the menu is the ONLY guaranteed
+     interaction. Left-click-opens-window is a best-effort nicety, never a
+     contract item.
+
+5.4  Wayland (owner's session): no global-coordinate APIs are used by this
+     contract; the tray is compositor-managed. Window focus/raise after
+     "Open Tide" is best-effort under Wayland.
+
+==================================================
+6. SETTINGS SUBMENU — RECOMMENDATION (v1: NONE)
+==================================================
+
+6.1  RECOMMENDATION: v1 ships NO settings submenu. Rationale: the only
+     user-adjustable values (DC-09 MAX_INCREMENTAL_BACKLOG 100..100000;
+     DC-13 §3.5 scheduler intervals) have safe defaults tuned by the owner
+     (DC-09 amendment; DC-13 §3.5). A settings surface before the runtime
+     wrapper exists would be UI for values nobody changes.
+
+6.2  When settings become necessary, they enter as a single "Settings"
+     submenu under §4's menu with EXACTLY the DC-09/DC-13 bounded fields —
+     never a free-form dialog — via an amendment to this contract. The
+     app-UI settings button remains FORBIDDEN by owner directive.
+
+==================================================
+7. OUT OF SCOPE
+==================================================
+
+- Windows tray behavior (DC-15 §4 WIP)
+- Notifications, toasts, badges on the taskbar
+- Settings dialog (the context menu submenu of §6 is the ceiling)
+- Auto-start-on-login management (OS feature, not app feature)
+- Detailed sync-state display (Sync-Errors dialog owns it)
+
+==================================================
+8. DECISIONS
+==================================================
+
+D1 (DECIDED, owner directive 2026-08-30): No options/settings button in
+    the app UI; the tray context menu is the configuration surface for v1.
+D2 (DECIDED): Menu catalog v1 = Open Tide, Sync now, [Sync Errors],
+    Quit — order per §4. "Sync Errors" recommended, MAY be omitted.
+D3 (DECIDED): Window close hides to tray; Quit is menu-only (§4.4) and
+    performs a clean sidecar stdin-EOF shutdown.
+D4 (DECIDED): "Sync now" routes through the existing sync_now RPC with
+    manualSyncBypassesBackoff = true; disabled while a session is in
+    flight or no peers are paired.
+D5 (DECIDED): No settings submenu in v1 (§6.1); any future settings enter
+    as a bounded tray submenu via amendment, never an app-UI button (D1).
+D6 (OPEN, owner): Confirm "Sync Errors" menu item included in v1 (§4.3).
+D7 (OPEN, owner): Confirm tray icon states for v1 — IDLE + SYNCING only,
+    or additionally the ERROR-PRESENT marker (§3.3).
+D8 (OPEN, implementation detail, non-blocking): polling cadence for the
+    SYNCING state (§3.2).

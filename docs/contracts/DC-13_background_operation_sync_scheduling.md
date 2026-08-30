@@ -386,7 +386,8 @@ TR-10 CONFIGURED INTERVALS RESPECTED: parameterized test sweeping
 8. OUT OF SCOPE
 ==================================================
 
-- Tray icon and settings UI appearance/layout -> future UI contract;
+- Tray icon and settings UI appearance/layout -> DC-19 (tray icon/context
+  menu contract)
   only the EXISTENCE of the tray actions and the settings listed in
   section 3.5 is contractual here.
 - mDNS discovery mechanics and discovery lifecycle internals ->
