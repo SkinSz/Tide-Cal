@@ -144,13 +144,31 @@ export function advanceApplied(
 /**
  * DC-02 §5 neededRanges: exact disjoint contiguous ranges we still need,
  * given a peer's advertised clock, EXCLUDING already-pending records.
+ *
+ * Pkg5b (QA M-4 root-cause fix): `selfDeviceId`, when provided, excludes
+ * SELF-PRODUCED sequences from the result. A producer's own seqs are local
+ * by definition — the device created and applied them at T1 — so they can
+ * never be "needed" from a peer, and the receiver-side knowledge state has
+ * no reason to track an applied_upto frontier for them. Without this
+ * exclusion, a peer's advertised clock component for our own device id
+ * (it learned those seqs by applying our changes) produced a phantom
+ * CHANGES_REQUEST for our own history; the request is either served back as
+ * pure duplicates (duplicates never advance applied_upto, so the range never
+ * shrinks) or unservable after compaction — in both cases the pull loop
+ * registers persistent "gap rounds" and fires DC-09 §3 Trigger A on every
+ * session between fully-converged peers (the M-4 every-session full-state
+ * transfer). Excluding self restores the contract meaning: neededRanges is
+ * about data we genuinely lack.
  */
 export function neededRanges(
   k: KnowledgeState,
   advertised: VectorClock,
+  selfDeviceId?: string,
 ): SeqRange[] {
   const need: SeqRange[] = [];
   for (const [d, advSeq] of Object.entries(advertised)) {
+    // Pkg5b (QA M-4): self-produced sequences are never needed.
+    if (selfDeviceId !== undefined && d === selfDeviceId) continue;
     const have = appliedThrough(k, d);
     if (advSeq <= have) continue;
     const havePending = k.pending.get(d) ?? new Set<number>();

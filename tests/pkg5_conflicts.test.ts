@@ -15,18 +15,18 @@
 //      materialization, no LWW even against a later-hlc record).
 //
 //   2. Full sessions (pkg1 harness) — conflict records must be created on
-//      real receivers and survive real traffic. NOTE: the session also runs
-//      the DC-09 full-state phase (applySnapshot §7.1 "local survives iff NOT
-//      dominated by snapshot_clock"), which — with the known every-session
-//      full-state-transfer behavior — converges conflict-diverged ROWS by
-//      vector-clock domination. That is DC-09's own normative rule and is
-//      OUTSIDE this package's surface limits (full_state.ts); the tests
-//      therefore assert, at session level: conflict rows on every receiver
-//      with ALL payloads preserved verbatim, participant-set consistency,
-//      no duplicates, restart persistence, and row convergence (both sides
-//      end on one of the conflicting values — never a third value, never
-//      data loss). The DC-03 §3.3 row-materialization guarantee itself is
-//      asserted at level 1, where it belongs.
+//      real receivers and survive real traffic. Pkg5b NOTE (was: "the
+//      DC-09 snapshot phase converges conflict-diverged ROWS"): with the
+//      M-4 trigger fix (neededRanges excludes self-produced seqs) a
+//      converged session no longer runs a full-state exchange, and Pkg5b's
+//      conflict-aware applySnapshot guard keeps the local value even when
+//      one legitimately runs — so conflict-diverged ROWS now stay DIVERGED
+//      per DC-03 §3.3/TR-2 until user resolution. The tests therefore
+//      assert, at session level: conflict rows on every receiver with ALL
+//      payloads preserved verbatim, participant-set consistency, no
+//      duplicates, restart persistence, and per-device row divergence
+//      (each device keeps its own pre-conflict value; never a third value,
+//      never data loss). The §3.3 guarantee is pinned at BOTH levels now.
 //
 // The independent expected-state oracle (pkg1_helpers ExpectedState) is
 // asserted alongside every scenario; conflict scenarios use per-device
@@ -326,10 +326,11 @@ function concurrentTitleRec(d: Device, id: string, deviceId: string): string {
 describe("Pkg5 level 2 — detection through real sessions (pkg1 harness)", () => {
   // -------------------------------------------------------------------------
   // 5. Same-field concurrent edits over real sessions → conflict rows on
-  //    BOTH receivers with both payloads preserved; rows converge to one of
-  //    the conflicting values (DC-09 §7.1 snapshot phase; see header note).
+  //    BOTH receivers with both payloads preserved; rows STAY DIVERGED per
+  //    DC-03 §3.3 (Pkg5b: no snapshot domination of unresolved conflicts —
+  //    previously the every-session Trigger A snapshot phase converged them).
   // -------------------------------------------------------------------------
-  test("sessions: conflict rows on both receivers, payloads preserved, rows converge", async () => {
+  test("sessions: conflict rows on both receivers, payloads preserved, rows diverged pending resolution", async () => {
     const a = makeDevice("a");
     const b = makeDevice("b");
     devices = [a, b];
@@ -353,10 +354,11 @@ describe("Pkg5 level 2 — detection through real sessions (pkg1 harness)", () =
       expect(values.sort()).toEqual(["From A", "From B"]);
     }
 
-    // Rows converged: same title everywhere, and it is one of the two
-    // conflicting values (never a third value, never data loss).
-    expect(rowTitle(a, id)).toBe(rowTitle(b, id));
-    expect(["From A", "From B"]).toContain(rowTitle(a, id));
+    // Rows stay DIVERGED: each device keeps its own pre-conflict value
+    // until user resolution (DC-03 §3.3/TR-2, Pkg5b) — never a third value,
+    // never data loss.
+    expect(rowTitle(a, id)).toBe("From A");
+    expect(rowTitle(b, id)).toBe("From B");
   });
 
   // -------------------------------------------------------------------------
@@ -453,9 +455,10 @@ describe("Pkg5 level 2 — detection through real sessions (pkg1 harness)", () =
 
   // -------------------------------------------------------------------------
   // 10. 3-peer same-field conflict → ONE record with 3 participants per
-  //     device, consistent participant sets, no divergence (§3.5 / TR-9)
+  //     device, consistent participant sets, per-device divergence (§3.5/TR-9
+  //     + Pkg5b §3.3: each device keeps its own value until resolution)
   // -------------------------------------------------------------------------
-  test("3-peer same-field conflict → one 3-participant record per device, consistent sets, convergent rows", async () => {
+  test("3-peer same-field conflict → one 3-participant record per device, consistent sets, rows diverged", async () => {
     const a = makeDevice("a");
     const b = makeDevice("b");
     const c = makeDevice("c");
@@ -483,10 +486,12 @@ describe("Pkg5 level 2 — detection through real sessions (pkg1 harness)", () =
     expect(perDevice[1]).toEqual(perDevice[0]);
     expect(perDevice[2]).toEqual(perDevice[0]);
 
-    // Rows converge pairwise to one of the three conflicting values.
-    const titles = [a, b, c].map((d) => rowTitle(d, id));
-    expect(new Set(titles).size).toBe(1);
-    expect(["Title A", "Title B", "Title C"]).toContain(titles[0]);
+    // Rows stay DIVERGED per device (Pkg5b §3.3 continuation): each keeps
+    // its own pre-conflict value pending resolution — never a third value,
+    // never data loss.
+    expect(rowTitle(a, id)).toBe("Title A");
+    expect(rowTitle(b, id)).toBe("Title B");
+    expect(rowTitle(c, id)).toBe("Title C");
   });
 
   // -------------------------------------------------------------------------

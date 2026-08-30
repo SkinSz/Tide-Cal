@@ -150,6 +150,33 @@ function clearEntityVersion(db: Database.Database, entityId: string): void {
 }
 
 /**
+ * Pkg5b (DC-03 §3.3 continuation / Pkg5-review P9 residual): does this
+ * entity carry an UNRESOLVED conflict row (Pkg5's DC-07 conflicts table)?
+ *
+ * While a conflict is unresolved, DC-03 §3.3/§3.4/TR-2 ("local state is NOT
+ * overwritten … the stored pre-conflict local value remains visible until
+ * resolution") governs the materialized row value. DC-09 §7.1's domination
+ * rule may still decide the anti-entropy EXCHANGE, but it must not silently
+ * rewrite the row VALUE behind an unresolved conflict — that would be an
+ * implicit winner selection (defeating the user-resolution contract) with
+ * the conflict record left showing a row that reflects neither the local
+ * nor a user-chosen value. Non-conflicted entities keep §7.1 unchanged.
+ */
+function hasUnresolvedConflict(
+  db: Database.Database,
+  entityId: string,
+): boolean {
+  return (
+    db
+      .prepare<[string], unknown>(
+        `SELECT 1 FROM conflicts
+         WHERE entity_id = ? AND status = 'unresolved' LIMIT 1`,
+      )
+      .get(entityId) !== undefined
+  );
+}
+
+/**
  * Pkg1: replay idempotence check — does the local live row already equal the
  * snapshot entry's data byte-for-byte (canonical JSON comparison, so key
  * order can never cause a false difference)?
@@ -320,6 +347,12 @@ export interface ApplyResult {
   survivedLocal: number;
   /** live local events deleted-by-omission under the §7.1 absence rule */
   absenceTombstones: number;
+  /**
+   * Pkg5b: snapshot entries whose local row holds an UNRESOLVED conflict —
+   * the materialized local value was kept (DC-03 §3.3) instead of being
+   * replaced by the §7.1 domination winner. Resolution lifts the guard.
+   */
+  conflictPreserved: number;
 }
 
 export function applySnapshot(
@@ -332,6 +365,7 @@ export function applySnapshot(
     inheritedTombstones: 0,
     survivedLocal: 0,
     absenceTombstones: 0,
+    conflictPreserved: 0,
   };
 
   const insertTombstone = db.prepare(`
@@ -355,6 +389,16 @@ export function applySnapshot(
       if (!dominates(snapshot.snapshot_clock, localVersion)) {
         result.survivedLocal++;
         continue; // local survives; next anti-entropy round reconciles
+      }
+      // Pkg5b (DC-03 §3.3 continuation, Pkg5-review P9): the local value of
+      // an entity with an UNRESOLVED conflict row is NOT replaced by the
+      // §7.1 domination winner — it stays until explicit user resolution.
+      // Skipping the entry entirely also keeps the local entity version
+      // anchored to local history; the conflict row itself is untouched
+      // (full_state never reads or writes conflicts/…_participants rows).
+      if (hasUnresolvedConflict(db, entry.entity_id)) {
+        result.conflictPreserved++;
+        continue;
       }
       // Pkg1: replay idempotence — if the entry's data is already identical
       // locally, staging + upsert would write identical bytes (a literal
@@ -445,6 +489,15 @@ export function applySnapshot(
       .all();
     for (const le of localEvents) {
       if (snapshotIds.has(le.event_id)) continue;
+      // Pkg5b (DC-03 §3.3 continuation): same guard as the replacement path —
+      // an entity with an unresolved conflict must not have its materialized
+      // state (here: the live row itself) destroyed by snapshot inference
+      // while the user has not yet resolved. Deleting via the absence rule
+      // would be the same silent winner selection this package fixes.
+      if (hasUnresolvedConflict(db, le.event_id)) {
+        result.conflictPreserved++;
+        continue;
+      }
       const localVersion = localVersionClock(db, le.event_id);
       if (!dominates(snapshot.snapshot_clock, localVersion)) continue;
       // Pkg1 (QA C-1): an EMPTY local version proves nothing. dominates()

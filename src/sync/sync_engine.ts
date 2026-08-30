@@ -376,6 +376,47 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     for (const [d, s] of Object.entries(clock)) upsert.run(d, s);
   }
 
+  /**
+   * Pkg5b (QA M-4 companion): seed the durable knowledge state with the
+   * device's OWN contiguous frontier (applied_upto[self] = max own local_seq
+   * across `changes` and `device_clock` — the same allocation rule T1 uses).
+   *
+   * A device has, by definition, applied every record it produced at T1
+   * (the T1 transaction wrote both), so this is truthful knowledge, not a
+   * shortcut. Before Pkg5b the value existed only by ACCIDENT: the
+   * every-session Trigger A snapshot exchange merged snapshot_clock (which
+   * contains self) into applied_upto. Fixing the trigger (neededRanges
+   * excluding self) removed that accident, and T2 then misclassified
+   * re-delivery of the device's OWN records (a peer echoing them back) as
+   * buffer/apply instead of duplicate — qa5 probe P3 caught it. Seeding at
+   * session start restores the correct dedup classification durably (T2
+   * reloads knowledge from the DB inside its transaction) without a schema
+   * or persistence-layer change. MAX-merge keeps it monotone with T2.
+   */
+  function seedSelfAppliedFrontier(): void {
+    const row = deps.db
+      .prepare<[string, string], { m: number | null }>(
+        `SELECT MAX(s) AS m FROM (
+           SELECT MAX(local_seq) AS s FROM changes WHERE device_id = ?
+           UNION ALL
+           SELECT (SELECT max_seq FROM device_clock WHERE peer_device_id = ?)
+         )`,
+      )
+      .get(deps.selfDeviceId, deps.selfDeviceId);
+    const frontier = row?.m ?? 0;
+    if (!Number.isFinite(frontier) || frontier <= 0) return;
+    deps.db
+      .prepare(
+        `INSERT INTO applied_upto (producer_device_id, applied_through) VALUES (?, ?)
+         ON CONFLICT(producer_device_id) DO UPDATE SET
+           applied_through = MAX(applied_through, excluded.applied_through)`,
+      )
+      .run(deps.selfDeviceId, frontier);
+    if ((holder.knowledge.appliedUpto[deps.selfDeviceId] ?? 0) < frontier) {
+      holder.knowledge.appliedUpto[deps.selfDeviceId] = frontier;
+    }
+  }
+
   async function runSession(transport: SyncTransport): Promise<SessionStats> {
     const stats: SessionStats = {
       sent: 0,
@@ -388,6 +429,8 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     // DC-09 §3.5: offers_made_this_session is in-memory only; a new session
     // gets fresh dedup state.
     sessionDedup = new OfferDedup();
+    // Pkg5b: truthful self-frontier seeding BEFORE the pull loop (see doc).
+    seedSelfAppliedFrontier();
 
     // --- HELLO exchange ---
     const hello: SyncMessage = {
@@ -416,7 +459,11 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     await pushRevocationQueue(transport, stats);
 
     // --- pull what we need ---
-    let ranges = neededRanges(holder.knowledge, peerHello.device_clock);
+    // Pkg5b (QA M-4): exclude self-produced sequences — our own seqs are
+    // local by definition, and requesting them back left the range
+    // permanently unservable-by-advancement, firing Trigger A on every
+    // session between converged peers (see neededRanges doc).
+    let ranges = neededRanges(holder.knowledge, peerHello.device_clock, deps.selfDeviceId);
     let gapRetries = 0;
     // M-5: absolute cap on total pull iterations. A peer that keeps changing
     // its advertised ranges must not extend the loop forever; gapRetries
@@ -436,7 +483,7 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
       const before = JSON.stringify(ranges);
       ranges =
         batch.remaining_ranges ??
-        neededRanges(holder.knowledge, peerHello.device_clock);
+        neededRanges(holder.knowledge, peerHello.device_clock, deps.selfDeviceId);
       if (JSON.stringify(ranges) === before) {
         gapRetries++; // unservable gap (compacted on peer): DC-09 Trigger A
         triggers.recordGapRound(peerKey);
