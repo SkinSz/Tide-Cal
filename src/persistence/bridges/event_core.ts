@@ -92,6 +92,30 @@ interface EventRow {
   utc_end_ms: number | null;
 }
 
+/**
+ * M-1 / BND-01 identity guard (defense-in-depth behind the sidecar
+ * dispatcher's validation): an EventInput must NEVER carry an `id`.
+ *
+ * The event identity is owned by the domain core — `createEvent` generates
+ * it, `updateEvent` takes it from the op's target argument. Historically
+ * `updateEvent` built `{id, ...input}`, so a client-supplied `input.id`
+ * silently overrode the real target: the row write (upsert) missed the
+ * target and INSERTED a phantom row while the change records were still
+ * written under the target's entity — record/row divergence that survives
+ * restart and diverges sync peers. This guard makes the violation an
+ * explicit, deterministic error at the domain layer too, so even callers
+ * that bypass the sidecar dispatcher cannot corrupt state.
+ */
+function assertNoInjectedId(input: EventInput, op: "create" | "update"): void {
+  if (input !== null && typeof input === "object" && "id" in input) {
+    throw new Error(
+      `${op}_event: input.id is not accepted — event ids are assigned by ` +
+        `the sidecar (update targets come from the op's id argument) and a ` +
+        `client-injected id is rejected without any state change`,
+    );
+  }
+}
+
 export class EventCore {
   readonly db: ReturnType<typeof openDatabase>;
   readonly dbPath: string;
@@ -163,9 +187,17 @@ export class EventCore {
   }
 
   createEvent(input: EventInput): CalendarEvent {
+    // M-1/BND-01: identity is core-owned. Explicit field pick instead of
+    // `{id, ...input}` so a client-injected `input.id` can never override
+    // the generated id even if the dispatcher guard were bypassed.
+    assertNoInjectedId(input, "create");
     const event: CalendarEvent = {
       id: `evt-${randomUUID()}`,
-      ...input,
+      title: input.title,
+      description: input.description,
+      startMs: input.startMs,
+      endMs: input.endMs,
+      allDay: input.allDay,
     };
     const hlc = this.hlc.now();
     createLocalChange(
@@ -187,9 +219,23 @@ export class EventCore {
   }
 
   updateEvent(id: string, input: EventInput): CalendarEvent {
+    // M-1/BND-01: the target identity is FROZEN to the op's `id` argument.
+    // A client-supplied input.id is an explicit error (see
+    // assertNoInjectedId) — never a silent re-target, and never a phantom
+    // insert. The updated row/result are built by explicit field pick so
+    // `input` cannot smuggle the identity (or any other field) in.
+    assertNoInjectedId(input, "update");
     const existing = this.getEventRow(id);
     if (!existing) throw new Error(`event not found: ${id}`);
     const before = rowToEvent(existing);
+    const updated: CalendarEvent = {
+      id,
+      title: input.title,
+      description: input.description,
+      startMs: input.startMs,
+      endMs: input.endMs,
+      allDay: input.allDay,
+    };
 
     // One T1 record per logical field group that actually changed
     // (DC-01 field-level semantics: title / description / schedule).
@@ -234,16 +280,11 @@ export class EventCore {
         (db) => {
           // Row rewrite inside the same transaction as each change record;
           // updated_hlc mirrors the record's HLC timestamp.
-          insertEventRow(
-            db,
-            { id, ...input },
-            hlc,
-            true,
-          );
+          insertEventRow(db, updated, hlc, true);
         },
       );
     }
-    return { id, ...input };
+    return updated;
   }
 
   deleteEvent(id: string): void {

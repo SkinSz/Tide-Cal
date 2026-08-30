@@ -18,7 +18,7 @@
 //   delete_event {id}                         -> null
 
 import { createInterface } from "node:readline";
-import { EventCore } from "./event_core.ts";
+import { EventCore, type EventInput } from "./event_core.ts";
 import {
   loadOrCreateIdentity,
   serveSync,
@@ -309,22 +309,123 @@ export class SyncManager {
   }
 }
 
+// ---------------------------------------------------------------------------
+// M-1 / BND-01 + BND-05: event identity & shape contract (authoritative
+// sidecar boundary validation). All rejections are deterministic ok:false
+// errors; a rejected request NEVER mutates state.
+//
+// Contract:
+//   create_event: args.input must be exactly the five client-settable
+//     fields; any `input.id` is rejected — ids are core-generated
+//     (`evt-<uuid>`), client id allocation has no legitimate use because
+//     the id IS the sync identity (change records, entity_versions, peer
+//     convergence all key on it).
+//   update_event: args.id (non-empty string) is the SOLE identity; any
+//     `input.id` is rejected — even one equal to args.id — so the identity
+//     channel is unambiguous. Clients that echo the full event back as
+//     input must strip `id`.
+//   delete_event: args.id must be a non-empty string.
+//   Unknown/mistyped input fields are rejected (never echoed, never
+//   persisted).
+// ---------------------------------------------------------------------------
+
+/** The only fields a client may set on an event. */
+const EVENT_INPUT_KEYS: ReadonlySet<string> = new Set([
+  "title",
+  "description",
+  "startMs",
+  "endMs",
+  "allDay",
+]);
+
+function fail(msg: string): never {
+  throw new Error(msg);
+}
+
+/**
+ * Validate the raw `args.input` of create_event/update_event. Returns a
+ * clean EventInput containing exactly the five known fields.
+ */
+function validateEventInput(raw: unknown, op: string): EventInput {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    fail(
+      `${op}: input must be an object with fields title, description, startMs, endMs, allDay`,
+    );
+  }
+  const input = raw as Record<string, unknown>;
+  if ("id" in input) {
+    fail(
+      `${op}: input.id is not accepted — event ids are assigned by the ` +
+        `sidecar and are not client-settable (update_event targets the id ` +
+        `in args.id); the request was rejected without any state change`,
+    );
+  }
+  const unknown = Object.keys(input).filter((k) => !EVENT_INPUT_KEYS.has(k));
+  if (unknown.length > 0) {
+    fail(
+      `${op}: unknown input field(s): ${unknown.join(", ")} — allowed: ` +
+        `title, description, startMs, endMs, allDay`,
+    );
+  }
+  if (typeof input.title !== "string") {
+    fail(`${op}: input.title must be a string`);
+  }
+  if (typeof input.description !== "string") {
+    fail(`${op}: input.description must be a string`);
+  }
+  for (const k of ["startMs", "endMs"] as const) {
+    if (typeof input[k] !== "number" || !Number.isFinite(input[k])) {
+      fail(`${op}: input.${k} must be a finite number`);
+    }
+  }
+  if (typeof input.allDay !== "boolean") {
+    fail(`${op}: input.allDay must be a boolean`);
+  }
+  return {
+    title: input.title,
+    description: input.description,
+    startMs: input.startMs as number,
+    endMs: input.endMs as number,
+    allDay: input.allDay,
+  };
+}
+
+/** Validate an op's target event id (update_event / delete_event). */
+function requireEventId(raw: unknown, op: string): string {
+  if (typeof raw !== "string" || raw.trim().length === 0) {
+    fail(`${op}: args.id must be a non-empty string`);
+  }
+  return raw;
+}
+
 export function makeDispatcher(core: EventCore, sync?: SyncManager): Dispatcher {
   return (op, args) => {
     switch (op) {
       case "ping":
         return { pong: true, device_id: core.selfDeviceId };
-      case "list_events":
+      case "list_events": {
+        const { from_ms: f, to_ms: t } = args;
+        for (const [k, v] of [
+          ["from_ms", f],
+          ["to_ms", t],
+        ] as const) {
+          if (v !== undefined && v !== null && typeof v !== "number") {
+            fail(`list_events: args.${k} must be a number or null`);
+          }
+        }
         return core.listEvents({
-          fromMs: (args.from_ms as number | null | undefined) ?? null,
-          toMs: (args.to_ms as number | null | undefined) ?? null,
+          fromMs: (f as number | null | undefined) ?? null,
+          toMs: (t as number | null | undefined) ?? null,
         });
+      }
       case "create_event":
-        return core.createEvent(args.input as never);
-      case "update_event":
-        return core.updateEvent(args.id as string, args.input as never);
+        return core.createEvent(validateEventInput(args.input, "create_event"));
+      case "update_event": {
+        const id = requireEventId(args.id, "update_event");
+        return core.updateEvent(id, validateEventInput(args.input, "update_event"));
+      }
       case "delete_event":
-        core.deleteEvent(args.id as string);
+        core.deleteEvent(requireEventId(args.id, "delete_event"));
         return null;
       default:
         throw new Error(`unknown op: ${op}`);
