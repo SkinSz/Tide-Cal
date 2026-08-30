@@ -178,6 +178,7 @@ beforeEach(() => {
   installDom();
   installBridge();
   events = [];
+  setViewMode("month"); // undo any view-mode leak from a previous test
   initDialog();
 });
 
@@ -194,6 +195,11 @@ async function renderMonth(): Promise<DomEl> {
   await renderCalendar();
   return byId.get("calendar-grid")!;
 }
+
+// Pkg6 (date-flake fix, test-only): reset the shared view mode — the calendar
+// module keeps `viewMode` module state, so the week-view test leaks "week"
+// into later tests that call renderMonth() expecting a month grid.
+const { setViewMode } = await import("../frontend/calendar.ts");
 
 function dayColumns(grid: DomEl): DomEl[] {
   return grid.children.filter((c) => c.classList.contains("day-col"));
@@ -216,9 +222,19 @@ function capture(types: string[]): Map<string, unknown[]> {
 }
 
 function evt(title: string, dayOffset = 0): CalendarEvent {
-  const d = new Date();
-  d.setHours(10, 0, 0, 0);
-  d.setDate(d.getDate() + dayOffset);
+  // Pkg6 (date-flake fix, test-only): anchor to TODAY but clamp the
+  // day-of-month so today+dayOffset (max 1) can never walk across the month
+  // boundary. The old `setDate(getDate()+dayOffset)` walked into the next
+  // month whenever "today" was the last day(s) of a month, so the month grid
+  // rendered fewer chips than asserted and the exclusivity test failed with
+  // "expected 1 to be 2" — a documented pre-existing flake. Clamping keeps
+  // every generated event inside the current month (deterministic on any
+  // date, including month ends and February) while keeping event-0 anchored
+  // to today, which the week-view assertions rely on (Monday-based week).
+  const now = new Date();
+  const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+  const day = Math.min(now.getDate(), daysInMonth - 1);
+  const d = new Date(now.getFullYear(), now.getMonth(), day + dayOffset, 10, 0, 0, 0);
   const start = d.getTime();
   return {
     id: `evt-${title}`,

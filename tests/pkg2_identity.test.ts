@@ -352,6 +352,18 @@ async function runSidecar(
   dbPath: string,
   lines: string[],
 ): Promise<RpcResponse[]> {
+  // Pkg6 (pkg2-review leftover, per Pkg3 agent's note): the sidecar answers
+  // ASYNC — responses can arrive out of order. Correlate by request `id`
+  // instead of arrival index, then return responses ordered by the requests'
+  // ids so call-site index assertions keep their meaning.
+  const requestIds: unknown[] = lines.map((l) => {
+    try {
+      return (JSON.parse(l) as { id?: unknown }).id;
+    } catch {
+      return undefined;
+    }
+  });
+  const byId = new Map<unknown, RpcResponse>();
   const childEnv = { ...process.env };
   delete childEnv.VITEST;
   childEnv.TIDE_DB_PATH = dbPath;
@@ -359,24 +371,24 @@ async function runSidecar(
     env: childEnv,
     stdio: ["pipe", "pipe", "inherit"],
   });
-  const responses: RpcResponse[] = [];
   try {
     const rl = createInterface({ input: child.stdout });
     const done = new Promise<void>((resolve, reject) => {
       const timer = setTimeout(
-        () => reject(new Error(`timeout after responses: ${JSON.stringify(responses)}`)),
+        () => reject(new Error(`timeout after responses: ${JSON.stringify([...byId.values()])}`)),
         20_000,
       );
       rl.on("line", (line) => {
         if (!line.trim()) return;
-        responses.push(JSON.parse(line) as RpcResponse);
-        if (responses.length === lines.length) {
+        const parsed = JSON.parse(line) as RpcResponse & { id?: unknown };
+        byId.set(parsed.id, parsed);
+        if (byId.size === lines.length) {
           clearTimeout(timer);
           resolve();
         }
       });
       child.on("exit", (code: number | null) =>
-        reject(new Error(`sidecar exited early code=${code}: ${responses.length}/${lines.length} responses`)),
+        reject(new Error(`sidecar exited early code=${code}: ${byId.size}/${lines.length} responses`)),
       );
     });
     child.stdin.write(lines.join("\n") + "\n");
@@ -389,7 +401,11 @@ async function runSidecar(
       child.on("exit", () => resolve());
     });
   }
-  return responses;
+  return requestIds.map((id) => {
+    const r = byId.get(id);
+    if (!r) throw new Error(`sidecar never answered request id=${JSON.stringify(id)}`);
+    return r;
+  });
 }
 
 describe("Pkg2 B: raw sidecar stdio — M-1 repro + restart persistence", () => {

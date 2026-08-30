@@ -197,8 +197,24 @@ export class EventCore {
   /**
    * Bootstrap the shell-local calendar through the same T1 path so even
    * this bootstrap produces an auditable change record.
+   *
+   * Pkg6 (QA-2 F-1): the bootstrap change is emitted ONLY when the calendar
+   * row is MISSING. Previously the T1 ran unconditionally, so every
+   * sidecar restart emitted a fresh authoritative "title='My Calendar'"
+   * change for an entity that already existed — a spurious change per
+   * restart (QA-2 s5_cycles.json: changes_delta=1 x N). Beyond noise, that
+   * is a latent LWW data-loss trap: once calendar rename ships, a restart
+   * would re-assert the DEFAULT title over a peer-renamed calendar. An
+   * existing row (local or synced) is left completely untouched — no
+   * change record, no device_clock advance, no updated_hlc churn.
    */
   private ensureDefaultCalendar(): void {
+    const exists = this.db
+      .prepare<[string], unknown>(
+        "SELECT 1 FROM calendars WHERE calendar_id = ?",
+      )
+      .get(DEFAULT_CALENDAR_ID);
+    if (exists !== undefined) return; // already bootstrapped: no-op
     const hlc = this.hlc.now();
     createLocalChange(
       this.db,

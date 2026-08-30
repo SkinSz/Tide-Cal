@@ -486,6 +486,17 @@ export function makeDispatcher(core: EventCore, sync?: SyncManager): Dispatcher 
       case "delete_event":
         core.deleteEvent(requireEventId(args.id, "delete_event"));
         return null;
+      // Pkg6 (BND-06 allow-list drift): read-only series listing. The op was
+      // in lib.rs sync_op's ALLOWED list but unimplemented here (fell through
+      // to `unknown op`). Grep evidence (pkg6-report §3): frontend/store.ts
+      // listSeries() invokes "list_series" on the desktop path — removal from
+      // the allow-list would have permanently disabled the recurrence
+      // indicator decoration (the store tolerates absence, but wiring the
+      // trivially-listable read restores the intended feature). EventCore
+      // listSeries() is a pure SELECT over series + occurrence_overrides
+      // (DC-12 §2) — no change records, no mutation, no args.
+      case "list_series":
+        return core.listSeries();
       // --- Pkg5 (QA M-2): read-only Conflicts surface (DC-14 §3.1/§3.2/§5).
       // Delegates to ConflictsViewModel so response shapes are the exact
       // ConflictListItem / ConflictDetailView the frontend bridge consumes.

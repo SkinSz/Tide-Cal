@@ -274,13 +274,21 @@ export function buildSnapshot(
     const entityId = String(c.calendar_id);
     const version = localVersionClock(db, entityId);
     const winner = latestProducer(db, entityId);
-    if (winner === undefined) continue;
+    // Pkg6 (pkg1-review H1 residual): over-inclusive like the events loop.
+    // A calendar row with no version state (e.g. created before the v6
+    // entity_versions migration, or version state lost) must still ride the
+    // snapshot with an _unversioned placeholder — `continue`-ing here let a
+    // migrated-after-compaction DB strand a fresh peer without its calendar,
+    // and the receiver could then never materialize it incrementally
+    // (later pulls classify as duplicate once applied_upto advances).
+    // Over-inclusion is benign (the receiver's §7.1 rule reconciles);
+    // under-inclusion silently strands data.
     buffer.push({
       entity_id: entityId,
       entity_type: "calendar",
       data: JSON.stringify(c),
-      producer_device_id: winner.device_id,
-      producer_seq: winner.local_seq,
+      producer_device_id: winner?.device_id ?? "_unversioned",
+      producer_seq: winner?.local_seq ?? 0,
       causality_clock: version,
     });
     if (buffer.length >= batchSize) flush();

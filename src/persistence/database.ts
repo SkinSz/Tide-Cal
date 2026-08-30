@@ -787,11 +787,46 @@ export interface QuarantineOptions {
  * H-3: persist an invalid incoming record durably before dropping it from
  * processing. Quarantine is a diagnostic surface (DC-04 §4.3c): countable,
  * inspectable, never user-resolvable, never blocking the session.
+ *
+ * Pkg6 (QA-1 F-5): TD-001's "never create a second quarantine row" guarantee
+ * extended across frontier advance. Previously the only dedupe guard was the
+ * skipped_seqs row (engine intake), which is GC'd once the frontier advances
+ * past the seq (TD-001 (4)/(8)) — so a re-delivery of an already-quarantined
+ * record AFTER the frontier advanced re-quarantined it as a second row
+ * (QA MINOR F-5, SC6 "expected 2 to be 1"). Before inserting, the durable
+ * quarantine table is consulted for an existing row with the same
+ * (device_id, local_seq) extracted from its verbatim raw_record; a match
+ * suppresses the duplicate row. The (device_id, local_seq) pair uniquely
+ * identifies a record (change_id = (device, seq)), so two DIFFERENT invalid
+ * records can never collide on it. Diagnostic-only: callers keep their
+ * skip-row/misbehavior/stat bookkeeping unchanged.
  */
 export function quarantineRecord(
   db: Database.Database,
   opts: QuarantineOptions,
 ): void {
+  const raw = opts.rawRecord;
+  if (raw !== null && typeof raw === "object" && !Array.isArray(raw)) {
+    const deviceId = (raw as { device_id?: unknown }).device_id;
+    const seq = (raw as { local_seq?: unknown }).local_seq;
+    if (
+      typeof deviceId === "string" &&
+      deviceId.length > 0 &&
+      typeof seq === "number" &&
+      Number.isInteger(seq) &&
+      seq > 0
+    ) {
+      const existing = db
+        .prepare(
+          `SELECT 1 FROM quarantine
+           WHERE json_extract(raw_record, '$.device_id') = ?
+             AND json_extract(raw_record, '$.local_seq') = ?
+           LIMIT 1`,
+        )
+        .get(deviceId, seq);
+      if (existing !== undefined) return; // already quarantined: exactly one row
+    }
+  }
   db.prepare(`
     INSERT INTO quarantine
       (quarantine_reason, received_at_hlc, sender_device_id, raw_record)

@@ -234,8 +234,18 @@ describe("DC-09 full-state synchronization", () => {
     const snapshots: Snapshot[] = [];
     buildSnapshot(sender, (s) => snapshots.push(s));
     const entities = snapshots.flatMap((s) => s.entities);
-    expect(entities).toHaveLength(5);
-    for (const [idx, e] of entities.entries()) {
+    // Pkg6 (pkg1-review H1 residual): the calendar loop is OVER-INCLUSIVE like
+    // the events loop — the version-less calendar row (no change history in
+    // this seed) now rides the snapshot with an _unversioned placeholder
+    // instead of being silently omitted. 5 events + 1 calendar = 6 entries.
+    expect(entities).toHaveLength(6);
+    const calendar = entities.find((e) => e.entity_type === "calendar")!;
+    expect(calendar.entity_id).toBe("c-1");
+    expect(calendar.producer_device_id).toBe("_unversioned"); // over-inclusive placeholder
+    expect(calendar.producer_seq).toBe(0);
+    const events = entities.filter((e) => e.entity_type === "event");
+    expect(events).toHaveLength(5);
+    for (const [idx, e] of events.entries()) {
       expect(e.producer_device_id).toBe(SENDER); // never "_snapshot"
       expect(e.producer_seq).toBe(idx + 1);
       expect(e.causality_clock[SENDER]).toBe(idx + 1);

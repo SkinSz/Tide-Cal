@@ -247,6 +247,26 @@ export interface SessionStats {
    * here (they cost nothing and are visible via the hard_blocks row).
    */
   receivedDroppedIntake: number;
+  /**
+   * Pkg6 (item 8): true when this session's HELLO carried the DC-02 §4.1
+   * "impossible under honest operation" anomaly — the peer advertised a
+   * clock component for OUR device id greater than our own (identity theft
+   * or non-conformant same-id restore). Health cue only; also logged and
+   * counted (getHelloClockAnomalyCount).
+   */
+  helloClockAnomaly?: boolean;
+}
+
+/**
+ * Pkg6 (item 8, pkg5b-review §3/§6-A recommendation): process-lifetime count
+ * of HELLO clock anomalies (see noteHelloClockAnomaly). A health cue for
+ * operators/diagnostics — NOT enforcement (DC-16 v1: the misbehavior ladder
+ * is deliberately not fed; a warning log accompanies every increment).
+ */
+let helloClockAnomalyCount = 0;
+
+export function getHelloClockAnomalyCount(): number {
+  return helloClockAnomalyCount;
 }
 
 interface KnowledgeHolder {
@@ -290,6 +310,9 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
   // The durable Tier-2 write ALWAYS goes through this engine's database,
   // including for an injected tracker (hook is attached, not replaced).
   misbehavior.onHardBlock = (p) => hardBlockProducer(deps.db, p);
+  // Pkg6 (QA-1 F-6): drain zombie pending rows left by an aborted session
+  // (frontier already past them) BEFORE the engine's knowledge is first used.
+  gcZombiePending();
 
   /**
    * H-4: one cached pending receive per session/transport. Calling this
@@ -358,6 +381,37 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     return msg;
   }
 
+  /**
+   * Pkg6 (QA-1 F-6): zombie pending_changes GC. A pending row whose seq is
+   * at/below the producer's durable applied_upto frontier can NEVER be
+   * drained (drain only fires while the frontier advances through it; any
+   * re-delivery at/below the frontier classifies as duplicate, and the
+   * snapshot path's F3 cleanup covers only that one path) — a session
+   * aborted mid-transfer leaves such zombies behind forever, polluting
+   * post-restart knowledge. Delete every pending row at/below its producer
+   * frontier; rows ABOVE the frontier (legitimately buffered, gap still
+   * open) and rows for producers with no frontier row are untouched. The
+   * in-memory knowledge mirror is refreshed from the DB only when something
+   * was actually deleted. Runs at engine construction (covers the
+   * abort-then-restart case) and at each session start (covers long-lived
+   * engine instances whose frontier advanced past a buffered seq mid-life,
+   * e.g. via snapshot application).
+   */
+  function gcZombiePending(): void {
+    const res = deps.db
+      .prepare(
+        `DELETE FROM pending_changes WHERE (device_id, local_seq) IN (
+           SELECT p.device_id, p.local_seq FROM pending_changes p
+           JOIN applied_upto a ON a.producer_device_id = p.device_id
+           WHERE p.local_seq <= a.applied_through)`,
+      )
+      .run();
+    if (res.changes === 0) return;
+    // Mirror the durable GC onto the caller-visible knowledge object.
+    const fresh = loadKnowledgeFromDb(deps.db);
+    holder.knowledge.pending = fresh.pending;
+  }
+
   function getDeviceClockDb(): VC {
     const rows = deps.db
       .prepare("SELECT peer_device_id AS d, max_seq AS s FROM device_clock")
@@ -367,7 +421,41 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     return clock;
   }
 
-  /** Element-wise MAX clock merge (same shape as applyRemoteChange's). */
+  /**
+   * Pkg6 (item 8, pkg5b-review §3/§6-A recommendation): HELLO clock-anomaly
+   * signal. A peer advertising a clock component for OUR device id GREATER
+   * than our own device_clock[self] is impossible under honest operation:
+   * only our own T1 writes advance device_clock[self], so no honest peer can
+   * know a higher self seq than we produced (DC-02 §4.1). Seeing one means
+   * identity theft (another device operating under our id) or a
+   * non-conformant raw same-id backup-restore (DC-05 §2.2 / DC-02 §4.3:
+   * restore = new identity). v1 disposition per pkg5b-review: log a warning
+   * + count it (getHelloClockAnomalyCount) + flag the session stats. This is
+   * a HEALTH CUE ONLY, not enforcement: the misbehavior ladder is
+   * deliberately NOT fed (an anomalous HELLO is not a record arrival), no
+   * clock merge is skipped (the element-wise MAX merge makes inflation
+   * harmless — pkg5b-review §4.3), and no session is terminated.
+   */
+  function noteHelloClockAnomaly(
+    peerClock: VC,
+    peerKey: string,
+    stats: SessionStats,
+  ): void {
+    const advertised = peerClock[deps.selfDeviceId];
+    if (typeof advertised !== "number" || !Number.isFinite(advertised)) return;
+    const own = getDeviceClockDb()[deps.selfDeviceId] ?? 0;
+    if (advertised <= own) return;
+    helloClockAnomalyCount++;
+    stats.helloClockAnomaly = true;
+    console.warn(
+      `[tide][health] HELLO clock anomaly: peer session (${peerKey}) ` +
+        `advertises device_clock[${deps.selfDeviceId}] = ${advertised} > ` +
+        `our own ${own}. Impossible under honest operation (DC-02 §4.1) — ` +
+        `indicates identity theft or a non-conformant same-id restore. ` +
+        `Health cue only; no enforcement action taken (DC-16 v1).`,
+    );
+  }
+
   function mergeDeviceClock(db: Database, clock: Record<string, number>): void {
     const upsert = db.prepare(`
       INSERT INTO device_clock (peer_device_id, max_seq) VALUES (?, ?)
@@ -431,6 +519,10 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     sessionDedup = new OfferDedup();
     // Pkg5b: truthful self-frontier seeding BEFORE the pull loop (see doc).
     seedSelfAppliedFrontier();
+    // Pkg6 (QA-1 F-6): same GC for long-lived engine instances — a frontier
+    // that advanced past a buffered seq mid-life (e.g. snapshot application)
+    // must not leave the zombie behind until the next restart.
+    gcZombiePending();
 
     // --- HELLO exchange ---
     const hello: SyncMessage = {
@@ -454,6 +546,9 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     const peerKey =
       deps.peerDeviceId ?? derivePeerKey(peerHello.device_clock);
     triggers.resetStreak(peerKey); // §3.1: streak resets at session start
+    // Pkg6 (item 8): DC-02 §4.1 impossibility signal — health cue, not
+    // enforcement (see noteHelloClockAnomaly doc).
+    noteHelloClockAnomaly(peerHello.device_clock, peerKey, stats);
 
     // --- DC-10 §2.2: push our full revocation queue for this peer ---
     await pushRevocationQueue(transport, stats);
