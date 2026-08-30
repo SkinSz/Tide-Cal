@@ -1,6 +1,7 @@
 # TIDE DESIGN CONTRACT DC-19
 # Tray Icon and Context Menu (Linux First)
-Status: DRAFT — awaiting owner approval (drafted 2026-08-30).
+Status: APPROVED by project owner (2026-08-31, D1-D7 decided; D8 is a
+        non-blocking implementation detail).
         Owner directive this contract encodes: NO options/settings button in
         the app UI; the tray icon's right-click context menu IS the v1
         settings/configuration surface.
