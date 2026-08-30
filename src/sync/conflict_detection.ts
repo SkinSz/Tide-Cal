@@ -1,8 +1,8 @@
 // Tide DC-03: Scalar conflict detection + conflict records.
-// Pure decision logic per APPROVED contract DC-03. The caller owns storage.
+// Pure decision logic per APPROVED contract DC-03 (v2: §3.2a). The caller owns storage.
 
 import type { ChangeRecord, VectorClock } from "./change_record.ts";
-import { concurrent } from "./vector_clock.ts";
+import { concurrent, sameOrDescendant, equalClocks } from "./vector_clock.ts";
 
 export type ConflictStatus =
   | "unresolved"
@@ -68,6 +68,7 @@ export function valuesDiffer(a: ChangeRecord, b: ChangeRecord): boolean {
 export type DetectionOutcome =
   | { kind: "noop" } // identical-value convergence (DC-03 §3.1)
   | { kind: "apply" } // causally-after or no concurrent differing pair
+  | { kind: "stale" } // §3.2a: causally dominated by a local participant — history only
   | { kind: "conflict"; conflicting: ChangeRecord[] }; // DC-03 §3.3
 
 /**
@@ -90,6 +91,24 @@ export function detect(
     (!v.deleted && !localCurrent.deleted && deepEqual(v.value, localCurrent.value))
   ) {
     return { kind: "noop" };
+  }
+
+  // Rule 3.2a (v2): STALE CAUSAL-BEFORE = history only. If any local
+  // participant dominates C's knowledge (C is causally before it), C is
+  // superseded knowledge and MUST NOT regress the materialized row. Stored
+  // in history + clocks merged by the caller; no conflict record (there is
+  // no concurrent divergence to preserve). Mutually exclusive with §3.3:
+  // concurrent(C, L) and causallyBefore(C, L) cannot both hold (DC-02 §3).
+  const dominated = locals.some((l) =>
+    sameOrDescendant(
+      l.causality_clock,
+      { device_id: l.device_id, local_seq: l.local_seq },
+      incoming.causality_clock,
+      { device_id: incoming.device_id, local_seq: incoming.local_seq },
+    ) && !equalClocks(l.causality_clock, incoming.causality_clock),
+  );
+  if (dominated) {
+    return { kind: "stale" };
   }
 
   // Rule 3.2/§3.3: concurrency check against un-compacted participants

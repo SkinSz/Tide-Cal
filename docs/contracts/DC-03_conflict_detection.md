@@ -1,10 +1,15 @@
 # TIDE DESIGN CONTRACT DC-03
 # Scalar Conflict Detection
-Status: APPROVED by project owner (2026-08-25)
+Status: APPROVED by project owner (2026-08-25); v2 amendment 2026-08-30
+        (§3.2a stale causal-before = history only — P11 remediation,
+        owner-directed work package)
 Depends on: Architecture Spec v0.3 §8, §9, §13, §14, §30, §31; DC-01; DC-02
 Unblocks: DC-04 (collection merge), conflict-resolution UI (deferred #12),
           sync protocol conflict-record transport (deferred #11)
 Resolves: deferred decision #3 from Spec §30
+Changelog: v2 (2026-08-30) — adds §3.2a closing the §3.3 fall-through for
+           causally dominated incoming records (QA-1 P11). No prior rule
+           changed; §3.1/3.2/3.3-3.7 semantics untouched.
 
 ==================================================
 1. PURPOSE
@@ -103,6 +108,12 @@ device evaluates C against all participants L for C's conflict entity:
         if for all L in locals: causallyBefore(L, C):
             apply C normally; return NO_CONFLICT
 
+        // Rule 3.2a: stale causal-before = history only (v2)
+        if any L in locals: causallyBefore(C, L):
+            do NOT mutate the materialized row;
+            store C in history (DC-02 §7) + merge clocks;
+            return STALE_SUPERSEDED (no conflict record)
+
         // Rule 3.3: concurrency check
         conflicting = [L for L in locals if concurrent(C, L)
                        and valuesDiffer(C, L)]
@@ -123,6 +134,25 @@ Rules in prose:
 3.2  CAUSAL-AFTER. If C is causally after every participant (per DC-02
      sameOrDescendant), C applies normally. No conflict exists — later
      knowledge supersedes earlier knowledge deterministically.
+
+3.2a STALE CAUSAL-BEFORE = HISTORY ONLY (v2, added 2026-08-30). If C is
+     causally BEFORE any participant L on the same conflict entity
+     (causallyBefore(C, L) per DC-02 §3 — some local participant already
+     dominates C's knowledge), C is part of history but MUST NOT mutate the
+     materialized entity row: a causally dominated operation cannot regress
+     newer state. C is still stored in the change history with clocks merged
+     (DC-02 §7 application gating is unaffected) so replication, compaction
+     accounting, and future detections keep working. No Conflict Record is
+     created: there is no concurrent divergence to preserve — C is simply
+     late delivery of superseded knowledge. This rule closes the §3.3
+     fall-through gap exposed by QA-1 P11 (stale title overwrote a newer
+     row; see docs/qa/remediation/p11-diagnosis.md).
+
+     Distinction preserved: causally-BEFORE (this rule, drop from
+     materialized state) vs CAUSAL-AFTER (3.2, apply) vs CONCURRENT
+     (3.3/3.4, conflict record). Genuine concurrent edits are never caught
+     by this rule: concurrent(C, L) and causallyBefore(C, L) are mutually
+     exclusive by DC-02 §3 definitions.
 
 3.3  CONCURRENT SAME-FIELD DIFFERENCE = CONFLICT. If C is concurrent
      (DC-02 §3) with any participant on the same conflict entity and their

@@ -488,7 +488,7 @@ function deserializeChangeRow(r: ChangeRow): ChangeRecord {
 function detectAndRecordConflict(
   db: Database.Database,
   record: ChangeRecord,
-): "apply" | "noop" | "conflict" {
+): "apply" | "noop" | "conflict" | "stale" {
   if (record.entity_type !== "event") return "apply";
   const localCurrent = eventRowLocalValue(db, record.entity_id, record.field_path);
   const locals = loadConflictLocals(db, record.entity_id, record.field_path);
@@ -497,7 +497,7 @@ function detectAndRecordConflict(
     recordConflictRow(db, record, outcome.conflicting);
     return "conflict";
   }
-  return outcome.kind; // "apply" | "noop"
+  return outcome.kind; // "apply" | "noop" | "stale"
 }
 
 /**
@@ -673,6 +673,9 @@ export function applyRemoteChange(
         // Pkg5 (QA M-2): DC-03 §3 detection BEFORE mutating local state.
         //   "apply"    -> entity-row mutation runs (§3.2/§3.6, no conflict)
         //   "noop"     -> §3.1 identical-value convergence: no row write
+        //   "stale"    -> §3.2a (v2): C is causally dominated by a local
+        //                 participant — history + clocks advance but the
+        //                 materialized row is NOT regressed
         //   "conflict" -> §3.3/§3.4: entity row NOT overwritten; the conflict
         //                 record was persisted above; history + clocks below
         //                 still advance (application gating per DC-02 §7 is
