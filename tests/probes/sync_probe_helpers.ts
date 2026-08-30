@@ -37,7 +37,7 @@ import { createSyncEngine } from "../../src/sync/sync_engine.ts";
 import { EventCore } from "../../src/persistence/bridges/event_core.ts";
 import type { SyncTransport } from "../../src/sync/sync_engine.ts";
 
-export const QA_TMP = "/tmp/tide-qa-sync/qa-tmp";
+export const QA_TMP = join("/tmp", "tide-probe-qa", "qa-tmp");
 export const RESULTS_DIR = join(QA_TMP, "results");
 
 export interface Device {
@@ -396,8 +396,14 @@ export function dumpState(tag: string, d: Device): Record<string, unknown> {
 }
 
 export function saveResult(name: string, data: unknown): void {
-  mkdirSync(RESULTS_DIR, { recursive: true });
-  writeFileSync(join(RESULTS_DIR, `${name}.json`), JSON.stringify(data, null, 2));
+  // Best-effort evidence dump: tests must never fail because evidence
+  // persistence does (read-only FS, sandbox, etc.).
+  try {
+    mkdirSync(RESULTS_DIR, { recursive: true });
+    writeFileSync(join(RESULTS_DIR, `${name}.json`), JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.warn(`[probe] saveResult(${name}) skipped:`, String(e).slice(0, 120));
+  }
 }
 
 export { createSyncEngine, makeEntityMutator };

@@ -22,8 +22,8 @@
 // carries both directions per DC-08 §4.
 import { expect, test } from "vitest";
 import { serveSync, connectSync } from "../../src/network/sync_runtime.ts";
-import { guardProcess, makeDevice, pairDevices, oracle, saveResult, type Device } from "./helpers.ts";
-import { createSyncEngine, makeEntityMutator } from "./helpers.ts";
+import { guardProcess, makeDevice, pairDevices, oracle, saveResult, type Device } from "./sync_probe_helpers.ts";
+import { createSyncEngine, makeEntityMutator } from "./sync_probe_helpers.ts";
 
 function mkEvent(d: Device, title: string) {
   const t = Date.now();

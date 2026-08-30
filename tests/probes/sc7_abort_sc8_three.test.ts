@@ -1,10 +1,9 @@
 // SC7: abrupt abort mid-session x5 + restart -> must converge, no duplication.
 // SC8: 3-device star topology with concurrent creates + delete-vs-edit conflict.
-// Pkg6 disposition (2026-08-30): SC8 asserts same-row-state-everywhere, i.e.
-// implicit-LWW convergence that Pkg5/DC-03 §3.4 REPLACED — delete-vs-edit now
-// leaves unresolved conflict rows on all three devices (verified, NOT data
-// loss; pkg5b-review §5). Left failing intentionally: observe-only pending
-// owner disposition of the replaced semantics.
+// PROMOTED (2026-08-30): SC8's old assertion (same-row-state-everywhere) pinned
+// the implicit-LWW convergence that Pkg5/DC-03 §3.4 REPLACED. Rewritten to pin
+// the CORRECT semantics: deleter keeps deletion, editor keeps edit, unresolved
+// conflict rows on all devices (verified NOT data loss; pkg5b-review §5).
 import { expect, test } from "vitest";
 import type Database from "better-sqlite3";
 import { join } from "node:path";
@@ -17,7 +16,7 @@ import {
   dumpState,
   saveResult,
   type Device,
-} from "./helpers.ts";
+} from "./sync_probe_helpers.ts";
 
 function mkEvent(d: Device, title: string) {
   const t = Date.now();
@@ -102,6 +101,18 @@ test("SC8 3-device star: concurrent creates on all 3 + delete-vs-edit, converge 
     stateA: dumpState("HUB", a),
   });
   expect(o1.converged, JSON.stringify(o1.detail)).toBe(true);
-  expect(o2.converged, JSON.stringify(o2.detail)).toBe(true);
-  expect([evbA, evbB, evbC]).toEqual([evbA, evbA, evbA]); // same row state everywhere
+  // Post-Pkg5/DC-03 §3.4 semantics (PROMOTED pin): delete-vs-edit does NOT
+  // converge to a single row state — the deleter keeps the deletion, the
+  // editor keeps the edit, and an unresolved conflict row is recorded on
+  // every device that saw both intents (verified NOT data loss:
+  // pkg5b-review §5 SC8 replica).
+  const unresolved = (d: Device) =>
+    (d.db.prepare(
+      "SELECT COUNT(*) c FROM conflicts WHERE entity_id=? AND status='unresolved'",
+    ).get(evB.id) as { c: number }).c;
+  expect(unresolved(a)).toBeGreaterThanOrEqual(1);
+  expect(unresolved(b)).toBeGreaterThanOrEqual(1);
+  expect(unresolved(c)).toBeGreaterThanOrEqual(1);
+  const editorKept = (b.db.prepare("SELECT title FROM events WHERE event_id=?").get(evB.id) as { title: string }).title;
+  expect(editorKept).toBe("edited-while-deleted");
 }, 60000);

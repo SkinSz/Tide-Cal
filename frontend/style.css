@@ -216,6 +216,65 @@ dialog menu .spacer { flex: 1 1 auto; }
   z-index: 2;
 }
 
+/* Drag-n-drop + delete-arm affordances */
+.chip-dragging { opacity: 0.5; }
+.chip[draggable="true"] { cursor: grab; }
+.week-col.drop-target {
+  outline: 2px dashed var(--accent);
+  outline-offset: -2px;
+}
+.chip-delete-arm {
+  background: #b3402e !important;
+  color: #fff !important;
+  font-weight: 600;
+}
+.chip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* Whole-day banner: a SOLID full-height appointment block covering the entire
+   day column (00:00–24:00) — same visual language as the all-day lane chip
+   (solid accent fill, dark text) so it unambiguously reads as an appointment,
+   never as day highlighting (owner: translucent washes confused it with the
+   today marking). Click-through (pointer-events: none): the lane chip owns
+   selection/edit/delete; hour cells keep click + drop behavior underneath;
+   timed chips paint on top (z-index 2 vs 1). */
+.allday-banner {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  left: 2px;
+  right: 2px;
+  background: var(--accent);
+  border: none;
+  border-radius: 6px;
+  color: #08131c;
+  font-size: 0.68rem;
+  font-weight: 600;
+  text-align: center;
+  overflow: hidden;
+  opacity: 0.92; /* slight translucency so hour lines stay faintly visible */
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* Live drag ghost: semi-transparent preview with the real target time */
+.drag-ghost {
+  opacity: 0.85;
+  background: color-mix(in srgb, var(--accent) 45%, var(--panel));
+  border: 1px dashed var(--accent);
+  pointer-events: none;
+}
+
+/* Whole-day drag ghost: brighter banner preview on the target day column */
+.drag-ghost-allday {
+  background: color-mix(in srgb, var(--accent) 35%, transparent);
+  border: 2px dashed var(--accent);
+  pointer-events: none;
+  z-index: 40;
+}
+
 /* Hour guide lines through the day columns (week view) */
 .hour-line {
   position: absolute;

@@ -12,7 +12,7 @@ import {
   dumpState,
   saveResult,
   type Device,
-} from "./helpers.ts";
+} from "./sync_probe_helpers.ts";
 
 function mkEvent(d: Device, title: string) {
   const t = Date.now();

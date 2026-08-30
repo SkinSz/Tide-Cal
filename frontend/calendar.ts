@@ -1,6 +1,6 @@
 // Tide calendar grid: month view and week view, vanilla TS DOM rendering.
 import type { CalendarEvent } from "./store.ts";
-import { listEvents, listSeries, type SeriesRow } from "./store.ts";
+import { listEvents, listSeries, updateEvent, deleteEvent, type SeriesRow } from "./store.ts";
 import { recurrenceBadge, type SeriesInfo } from "./recurrence.ts";
 
 export type ViewMode = "month" | "week";
@@ -188,18 +188,261 @@ function eventChip(
   chip.title = ev.title;
   decorateRecurrence(chip, ev, series);
   // UX contract (owner rule): single-click SELECTS, double-click OPENS the
-  // edit dialog. Never open on single click.
+  // edit dialog. Never open on single click. Delete key deletes (with the
+  // dialog's two-step confirm), drag moves (week view).
+  chip.tabIndex = 0;
   chip.addEventListener("click", (e) => {
     e.stopPropagation();
     selectChip(chip);
+    selectedEvent = ev;
     document.dispatchEvent(new CustomEvent("tide:eventselect", { detail: ev }));
   });
   chip.addEventListener("dblclick", (e) => {
     e.stopPropagation();
     onEventClick(ev);
   });
+  chip.addEventListener("keydown", (e) => {
+    const key = (e as KeyboardEvent).key;
+    if (chip.dataset.deleteArmed === "1" && key !== "Delete" && key !== "Backspace") {
+      disarmDelete(chip); // any other key cancels the armed delete
+      return;
+    }
+    if (key !== "Delete" && key !== "Backspace") return;
+    e.preventDefault();
+    e.stopPropagation();
+    deleteSelected(chip);
+  });
+  wireDrag(chip, ev);
   return chip;
 }
+
+// ---------------------------------------------------------------------------
+// Delete key (owner request): Delete/Backspace on a selected chip opens the
+// two-step in-app confirmation (same pattern as the dialog's Delete button —
+// arm → "Confirm delete?" → execute; auto-revert after 8s). No native
+// confirm() — WebKit popup chrome is banned (smoke-test round 2).
+// ---------------------------------------------------------------------------
+
+let selectedEvent: CalendarEvent | null = null;
+
+function deleteSelected(chip: HTMLElement): void {
+  const ev = selectedEvent;
+  if (!ev || chip.dataset.eventId !== ev.id) return;
+  if (chip.dataset.deleteArmed !== "1") {
+    chip.dataset.deleteArmed = "1";
+    chip.dataset.prevTitle = chip.textContent ?? "";
+    chip.textContent = "Confirm delete? (Del again)";
+    chip.title = "Press Delete again to confirm — click elsewhere or press any other key to cancel";
+    chip.classList.add("chip-delete-arm");
+    chip.dataset.revertTimer = window
+      .setTimeout(() => disarmDelete(chip), 8000)
+      .toString();
+    return;
+  }
+  disarmDelete(chip);
+  void (async () => {
+    try {
+      await deleteEvent(ev.id);
+      selectedEvent = null;
+      document.dispatchEvent(new CustomEvent("tide:refresh"));
+    } catch (err) {
+      console.error("[tide] delete failed:", err);
+    }
+  })();
+}
+
+function disarmDelete(chip: HTMLElement): void {
+  chip.dataset.deleteArmed = "";
+  if (chip.dataset.revertTimer) {
+    clearTimeout(Number(chip.dataset.revertTimer));
+    chip.dataset.revertTimer = "";
+  }
+  chip.classList.remove("chip-delete-arm");
+  // Restore the original label (re-render is the general path; this keeps
+  // the armed chip readable if the render hasn't happened yet).
+  const ev = selectedEvent;
+  if (ev && chip.dataset.eventId === ev.id) {
+    chip.textContent = ev.allDay || chip.classList.contains("chip-allday")
+      ? ev.title
+      : `${fmtTime(ev.startMs)} ${ev.title}`;
+    chip.title = ev.title;
+    decorateRecurrence(chip, ev, seriesLookup ?? new Map());
+  }
+}
+
+function cancelDeleteArms(root: ParentNode): void {
+  root.querySelectorAll<HTMLElement>(".chip-delete-arm").forEach(disarmDelete);
+}
+
+// ---------------------------------------------------------------------------
+// Drag-n-drop (owner request, week view): drag a chip to another day/hour to
+// move the appointment. HTML5 DnD with the chip as source and the week day
+// column as drop target; drop position maps to a new start time (day from the
+// column, minutes-of-day from the drop Y). Preserves duration. allDay chips
+// are excluded (the all-day lane has no time axis).
+// ---------------------------------------------------------------------------
+
+let dragEvent: CalendarEvent | null = null;
+let seriesLookup: Map<string, SeriesInfo> | null = null;
+let dragGhost: HTMLElement | null = null;
+
+/** Remove the live drag ghost (owner request: real-time time feedback). */
+function removeDragGhost(): void {
+  dragGhost?.remove();
+  dragGhost = null;
+}
+
+/**
+ * Live drag ghost: a semi-transparent block pinned to the day column under
+ * the cursor at the SNAPPED start time, labeled with the real wall-clock
+ * range the drop would produce — so the owner can see exactly when the
+ * appointment will land before releasing the mouse (Outlook-style).
+ */
+function updateDragGhost(col: HTMLElement, clientY: number, durMin: number): void {
+  const rect = col.getBoundingClientRect();
+  const yInCol = Math.min(Math.max(clientY - rect.top, 0), rect.height);
+  let minutes = Math.round(((yInCol / rect.height) * MINUTES_PER_DAY) / 15) * 15;
+  minutes = Math.min(Math.max(minutes, 0), MINUTES_PER_DAY - 15);
+  const topPct = (minutes / MINUTES_PER_DAY) * 100;
+  const heightPct = Math.min((durMin / MINUTES_PER_DAY) * 100, 100 - topPct);
+  const endMin = Math.min(minutes + durMin, MINUTES_PER_DAY);
+
+  if (!dragGhost) {
+    dragGhost = document.createElement("div");
+    dragGhost.className = "chip chip-timed drag-ghost";
+    col.appendChild(dragGhost);
+  } else if (dragGhost.parentElement !== col) {
+    dragGhost.remove();
+    col.appendChild(dragGhost);
+  }
+  const hh = (m: number) => `${pad(Math.floor(m / 60) % 24)}:${pad(Math.round(m % 60))}`;
+  dragGhost.style.top = `${topPct}%`;
+  dragGhost.style.height = `${heightPct}%`;
+  dragGhost.style.left = "2px";
+  dragGhost.style.right = "2px";
+  dragGhost.style.width = "auto";
+  dragGhost.style.zIndex = "50";
+  dragGhost.textContent = `${hh(minutes)} – ${hh(endMin)}`;
+  dragGhost.title = "Release to move the appointment here";
+}
+
+function wireDrag(chip: HTMLElement, ev: CalendarEvent): void {
+  chip.draggable = true;
+  chip.addEventListener("dragstart", (e) => {
+    dragEvent = ev;
+    e.dataTransfer?.setData("text/plain", ev.id);
+    if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+    chip.classList.add("chip-dragging");
+  });
+  chip.addEventListener("dragend", () => {
+    chip.classList.remove("chip-dragging");
+    dragEvent = null;
+    removeDragGhost();
+    document
+      .querySelectorAll<HTMLElement>(".drop-target")
+      .forEach((el) => el.classList.remove("drop-target"));
+  });
+  // Global dragover drives the ghost: the source chip fires drag events even
+  // when the pointer is over another column, so the ghost follows across days.
+  document.addEventListener("dragover", (e) => {
+    if (!dragEvent || dragEvent.id !== ev.id) return;
+    const target = (e.target as HTMLElement | null)?.closest?.(".week-col") as HTMLElement | null;
+    if (!target) {
+      removeDragGhost();
+      return;
+    }
+    e.preventDefault();
+    if (ev.allDay) {
+      updateAllDayGhost(target, ev);
+    } else {
+      updateDragGhost(target, e.clientY, Math.max((ev.endMs - ev.startMs) / 60000, 30));
+    }
+  });
+  document.addEventListener("drop", removeDragGhost);
+}
+
+/** Whole-day drag ghost: a full-height banner preview on the target day. */
+function updateAllDayGhost(col: HTMLElement, ev: CalendarEvent): void {
+  if (!dragGhost) {
+    dragGhost = document.createElement("div");
+    col.appendChild(dragGhost);
+  } else if (dragGhost.parentElement !== col) {
+    dragGhost.remove();
+    col.appendChild(dragGhost);
+  }
+  dragGhost.className = "allday-banner drag-ghost-allday";
+  dragGhost.textContent = ev.title;
+  dragGhost.style.cssText = "";
+  dragGhost.title = "Release to move the whole-day appointment to this day";
+}
+
+function wireWeekColumnDrop(col: HTMLElement, cell: DayCell): void {
+  col.addEventListener("dragover", (e) => {
+    if (!dragEvent) return; // only accept our own chips
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+    col.classList.add("drop-target");
+  });
+  col.addEventListener("dragleave", (e) => {
+    if (e.target === col) col.classList.remove("drop-target");
+  });
+  col.addEventListener("drop", (e) => {
+    e.preventDefault();
+    col.classList.remove("drop-target");
+    removeDragGhost();
+    const ev = dragEvent;
+    if (!ev) return;
+    const day = startOfDay(cell.date);
+    if (ev.allDay) {
+      // Whole-day drag: move the DATE only, keep the all-day flag. Duration
+      // stays 24h (whole-day events are single-day per design contract).
+      const dur = Math.max(ev.endMs - ev.startMs, DAY_MS);
+      const startMs = day.getTime();
+      if (startMs === ev.startMs) return; // no-op drop
+      void (async () => {
+        try {
+          await updateEvent(ev.id, {
+            title: ev.title,
+            description: ev.description,
+            startMs,
+            endMs: startMs + dur,
+            allDay: true,
+          });
+          selectedEvent = null;
+          document.dispatchEvent(new CustomEvent("tide:refresh"));
+        } catch (err) {
+          console.error("[tide] whole-day move failed:", err);
+        }
+      })();
+      return;
+    }
+    // Timed drag: map the drop Y to minutes-of-day; duration is preserved.
+    const rect = col.getBoundingClientRect();
+    const yInCol = Math.min(Math.max(e.clientY - rect.top, 0), rect.height);
+    let minutes = Math.round(((yInCol / rect.height) * MINUTES_PER_DAY) / 15) * 15;
+    minutes = Math.min(Math.max(minutes, 0), MINUTES_PER_DAY - 15);
+    const dur = Math.max(ev.endMs - ev.startMs, 60_000);
+    day.setMinutes(minutes);
+    const startMs = day.getTime();
+    if (startMs === ev.startMs) return; // no-op drop
+    void (async () => {
+      try {
+        await updateEvent(ev.id, {
+          title: ev.title,
+          description: ev.description,
+          startMs,
+          endMs: startMs + dur,
+          allDay: ev.allDay,
+        });
+        selectedEvent = null;
+        document.dispatchEvent(new CustomEvent("tide:refresh"));
+      } catch (err) {
+        console.error("[tide] drag-move failed:", err);
+      }
+    })();
+  });
+}
+
 
 /** Visual selection: exactly one chip highlighted at a time. */
 function selectChip(chip: HTMLElement): void {
@@ -295,6 +538,7 @@ export async function render(): Promise<void> {
     eventsForRange(rangeStart, rangeEnd),
     seriesByBaseEvent(),
   ]);
+  seriesLookup = series;
   // Re-check: async gap may mean the user navigated meanwhile.
   if (seq !== renderSeq) {
     return;
@@ -358,6 +602,53 @@ function minutesOfDay(d: Date): number {
   return d.getHours() * 60 + d.getMinutes();
 }
 
+/**
+ * Outlook-style overlap layout: assign each event a horizontal "lane" so
+ * events overlapping in time sit side by side, and events that merely chain
+ * (A ends when B starts — touching is NOT overlapping) reuse the same lane.
+ * `total` is the number of lanes in the event's own overlap cluster, so a
+ * pair of overlapping events each span 50% while a lone event spans 100%.
+ */
+interface OverlapItem {
+  ev: CalendarEvent;
+  lane: number;
+  total: number;
+}
+
+function layoutOverlapColumns(events: CalendarEvent[]): OverlapItem[] {
+  const out: OverlapItem[] = [];
+  let cluster: { ev: CalendarEvent; lane: number; laneEnd: number }[] = [];
+  let clusterEnd = 0;
+
+  const flush = () => {
+    const total = cluster.reduce((m, c) => Math.max(m, c.lane + 1), 0);
+    for (const c of cluster) out.push({ ev: c.ev, lane: c.lane, total });
+    cluster = [];
+  };
+
+  for (const ev of events) {
+    if (cluster.length > 0 && ev.startMs >= clusterEnd) flush(); // new cluster
+    if (cluster.length === 0) {
+      clusterEnd = ev.endMs;
+      cluster.push({ ev, lane: 0, laneEnd: ev.endMs });
+      continue;
+    }
+    // Place in the first lane whose last event ends at or before this start
+    // (touching counts as free); otherwise open a new lane.
+    let lane = cluster.findIndex((c) => ev.startMs >= c.laneEnd);
+    if (lane === -1) {
+      lane = cluster.length;
+      cluster.push({ ev, lane, laneEnd: ev.endMs });
+    } else {
+      cluster[lane] = { ev, lane, laneEnd: ev.endMs };
+    }
+    clusterEnd = Math.max(clusterEnd, ev.endMs);
+  }
+  if (cluster.length > 0) flush();
+  return out;
+}
+
+
 function weekDayColumn(
   cell: DayCell,
   events: CalendarEvent[],
@@ -372,24 +663,46 @@ function weekDayColumn(
     (sameDay(cell.date, selectedDate) ? " day-selected" : "");
   col.dataset.date = cell.date.toISOString().slice(0, 10);
   if (clickedHour != null) col.classList.add("hour-clicked");
+  wireWeekColumnDrop(col, cell);
 
-  // All-day lane on top.
+  // All-day lane on top (compact indicator on every day the event spans).
+  // PLUS (owner request): a full 24h "column banner" inside the time grid so
+  // the whole-day appointment visibly covers the entire day, Outlook-style.
+  // The grid banner is click-through-inert (pointer-events: none) — the lane
+  // chip owns selection/edit/delete, and the hour cells keep their click and
+  // drop behavior (DnD targets ignore all-day events).
   for (const ev of events.filter(
     (e) =>
       e.allDay &&
       new Date(e.startMs) <= endOfDay(cell.date) &&
       new Date(e.endMs - 1) >= startOfDay(cell.date),
   )) {
-    const chip = eventChip(ev, true, series);
-    chip.classList.add("lane-chip");
-    col.appendChild(chip);
+    const laneChip = eventChip(ev, true, series);
+    laneChip.classList.add("lane-chip");
+    col.appendChild(laneChip);
+
+    const banner = document.createElement("div");
+    banner.className = "allday-banner";
+    banner.textContent = ev.title;
+    banner.title = `${ev.title} (whole day)`;
+    col.appendChild(banner);
   }
 
-  // Timed blocks: absolute positioning from clock times.
-  for (const ev of events.filter(
-    (e) => !e.allDay && e.startMs < cell.date.getTime() + DAY_MS &&
-           e.endMs > cell.date.getTime(),
-  )) {
+  // Timed blocks: absolute positioning from clock times, with Outlook-style
+  // overlap layout — events that overlap in time share the column's width
+  // side by side (each gets left/width percentages), non-overlapping events
+  // keep the full width.
+  const timed = events
+    .filter(
+      (e) =>
+        !e.allDay &&
+        e.startMs < cell.date.getTime() + DAY_MS &&
+        e.endMs > cell.date.getTime(),
+    )
+    .sort((a, b) => a.startMs - b.startMs || a.endMs - b.endMs);
+  const lanes = layoutOverlapColumns(timed);
+  for (const item of lanes) {
+    const ev = item.ev;
     const s = Math.max(ev.startMs, cell.date.getTime());
     const en = Math.min(ev.endMs, cell.date.getTime() + DAY_MS);
     const startMin =
@@ -405,6 +718,11 @@ function weekDayColumn(
     chip.classList.add("chip-timed");
     chip.style.top = `${topPct}%`;
     chip.style.height = `${heightPct}%`;
+    // Horizontal split: lane index / lane count. A lone event spans 100%.
+    const laneCount = Math.max(item.total, 1);
+    chip.style.left = `${(item.lane / laneCount) * 100}%`;
+    chip.style.width = `${(1 / laneCount) * 100}%`;
+    chip.style.zIndex = String(3 + item.lane);
     chip.textContent = `${fmtTime(ev.startMs)} ${ev.title}`;
     col.appendChild(chip);
   }

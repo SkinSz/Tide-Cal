@@ -12,7 +12,7 @@ import {
   dumpState,
   saveResult,
   type Device,
-} from "./helpers.ts";
+} from "./sync_probe_helpers.ts";
 
 function mkEvent(d: Device, title: string) {
   const t = Date.now();
@@ -118,13 +118,15 @@ test("SC6 quarantine during active sync: invalid record mid-stream, valid flow c
       }
       if (this.received.length === 1) {
         this.received.push("batch");
-        const m = (this.sent as Array<{ type: string }>).findLast?.((x) => x.type === "CHANGES_REQUEST");
+        const sentArr = this.sent as Array<{ type: string }>;
+        const m = [...sentArr].reverse().find((x) => x.type === "CHANGES_REQUEST");
+        void m;
         return { v: 1, type: "CHANGES_BATCH", changes: batch, remaining_ranges: [] };
       }
       return null; // EOF
     },
   };
-  const { createSyncEngine, makeEntityMutator } = await import("./helpers.ts");
+  const { createSyncEngine, makeEntityMutator } = await import("./sync_probe_helpers.ts");
   const eng = createSyncEngine({ db: b.db, selfDeviceId: b.identity.deviceId, mutateEntity: makeEntityMutator() });
   const stats = await eng.runSession(scripted as never);
 

@@ -37,7 +37,7 @@ import {
   oracle,
   msgPipePair,
   type Device,
-} from "../qa-tmp/probes/helpers.ts";
+} from "./probes/sync_probe_helpers.ts";
 import { createSyncEngine } from "../src/sync/sync_engine.ts";
 import { makeEntityMutator } from "../src/persistence/bridges/sync_service.ts";
 import type { SyncTransport } from "../src/sync/sync_engine.ts";
