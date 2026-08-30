@@ -130,6 +130,6 @@ stable, blind final verification PASS WITH CONCERNS with zero new issues).
 - **ID:** TD-009
 - **Title:** Wire a Cancel button in the Devices dialog to the existing cancel_pairing_offer op
 - **Priority:** 2/10 — LOW (optional/aesthetic: the security gap is CLOSED server-side; the op exists, is allow-listed, and offers are already cleaned up by supersede, ceremony completion, and stdin-EOF shutdown)
-- **Status:** OPEN
+- **Status:** RESOLVED (2026-08-30) — frontend Cancel button wired to `cancel_pairing_offer` (frontend/index.html `btn-pairing-cancel`, frontend/devices.ts `cancelPairingOffer`, tests/td009_cancel_button.test.ts)
 - **Scope:** frontend/devices.ts + frontend/index.html: show a Cancel affordance while a pairing offer is pending (pairing-step-show visible with a code), call syncOp("cancel_pairing_offer"), update UI state. No backend work required.
 - **Origin:** blind review of f441f75 (pairing-offer lifecycle) noted user-initiated cancel is currently unreachable in the UI.

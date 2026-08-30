@@ -40,6 +40,25 @@ function setBusy(b: boolean): void {
   el<HTMLButtonElement>("devices-busy").hidden = !b;
 }
 
+// TD-009: a pending offer (pairing-step-show showing a code) is cancellable.
+function setOfferPending(pending: boolean): void {
+  const btn = document.getElementById("btn-pairing-cancel");
+  if (btn) btn.hidden = !pending;
+}
+
+async function cancelPairingOffer(): Promise<void> {
+  setBusy(true);
+  try {
+    await syncOp("cancel_pairing_offer", {});
+    setOfferPending(false);
+    log(`Pairing offer cancelled`);
+  } catch (err) {
+    log(`pairing offer cancel failed: ${String(err)}`);
+  } finally {
+    setBusy(false);
+  }
+}
+
 async function renderDeviceInfo(): Promise<void> {
   try {
     const info = await syncOp<DeviceInfo>("device_info");
@@ -80,8 +99,10 @@ async function showPairingCode(): Promise<void> {
     const res = await syncOp<{ qr_text: string }>("pairing_offer", {});
     const out = el<HTMLTextAreaElement>("pairing-code-out");
     out.value = res.qr_text;
+    setOfferPending(true); // supersede of an older offer keeps it visible
     log(`pairing offer created — paste the code on the other device.`);
   } catch (err) {
+    setOfferPending(false);
     log(`pairing offer failed: ${String(err)}`);
   } finally {
     setBusy(false);
@@ -104,6 +125,7 @@ async function acceptPairing(): Promise<void> {
       `paired with ${res.peer_device_id.slice(0, 16)}… (safety ${res.safety_number})`,
     );
     input.value = "";
+    setOfferPending(false); // successful pair closes the offer side too
     await renderDeviceInfo();
   } catch (err) {
     log(`pairing failed: ${String(err)}`);
@@ -135,4 +157,10 @@ export function initDevices(): void {
   document
     .getElementById("btn-pairing-accept")
     ?.addEventListener("click", () => void acceptPairing());
+  document
+    .getElementById("btn-pairing-cancel")
+    ?.addEventListener("click", () => void cancelPairingOffer());
+  // Closing the dialog hides a pending offer's Cancel affordance; the offer
+  // itself is still torn down server-side (stdin-EOF shutdown).
+  dlg()?.addEventListener("close", () => setOfferPending(false));
 }
