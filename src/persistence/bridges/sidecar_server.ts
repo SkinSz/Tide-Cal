@@ -18,7 +18,11 @@
 //   delete_event {id}                         -> null
 
 import { createInterface } from "node:readline";
-import { EventCore, type EventInput } from "./event_core.ts";
+import {
+  EventCore,
+  validateEventValues,
+  type EventInput,
+} from "./event_core.ts";
 import {
   loadOrCreateIdentity,
   serveSync,
@@ -327,6 +331,16 @@ export class SyncManager {
 //   delete_event: args.id must be a non-empty string.
 //   Unknown/mistyped input fields are rejected (never echoed, never
 //   persisted).
+//
+// Pkg 3 additions (same boundary, same rejection discipline):
+//   - all five fields are REQUIRED on create AND update ("full input
+//     required" — QA-2 F-2): partial input is a deterministic ok:false
+//     naming the missing fields; nothing is defaulted (a missing allDay is
+//     an error, never a silent false — BND-04) and no raw SQLite error can
+//     surface over IPC.
+//   - startMs/endMs: integral epoch ms, |v| <= MAX_EVENT_MS (8.64e15),
+//     endMs >= startMs (BND-02/03) — shared canonical validator in
+//     event_core.ts; binds to SQLite exactly as validated.
 // ---------------------------------------------------------------------------
 
 /** The only fields a client may set on an event. */
@@ -338,6 +352,9 @@ const EVENT_INPUT_KEYS: ReadonlySet<string> = new Set([
   "allDay",
 ]);
 
+/** Same fields, in canonical contract order (error messages). */
+const EVENT_INPUT_KEY_LIST = ["title", "description", "startMs", "endMs", "allDay"] as const;
+
 function fail(msg: string): never {
   throw new Error(msg);
 }
@@ -345,6 +362,25 @@ function fail(msg: string): never {
 /**
  * Validate the raw `args.input` of create_event/update_event. Returns a
  * clean EventInput containing exactly the five known fields.
+ *
+ * Pkg 2 (M-1/BND-01): identity contract — input.id rejected, unknown fields
+ * rejected, primitive types enforced.
+ *
+ * Pkg 3 (QA-2 F-2 / BND-02 / BND-03 / BND-04) extends, not replaces:
+ *   - EVERY one of the five fields must be PRESENT. The contract is
+ *     "full input required": partial input is a deterministic ok:false
+ *     naming the missing fields (the shipped Rust EventInput always sends
+ *     all five typed fields). Previously a partial update crashed later in
+ *     the SQLite seam with `NOT NULL constraint failed: events.description`
+ *     — that raw error can no longer surface over IPC. Nothing is
+ *     defaulted: a missing allDay is an error, not a silent false (BND-04).
+ *   - startMs/endMs must be integral epoch ms within +/-MAX_EVENT_MS with
+ *     endMs >= startMs — delegated to the shared canonical validator in
+ *     event_core.ts (validateEventValues) so the dispatcher and the domain
+ *     core enforce IDENTICAL rules. No silent coercion anywhere: the values
+ *     bound to SQLite are exactly the validated ones (integers, so INTEGER
+ *     affinity is a no-op — the "42.5" REAL / 0-for-garbage BND-03 class is
+ *     structurally closed).
  */
 function validateEventInput(raw: unknown, op: string): EventInput {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
@@ -367,6 +403,14 @@ function validateEventInput(raw: unknown, op: string): EventInput {
         `title, description, startMs, endMs, allDay`,
     );
   }
+  const missing = EVENT_INPUT_KEY_LIST.filter((k) => !(k in input));
+  if (missing.length > 0) {
+    fail(
+      `${op}: input is missing required field(s): ${missing.join(", ")} — ` +
+        `the full event input (title, description, startMs, endMs, allDay) ` +
+        `is required; partial updates are rejected without any state change`,
+    );
+  }
   if (typeof input.title !== "string") {
     fail(`${op}: input.title must be a string`);
   }
@@ -381,13 +425,16 @@ function validateEventInput(raw: unknown, op: string): EventInput {
   if (typeof input.allDay !== "boolean") {
     fail(`${op}: input.allDay must be a boolean`);
   }
-  return {
+  const clean: EventInput = {
     title: input.title,
     description: input.description,
     startMs: input.startMs as number,
     endMs: input.endMs as number,
     allDay: input.allDay,
   };
+  // Shared canonical value rules (integral, bounded, endMs >= startMs).
+  validateEventValues(clean, op);
+  return clean;
 }
 
 /** Validate an op's target event id (update_event / delete_event). */

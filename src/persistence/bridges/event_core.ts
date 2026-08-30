@@ -116,6 +116,65 @@ function assertNoInjectedId(input: EventInput, op: "create" | "update"): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Pkg 3 (QA M-5/BND-02, M-6/BND-03): canonical VALUE-level event validation.
+//
+// Single source of truth for the numeric/temporal rules, shared by the
+// sidecar dispatcher (wire boundary) and the domain core itself
+// (defense-in-depth, holds even if the dispatcher is bypassed). Every
+// violation throws a deterministic error BEFORE any createLocalChange() /
+// row write, so persistent state (rows + change log + entity_versions) is
+// byte-identical after a rejected request.
+//
+// Rules (see docs/qa/remediation/pkg3-report.md §2):
+//   - startMs/endMs must be INTEGRAL epoch milliseconds. Fractional values
+//     are rejected, never rounded: the events table declares
+//     utc_start_ms/utc_end_ms with INTEGER affinity, so binding 42.5 would
+//     silently store a REAL — the BND-03 class of seam-level coercion.
+//   - |startMs|/|endMs| <= MAX_EVENT_MS. The epoch-ms domain is bounded at
+//     ±8.64e15 (ECMAScript Date range, ±100M days). Wider integers up to
+//     2^53 would pass an integer check but make Date arithmetic return
+//     Invalid Date, silently writing "NaN-NaN-NaN" into the derived
+//     start_date/end_date columns — the same silent-garbage class. The
+//     bound also guarantees exact JSON round-trips to sync peers.
+//   - endMs >= startMs (BND-02). Inverted ranges are REJECTED, never
+//     clamped: the baseline clamp made the response echo, the stored row,
+//     and the change-record payload carry three different values.
+//   - Negative timestamps and 0 are VALID (pre-1970 instants; epoch 0).
+//     The domain has no historical lower bound, and every persistence,
+//     derived-column, and sync path round-trips negatives exactly.
+// ---------------------------------------------------------------------------
+
+/** Inclusive |epoch ms| bound: ECMAScript Date range (±100,000,000 days). */
+export const MAX_EVENT_MS = 8_640_000_000_000_000;
+
+export function validateEventValues(input: EventInput, op: string): void {
+  for (const k of ["startMs", "endMs"] as const) {
+    const v = input[k];
+    if (typeof v !== "number" || !Number.isInteger(v)) {
+      throw new Error(
+        `${op}: input.${k} must be an integer number of epoch ` +
+          `milliseconds (fractional/non-numeric values are rejected, ` +
+          `never coerced)`,
+      );
+    }
+    if (Math.abs(v) > MAX_EVENT_MS) {
+      throw new Error(
+        `${op}: input.${k} ${v} is outside the epoch-ms domain ` +
+          `(+/-${MAX_EVENT_MS}); values beyond it are rejected because ` +
+          `Date-derived columns and exact JSON round-trips cannot represent them`,
+      );
+    }
+  }
+  if (input.endMs < input.startMs) {
+    throw new Error(
+      `${op}: input.endMs (${input.endMs}) must be >= input.startMs ` +
+        `(${input.startMs}) — inverted ranges are rejected without any ` +
+        `state change`,
+    );
+  }
+}
+
 export class EventCore {
   readonly db: ReturnType<typeof openDatabase>;
   readonly dbPath: string;
@@ -199,6 +258,10 @@ export class EventCore {
       endMs: input.endMs,
       allDay: input.allDay,
     };
+    // Pkg 3: canonical value validation BEFORE any change record / row write
+    // (BND-02 inverted range, BND-03 non-integral timestamps) — a rejected
+    // create leaves rows + change log + entity_versions byte-identical.
+    validateEventValues(event, "create_event");
     const hlc = this.hlc.now();
     createLocalChange(
       this.db,
@@ -236,6 +299,11 @@ export class EventCore {
       endMs: input.endMs,
       allDay: input.allDay,
     };
+    // Pkg 3: canonical value validation on the MERGED event (the full input
+    // the dispatcher required) BEFORE any change record / row write —
+    // BND-02's inverted-range clamp (and its response/row/record value
+    // split) is now a deterministic rejection.
+    validateEventValues(updated, "update_event");
 
     // One T1 record per logical field group that actually changed
     // (DC-01 field-level semantics: title / description / schedule).
