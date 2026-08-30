@@ -1,5 +1,10 @@
 // SC7: abrupt abort mid-session x5 + restart -> must converge, no duplication.
 // SC8: 3-device star topology with concurrent creates + delete-vs-edit conflict.
+// Pkg6 disposition (2026-08-30): SC8 asserts same-row-state-everywhere, i.e.
+// implicit-LWW convergence that Pkg5/DC-03 §3.4 REPLACED — delete-vs-edit now
+// leaves unresolved conflict rows on all three devices (verified, NOT data
+// loss; pkg5b-review §5). Left failing intentionally: observe-only pending
+// owner disposition of the replaced semantics.
 import { expect, test } from "vitest";
 import type Database from "better-sqlite3";
 import { join } from "node:path";

@@ -1,4 +1,8 @@
 // Repro-count runs: SC2 (same-field conflict) x5, SC5 (compacted snapshot hole) x3, SC6 (quarantine replay) x3
+// Pkg6 disposition (2026-08-30): the SC2 x5 run asserts implicit-LWW row
+// convergence that Pkg5/DC-03 §3.3 REPLACED with per-device conflict
+// preservation (divergence conflict-backed; pkg5 tests pin it). Left
+// failing intentionally — observe-only pending owner disposition.
 import { expect, test } from "vitest";
 import type Database from "better-sqlite3";
 import { join } from "node:path";

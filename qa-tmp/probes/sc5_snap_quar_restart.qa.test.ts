@@ -155,6 +155,11 @@ test("SC6 quarantine during active sync: invalid record mid-stream, valid flow c
 });
 
 test("SC7 abort mid-session x3 + restart: converge, no duplication", async () => {
+  // Pkg6: assertion-timeout bump 5s -> 180s (QA harness artifact fix, per
+  // pkg4-review justification and pkg5b-review §5: this probe's own runtime
+  // is ~45 s of legitimate abort/restart cycles; the 5 s vitest default was
+  // a stale missing per-test timeout, not a product hang — SC7 passes
+  // deterministically when given 180 s, verified in qa-review5c-tmp).
   const runs: unknown[] = [];
   for (let run = 0; run < 3; run++) {
     const a = makeDevice("A");
@@ -194,4 +199,4 @@ test("SC7 abort mid-session x3 + restart: converge, no duplication", async () =>
   }
   expect(runs.every((r) => (r as { converged: boolean }).converged)).toBe(true);
   expect(runs.every((r) => (r as { pendingB: number }).pendingB === 0)).toBe(true);
-});
+}, 180_000); // Pkg6: per-test assertion timeout (see comment at test head)

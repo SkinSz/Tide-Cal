@@ -53,6 +53,9 @@ test("SC1 baseline: A creates 5 events, bidirectional sessions converge A<->B", 
 });
 
 test("SC2 concurrent SAME-field (title) edits on A and B — DC-03 conflict semantics", async () => {
+  // Pkg6 disposition: asserts implicit-LWW convergence replaced by Pkg5/DC-03
+  // §3.3 conflict semantics (divergence conflict-backed). Left failing —
+  // observe-only pending owner disposition (pkg6-report §remaining).
   const a = makeDevice("A");
   const b = makeDevice("B");
   pairDevices(a, b);
