@@ -53,6 +53,59 @@ function sigToHex(sig: Uint8Array): string {
   return Array.from(sig, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+/**
+ * Pkg4 (QA M-3 / QA-1 F3, correlated BND-08): bounded per-message idle
+ * timeout for the sync session's blocking receive points.
+ *
+ * SEMANTICS (deliberate, documented):
+ *   - WHAT is timed: per-MESSAGE IDLE, not whole-session. The clock restarts
+ *     on every received message, so a slow-but-alive peer that is actively
+ *     transferring (e.g. a 60k-change migration batch arriving as ~235
+ *     CHANGES_BATCH messages) can never false-time out, no matter how long
+ *     the whole session runs.
+ *   - VALUE (15s): the QA migration tests ran 60k changes over loopback at
+ *     batch=256 (~235 batches); healthy per-message gaps there are
+ *     milliseconds — three orders of magnitude below this bound — while a
+ *     genuinely stalled/dead peer (laptop sleep, power loss, NAT timeout:
+ *     no FIN, no data) is detected within 15s worst case. Consistent with
+ *     the campaign's REQUEST_TIMEOUT (15s) convention; no literal constant
+ *     of that name existed in the tree, so this is its canonical home.
+ *   - TERMINATION: the initiator throws SyncIdleTimeoutError out of
+ *     runSession. Applied batches stay committed (each batch is applied in
+ *     its own transaction and is idempotent by change_id — nothing to roll
+ *     back); unapplied ranges are simply not requested again this session.
+ *   - RETRY: always safe. Sync is idempotent by change_id; the next sync
+ *     recomputes neededRanges from knowledge state and re-requests exactly
+ *     what is missing (applied_upto never regresses — it only advances
+ *     transactionally per batch).
+ *   - CALLER: the sidecar's sync_now surfaces the error as a deterministic
+ *     ok:false ("sync session timed out waiting for peer ...") — it returns,
+ *     never hangs, in every peer-failure mode (stall, power loss, FIN close,
+ *     unroutable host — the last bounded separately by the sync_now connect
+ *     watchdog in sidecar_server.ts).
+ */
+export const SYNC_IDLE_TIMEOUT_MS = 15_000;
+
+/** Sentinel for "the idle window elapsed" — distinct from null (peer closed). */
+const IDLE_TICK = Symbol("pkg4-idle-timeout");
+
+/**
+ * Deterministic timeout failure for a stalled/dead peer. The message is
+ * stable: it is the string sync_now callers see as ok:false error.
+ */
+export class SyncIdleTimeoutError extends Error {
+  constructor(
+    /** Which protocol point went idle (e.g. "HELLO", "pull/CHANGES_BATCH"). */
+    readonly phase: string,
+    readonly idleMs: number,
+  ) {
+    super(
+      `sync session timed out waiting for peer (no message for ${idleMs}ms in ${phase})`,
+    );
+    this.name = "SyncIdleTimeoutError";
+  }
+}
+
 function sigFromHex(hex: string): Uint8Array {
   const out = new Uint8Array(hex.length / 2);
   for (let i = 0; i < out.length; i++) {
@@ -166,6 +219,14 @@ export interface SyncEngineDeps {
    * way — restart always clears Tier-1 state, DC-16 §2.3).
    */
   misbehavior?: PeerMisbehaviorTracker;
+  /**
+   * Pkg4 (QA M-3): per-message idle bound in ms for the initiator's blocking
+   * receive points (HELLO wait, pull-phase batch wait). Defaults to
+   * SYNC_IDLE_TIMEOUT_MS (15s). Idle resets on EVERY received message, so
+   * any value generous vs. per-message latency is safe for arbitrarily
+   * large transfers. Tests inject small values (e.g. 300) for speed.
+   */
+  idleTimeoutMs?: number;
 }
 
 export interface SyncEngine {
@@ -213,6 +274,8 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
   pruneResolvedQuarantine(deps.db);
   const holder: KnowledgeHolder = { knowledge };
   const maxBatch = deps.maxBatchRecords ?? 256;
+  // Pkg4 (QA M-3): per-message idle bound (see SYNC_IDLE_TIMEOUT_MS docs).
+  const idleTimeoutMs = deps.idleTimeoutMs ?? SYNC_IDLE_TIMEOUT_MS;
   // DC-09 §3 trigger bookkeeping; streaks are per peer/direction. Session
   // start resets the Trigger-A streak (§3.1); dedup is per-session (§3.5).
   const triggers = deps.triggers ?? new TriggerStateTracker();
@@ -255,6 +318,46 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     };
   }
 
+  /**
+   * Pkg4 (QA M-3): bounded receive for the session's BLOCKING await points —
+   * the peer HELLO wait and the pull-phase CHANGES_BATCH wait. Races the
+   * (H-4-cached) receive against ONE idle window of idleTimeoutMs.
+   *
+   *   - A received message resets the idle clock by definition: the window
+   *     is per wait, so an actively progressing transfer never trips it.
+   *   - null (peer closed cleanly) is returned as-is — existing null
+   *     handling (break/return) is unchanged and remains deterministic.
+   *   - On idle expiry we throw SyncIdleTimeoutError: the session terminates
+   *     deterministically, applied batches stay committed, and the caller
+   *     (sync_now) gets a deterministic error instead of hanging forever.
+   *   - The abandoned pending receive gets a no-op catch so a late
+   *     rejection (transport teardown) can never surface as an
+   *     unhandledRejection after the session has terminated.
+   */
+  async function receiveIdleBounded(
+    getNext: () => Promise<SyncMessage | null>,
+    phase: string,
+  ): Promise<SyncMessage | null> {
+    const pending = getNext();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const idle = new Promise<typeof IDLE_TICK>((resolve) => {
+      timer = setTimeout(() => resolve(IDLE_TICK), idleTimeoutMs);
+    });
+    let msg: SyncMessage | null | typeof IDLE_TICK;
+    try {
+      msg = await Promise.race([pending, idle]);
+    } catch (e) {
+      clearTimeout(timer);
+      throw e;
+    }
+    clearTimeout(timer);
+    if (msg === IDLE_TICK) {
+      void pending.catch(() => {}); // late transport failure: not ours anymore
+      throw new SyncIdleTimeoutError(phase, idleTimeoutMs);
+    }
+    return msg;
+  }
+
   function getDeviceClockDb(): VC {
     const rows = deps.db
       .prepare("SELECT peer_device_id AS d, max_seq AS s FROM device_clock")
@@ -295,7 +398,12 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     await transport.send(hello);
     stats.sent++;
 
-    const peerHello = await expectType(nextMessage(transport), "HELLO");
+    // Pkg4 (QA M-3): bounded — a peer that never answers HELLO (silent
+    // accept, half-open TCP) terminates the session deterministically.
+    const peerHello = await expectType(
+      () => receiveIdleBounded(nextMessage(transport), "HELLO"),
+      "HELLO",
+    );
     advancePeerKnowledge(peerHello.device_clock);
     // Stable key for per-peer trigger state (§3.1: streaks are per-peer,
     // per-direction). Prefer the configured peer id; fall back to the
@@ -422,7 +530,12 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     transport: SyncTransport,
     stats: SessionStats,
   ): Promise<Extract<SyncMessage, { type: "CHANGES_BATCH" }> | null> {
-    const msg = await nextMessage();
+    // Pkg4 (QA M-3): bounded — this is THE defect point. After soliciting
+    // CHANGES_REQUEST the initiator used to await the next message with no
+    // timeout at all: a responder that stalls or dies without FIN (laptop
+    // sleep, power loss, NAT timeout) hung runSession — and therefore
+    // sync_now — forever. Now one idle window bounds the wait.
+    const msg = await receiveIdleBounded(nextMessage, "pull/CHANGES_BATCH");
     if (msg !== null && msg.type !== "CHANGES_BATCH") {
       // Interleaved peer traffic (e.g., their CHANGES_REQUEST): stash and
       // keep waiting for our batch.
@@ -445,7 +558,12 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     stats: SessionStats,
   ): Promise<Extract<SyncMessage, { type: "CHANGES_BATCH" }> | null> {
     for (;;) {
-      const msg = stashed.length > 0 ? drainStashed() : await nextMessage();
+      // Pkg4 (QA M-3): bounded — the multi-round pull path (interleaved peer
+      // traffic lands here too) must never block without an idle bound.
+      const msg =
+        stashed.length > 0
+          ? drainStashed()
+          : await receiveIdleBounded(nextMessage, "pull/CHANGES_BATCH");
       if (msg === null) return null;
       if (msg.type === "CHANGES_BATCH" && msg.v === 1) return msg;
       // any other message type while pulling: handle inline

@@ -213,8 +213,17 @@ export class SyncManager {
       mutateEntity: makeEntityMutator(),
       misbehavior: this.misbehavior,
     });
-    const stats = await engine.runSession(session.transport);
-    session.done();
+    let stats;
+    try {
+      stats = await engine.runSession(session.transport);
+    } finally {
+      // Pkg4 (QA M-3/BND-08): the socket must never dangle on a failed
+      // session — a timed-out/stalled peer previously left this side's
+      // connection open forever (session.done() was only reached on the
+      // success path). done() is idempotent-safe on a dead socket (end()
+      // on a destroyed socket is a no-op).
+      session.done();
+    }
     return {
       ...stats,
       remote_device_id: Buffer.from(session.raw.remoteStaticKey()).length
@@ -481,6 +490,43 @@ export function makeDispatcher(core: EventCore, sync?: SyncManager): Dispatcher 
 }
 
 /** Sync-specific dispatcher ops (kept separate for testability). */
+
+/**
+ * Pkg4 (BND-08): bound on the sync_now connect + Noise handshake phase.
+ * Default 15s, matching SYNC_IDLE_TIMEOUT_MS (sync_engine.ts). Env override
+ * exists for ops and tests (e.g. TIDE_SYNC_CONNECT_TIMEOUT_MS=500).
+ */
+export const SYNC_CONNECT_TIMEOUT_MS = (() => {
+  const raw = process.env.TIDE_SYNC_CONNECT_TIMEOUT_MS;
+  const n = raw !== undefined ? Number(raw) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : 15_000;
+})();
+
+/**
+ * Pkg4: race `p` against a rejection timer. On timeout the underlying
+ * promise gets a no-op catch so a late rejection (EHOSTUNREACH, handshake
+ * failure of the still-in-flight connect) can never surface as an
+ * unhandledRejection after sync_now has already returned.
+ */
+export function withTimeout<T>(
+  p: Promise<T>,
+  ms: number,
+  message: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const guard = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return (async () => {
+    try {
+      return await Promise.race([p, guard]);
+    } finally {
+      clearTimeout(timer);
+      void p.catch(() => {});
+    }
+  })();
+}
+
 export function makeSyncDispatcher(
   sync: SyncManager,
   core: EventCore,
@@ -554,10 +600,23 @@ export function makeSyncDispatcher(
           throw new Error("host and port required");
         }
         return (async () => {
-          const session = await connectSync(
-            sync.identity.privateKey,
-            args.host as string,
-            args.port as number,
+          // Pkg4 (BND-08): connect + Noise handshake are bounded by a
+          // watchdog — an unroutable/dead host's TCP connect would otherwise
+          // hang sync_now for minutes (the OS-level connect timeout). The
+          // watchdog covers ONLY the pre-data phase; once connectSync
+          // resolves, mid-session peer failures are bounded by the engine's
+          // per-message idle timeout (SYNC_IDLE_TIMEOUT_MS, sync_engine.ts)
+          // — a whole-session deadline here would false-timeout a
+          // legitimately large/slow transfer.
+          const session = await withTimeout(
+            connectSync(
+              sync.identity.privateKey,
+              args.host as string,
+              args.port as number,
+            ),
+            SYNC_CONNECT_TIMEOUT_MS,
+            `sync connect timed out waiting for peer ${args.host}:${args.port} ` +
+              `(no TCP connect / Noise handshake within ${SYNC_CONNECT_TIMEOUT_MS}ms)`,
           );
           return sync.runEngineSession(session);
         })();
