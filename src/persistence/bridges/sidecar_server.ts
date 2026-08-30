@@ -42,6 +42,10 @@ import {
   createSyncEngine,
 } from "./sync_service.ts";
 import {
+  startSchedulerRuntime,
+  makeSessionOpener,
+} from "../../application/scheduler_runtime.ts";
+import {
   listQuarantine,
   countQuarantined,
   listQuarantineStats,
@@ -892,6 +896,26 @@ function main(): void {
     void handleLine(combined, trimmed).then((out) =>
       process.stdout.write(out + "\n"),
     );
+  });
+  // DC-13 §5/§7 runtime: timers drive the pure Scheduler (debounced push,
+  // periodic sweep). Sweep actions are NO-OPed inside the runtime (standing
+  // constraint until the compaction feature ships). Endpoint note: the peers
+  // table has no host/port and mDNS browse is not yet plumbed into the
+  // sidecar, so every peer starts endpoint-less and is skipped with a log
+  // line — automatic sessions begin once DC-11 endpoints arrive. Manual
+  // sync_now (tray/toolbar) is unaffected: it takes its endpoint explicitly.
+  startSchedulerRuntime({
+    now: () => Date.now(),
+    listPeers: () =>
+      listTrustedPeers(core.db).map((p) => ({
+        deviceId: p.device_id,
+        endpoint: null,
+      })),
+    openSession: makeSessionOpener({
+      privateKey: sync.identity.privateKey,
+      runSession: (session) => sync.runEngineSession(session as never),
+    }),
+    log: (m: string) => console.error(`[tide] ${m}`),
   });
   rl.on("close", () => {
     // Parent GUI closed our stdin — it is dead or dying (hard kill included:
