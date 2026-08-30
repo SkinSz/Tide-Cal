@@ -1,12 +1,14 @@
 // Tide persistence: database open + DC-07 transactional operations T1/T2.
 
 import Database from "better-sqlite3";
+import { randomUUID } from "node:crypto";
 import { DDL, SCHEMA_VERSION } from "./schema.ts";
 import {
   changeId,
   type ChangeRecord,
   type VectorClock,
 } from "../sync/change_record.ts";
+import { detect } from "../sync/conflict_detection.ts";
 import {
   classifyArrival,
   advanceApplied,
@@ -337,6 +339,225 @@ export function getDeviceClock(db: Database.Database): VectorClock {
 }
 
 // ---------------------------------------------------------------------------
+// Pkg5 (QA M-2 / QA-1 F2) — DC-03 conflict detection wired into T2
+// ---------------------------------------------------------------------------
+
+/**
+ * Local current value of one conflict entity (entity_id, field_path) of an
+ * EVENT entity, derived from the live `events` row (DC-03 §2.4 effective
+ * value semantics). A missing row = DELETED. The payload value shapes mirror
+ * exactly what EventCore/makeEntityMutator write:
+ *   'title'/'description' -> scalar string; 'schedule' ->
+ *   {startMs,endMs,allDay}; 'event' -> the eventFields() object; '*' and any
+ *   unknown path -> the whole event object (a live row means not-deleted).
+ */
+function eventRowLocalValue(
+  db: Database.Database,
+  entityId: string,
+  fieldPath: string,
+): { deleted: boolean; value: unknown } {
+  const row = db
+    .prepare<
+      [string],
+      {
+        title: string;
+        description: string;
+        all_day: number;
+        utc_start_ms: number | null;
+        utc_end_ms: number | null;
+      }
+    >(
+      "SELECT title, description, all_day, utc_start_ms, utc_end_ms FROM events WHERE event_id = ?",
+    )
+    .get(entityId);
+  if (!row) return { deleted: true, value: undefined };
+  switch (fieldPath) {
+    case "title":
+      return { deleted: false, value: row.title };
+    case "description":
+      return { deleted: false, value: row.description };
+    case "schedule":
+      return {
+        deleted: false,
+        value: {
+          startMs: row.utc_start_ms,
+          endMs: row.utc_end_ms,
+          allDay: row.all_day === 1,
+        },
+      };
+    default:
+      return {
+        deleted: false,
+        value: {
+          title: row.title,
+          description: row.description,
+          startMs: row.utc_start_ms,
+          endMs: row.utc_end_ms,
+          allDay: row.all_day === 1,
+        },
+      };
+  }
+}
+
+/**
+ * Un-compacted local participants (DC-03 §2.2) for one conflict entity:
+ * already-applied change records touching (entity_id, field_path). A '*'
+ * whole-entity remove touches EVERY conflict entity of that entity_id
+ * (DC-03 §3.4 delete-vs-edit); distinct field paths never match each other
+ * (§2.1 / §3.6 different fields never conflict).
+ */
+function loadConflictLocals(
+  db: Database.Database,
+  entityId: string,
+  fieldPath: string,
+): ChangeRecord[] {
+  const rows = (
+    fieldPath === "*"
+      ? db
+          .prepare<
+            [string],
+            ChangeRow
+          >(
+            `SELECT change_id, device_id, local_seq, entity_id, entity_type,
+                    field_path, operation, payload, hlc_timestamp,
+                    causality_clock, schema_version
+             FROM changes WHERE entity_id = ?`,
+          )
+          .all(entityId)
+      : db
+          .prepare<
+            [string, string],
+            ChangeRow
+          >(
+            `SELECT change_id, device_id, local_seq, entity_id, entity_type,
+                    field_path, operation, payload, hlc_timestamp,
+                    causality_clock, schema_version
+             FROM changes
+             WHERE entity_id = ? AND (field_path = ? OR field_path = '*')`,
+          )
+          .all(entityId, fieldPath)
+  ).map(deserializeChangeRow);
+  return rows;
+}
+
+interface ChangeRow {
+  change_id: string;
+  device_id: string;
+  local_seq: number;
+  entity_id: string;
+  entity_type: string;
+  field_path: string;
+  operation: string;
+  payload: string;
+  hlc_timestamp: number;
+  causality_clock: string;
+  schema_version: number;
+}
+
+function deserializeChangeRow(r: ChangeRow): ChangeRecord {
+  return {
+    change_id: r.change_id,
+    device_id: r.device_id,
+    local_seq: r.local_seq,
+    entity_id: r.entity_id,
+    entity_type: r.entity_type as ChangeRecord["entity_type"],
+    field_path: r.field_path,
+    operation: r.operation as ChangeRecord["operation"],
+    payload: JSON.parse(r.payload) as ChangeRecord["payload"],
+    hlc_timestamp: r.hlc_timestamp,
+    causality_clock: JSON.parse(r.causality_clock) as VectorClock,
+    schema_version: r.schema_version,
+  };
+}
+
+/**
+ * DC-03 §3 detection for one remotely applied record, evaluated BEFORE the
+ * entity-row mutation. Persists the conflict record on CONFLICT (§3.3/§4,
+ * inside the caller's T2 transaction) and returns the outcome:
+ *   "apply"    — no conflict: run the entity-row mutation (§3.2 causal-after,
+ *                §3.3 with no concurrent differing participant, §3.6)
+ *   "noop"     — §3.1 identical-value convergence: no row write at all
+ *   "conflict" — §3.3: entity row NOT overwritten; both values preserved in
+ *                the conflict record; the pre-conflict local value stays
+ *                visible until resolution (§3.4)
+ *
+ * Scope: EVENT entities only — the only type the live pipeline mutates
+ * (makeEntityMutator); other entity types have no row write to protect
+ * (see docs/qa/remediation/pkg5-diagnosis.md §4).
+ */
+function detectAndRecordConflict(
+  db: Database.Database,
+  record: ChangeRecord,
+): "apply" | "noop" | "conflict" {
+  if (record.entity_type !== "event") return "apply";
+  const localCurrent = eventRowLocalValue(db, record.entity_id, record.field_path);
+  const locals = loadConflictLocals(db, record.entity_id, record.field_path);
+  const outcome = detect(record, localCurrent, locals);
+  if (outcome.kind === "conflict") {
+    recordConflictRow(db, record, outcome.conflicting);
+    return "conflict";
+  }
+  return outcome.kind; // "apply" | "noop"
+}
+
+/**
+ * Persist (or extend) the DC-03 §4 conflict record for one detection, per
+ * DC-07's `conflicts` / `conflict_participants` tables:
+ *   - §3.5 / TR-9: all participants of a conflict entity join ONE record —
+ *     an existing UNRESOLVED record for the same (entity_id, field_path) is
+ *     extended with any participants not yet present (participants are
+ *     immutable once added, §4).
+ *   - §4: conflict_id is a UUIDv4 generated once at detection; detected_at_hlc
+ *     is the detecting device's wall clock (presentation-only, §5).
+ *   - §4.3: detection NEVER sets a resolved_* status — resolution is an
+ *     explicit user action only (DC-14). A RESOLVED record for the entity is
+ *     never reopened; a genuinely new concurrent pair gets a fresh record.
+ */
+function recordConflictRow(
+  db: Database.Database,
+  incoming: ChangeRecord,
+  conflicting: ChangeRecord[],
+): void {
+  const insertParticipant = db.prepare(`
+    INSERT OR IGNORE INTO conflict_participants
+      (conflict_id, change_id, device_id, local_seq, causality_clock, payload)
+    VALUES (?, ?, ?, ?, ?, ?)`);
+
+  db.transaction(() => {
+    // Nested transaction = SAVEPOINT inside T2 (better-sqlite3), matching
+    // the ConflictsViewModel write path pattern.
+    const existing = db
+      .prepare<[string, string], { conflict_id: string }>(
+        `SELECT conflict_id FROM conflicts
+         WHERE entity_id = ? AND field_path = ? AND status = 'unresolved'`,
+      )
+      .get(incoming.entity_id, incoming.field_path);
+    let conflictId: string;
+    if (existing) {
+      conflictId = existing.conflict_id;
+    } else {
+      conflictId = randomUUID();
+      db.prepare(
+        `INSERT INTO conflicts (conflict_id, entity_id, field_path, status,
+                                detected_at_hlc)
+         VALUES (?, ?, ?, 'unresolved', ?)`,
+      ).run(conflictId, incoming.entity_id, incoming.field_path, Date.now());
+    }
+    // §4 participants: the incoming C plus every concurrent differing local L.
+    for (const p of [...conflicting, incoming]) {
+      insertParticipant.run(
+        conflictId,
+        p.change_id,
+        p.device_id,
+        p.local_seq,
+        JSON.stringify(p.causality_clock),
+        JSON.stringify(p.payload),
+      );
+    }
+  })();
+}
+
+// ---------------------------------------------------------------------------
 // DC-07 §7 T2 — APPLY REMOTE CHANGE (atomic per DC-02 §7)
 // ---------------------------------------------------------------------------
 
@@ -449,7 +670,18 @@ export function applyRemoteChange(
           }
           record = JSON.parse(match.record_payload) as ChangeRecord;
         }
-        mutate?.(db, record);
+        // Pkg5 (QA M-2): DC-03 §3 detection BEFORE mutating local state.
+        //   "apply"    -> entity-row mutation runs (§3.2/§3.6, no conflict)
+        //   "noop"     -> §3.1 identical-value convergence: no row write
+        //   "conflict" -> §3.3/§3.4: entity row NOT overwritten; the conflict
+        //                 record was persisted above; history + clocks below
+        //                 still advance (application gating per DC-02 §7 is
+        //                 unaffected, so sync progress and future detections
+        //                 keep working).
+        const det = detectAndRecordConflict(db, record);
+        if (det === "apply") {
+          mutate?.(db, record);
+        }
         insertChange.run(serializeChange(record));
         // Pkg1: durable version state rides the same T2 transaction (INV-1a).
         recordEntityVersion(db, record);

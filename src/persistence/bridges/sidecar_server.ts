@@ -54,6 +54,9 @@ import {
 } from "../database.ts";
 // TD-005 remainder: per-item Retry shares the restart revalidation apply path.
 import { retryQuarantineRecord } from "../../sync/sync_engine.ts";
+// Pkg5 (QA M-2): read-only Conflicts surface (DC-14 §3.2/§5) over the same
+// DB handle — the view-model guarantees ConflictsViewModel-shaped responses.
+import { ConflictsViewModel } from "../../application/conflicts_ui.ts";
 // TD-006 / DC-16: Tier-1 tracker (in-memory) + state surface for the UI.
 import {
   PeerMisbehaviorTracker,
@@ -483,6 +486,40 @@ export function makeDispatcher(core: EventCore, sync?: SyncManager): Dispatcher 
       case "delete_event":
         core.deleteEvent(requireEventId(args.id, "delete_event"));
         return null;
+      // --- Pkg5 (QA M-2): read-only Conflicts surface (DC-14 §3.1/§3.2/§5).
+      // Delegates to ConflictsViewModel so response shapes are the exact
+      // ConflictListItem / ConflictDetailView the frontend bridge consumes.
+      // Deliberately READ-ONLY: resolve/skip are DC-14 §4.3 explicit user
+      // actions and are NOT exposed over RPC in this package (the shell
+      // bridge injection per frontend/conflicts.ts TODO(backend) is the
+      // separate write-path work item).
+      case "list_conflicts": {
+        const vm = new ConflictsViewModel(core.db, core.selfDeviceId);
+        const filter: { entity_id?: string } = {};
+        if (
+          args.entity_id !== undefined &&
+          (typeof args.entity_id !== "string" || args.entity_id.length === 0)
+        ) {
+          fail("list_conflicts: args.entity_id must be a non-empty string");
+        }
+        if (typeof args.entity_id === "string" && args.entity_id.length > 0) {
+          filter.entity_id = args.entity_id;
+        }
+        return {
+          total_unresolved: vm.totalUnresolved(),
+          conflicts: vm.listUnresolved(filter),
+        };
+      }
+      case "conflict_detail": {
+        if (
+          typeof args.conflict_id !== "string" ||
+          args.conflict_id.length === 0
+        ) {
+          fail("conflict_detail: args.conflict_id must be a non-empty string");
+        }
+        const vm = new ConflictsViewModel(core.db, core.selfDeviceId);
+        return vm.getDetail(args.conflict_id);
+      }
       default:
         throw new Error(`unknown op: ${op}`);
     }
