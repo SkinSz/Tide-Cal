@@ -133,3 +133,12 @@ stable, blind final verification PASS WITH CONCERNS with zero new issues).
 - **Status:** RESOLVED (2026-08-30) — frontend Cancel button wired to `cancel_pairing_offer` (frontend/index.html `btn-pairing-cancel`, frontend/devices.ts `cancelPairingOffer`, tests/td009_cancel_button.test.ts)
 - **Scope:** frontend/devices.ts + frontend/index.html: show a Cancel affordance while a pairing offer is pending (pairing-step-show visible with a code), call syncOp("cancel_pairing_offer"), update UI state. No backend work required.
 - **Origin:** blind review of f441f75 (pairing-offer lifecycle) noted user-initiated cancel is currently unreachable in the UI.
+
+## TD-010 — Tray ERROR-PRESENT marker (attention-needed icon state)
+- **ID:** TD-010
+- **Title:** Tray icon shows an ERROR-PRESENT state when quarantine/conflicts need attention
+- **Priority:** 3/10 — LOW-MEDIUM (passive visibility; the dialogs already own the detail)
+- **Status:** OPEN (created 2026-08-31, DC-19 drafting — owner deferred it from v1 tray scope)
+- **Semantics (DC-19 §3.3, normative when implemented):** boolean marker on the tray icon shown when at least one of: (a) non-resolved quarantine rows exist (Sync-Errors dialog domain), (b) unresolved conflict rows exist (Conflicts dialog domain). Source of truth: `quarantine_stats` + `list_conflicts` via existing sync_op RPC. Marker is boolean — NEVER duplicates dialog detail. Clears when both counts reach zero. v1 tray states remain IDLE + SYNCING only (DC-19 D7).
+- **Relevant files:** src-tauri/src/lib.rs (tray wiring, DC-19 implementation), frontend dialogs already expose the underlying counters.
+- **Trigger:** with the DC-13 runtime wrapper/tray implementation, or on owner request.

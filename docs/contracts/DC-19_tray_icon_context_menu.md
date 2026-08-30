@@ -58,10 +58,18 @@ theme animation.
      (sync_op surface); the Rust shell polls or is notified — the polling
      mechanism is an implementation detail, not contract.
 
-3.3  ERROR-PRESENT (optional state, v1 MAY omit): quarantine/hard-block
-     rows exist. The tray MUST NOT duplicate the Sync-Errors dialog's
-     detail; at most a static marker meaning "check Sync Errors". If
-     omitted in v1, the state is reserved, not forbidden.
+3.3  ERROR-PRESENT marker (owner decision 2026-08-31): the tray icon state
+     showing "attention needed" is DEFERRED to a technical-debt follow-up
+     (TD-010), NOT part of v1. v1 tray states are IDLE and SYNCING only.
+     When implemented, "attention needed" means at least one of:
+       - quarantine rows exist that are NOT resolved (active
+         quarantine/peer-invalid state — the Sync-Errors dialog's domain),
+       - unresolved conflict rows exist (the Conflicts dialog's domain).
+     Source of truth: quarantine_stats + list_conflicts counters via the
+     existing sync_op RPC (quarantine_stats, list_conflicts). The tray
+     MUST NOT duplicate dialog detail — the marker is boolean, and
+     "Open Tide" is how the user reaches the dialogs that explain it. The
+     marker clears when both underlying counts reach zero.
 
 3.4  Icon assets ship in the Tauri bundle (DC-15 §3 data layout does not
      apply — icons are program files, not user data).
@@ -85,9 +93,14 @@ Right-click opens the menu. Items, in order:
        is presentation detail.
      - Triggering it does NOT open the window.
 
-4.3  "Sync Errors" — opens the main window on the existing Sync-Errors
-     dialog (reuse; no new surface). Equivalent to Open Tide + opening the
-     dialog. Optional in v1; recommended (cheap, reuses everything).
+4.3  (REMOVED v1 by owner decision, 2026-08-31): no "Sync Errors" menu
+     item. Error surfacing is the TRAY ICON STATE instead (§3.3): the icon
+     shows an ERROR-PRESENT marker when attention is needed (quarantined
+     records and/or unresolved conflicts), and clicking the item that opens
+     the window is how the user reaches the Sync-Errors/Conflicts dialogs
+     that own the detail. Rationale: the menu item's only value was saving
+     one click, while the icon state gives passive visibility without
+     opening anything.
 
 4.4  "Quit" — full application exit:
      - closes the main window,
@@ -171,8 +184,9 @@ D4 (DECIDED): "Sync now" routes through the existing sync_now RPC with
     flight or no peers are paired.
 D5 (DECIDED): No settings submenu in v1 (§6.1); any future settings enter
     as a bounded tray submenu via amendment, never an app-UI button (D1).
-D6 (OPEN, owner): Confirm "Sync Errors" menu item included in v1 (§4.3).
-D7 (OPEN, owner): Confirm tray icon states for v1 — IDLE + SYNCING only,
-    or additionally the ERROR-PRESENT marker (§3.3).
+D6 (DECIDED, owner 2026-08-31): NO "Sync Errors" menu item in v1 (§4.3).
+    Error surfacing deferred to TD-010 (tray ERROR-PRESENT marker).
+D7 (DECIDED, owner 2026-08-31): v1 tray states = IDLE + SYNCING only. The
+    ERROR-PRESENT marker (§3.3) is deferred to TD-010.
 D8 (OPEN, implementation detail, non-blocking): polling cadence for the
     SYNCING state (§3.2).
