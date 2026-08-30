@@ -27,7 +27,11 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 type PendingTx = Sender<Result<Value, String>>;
 
 struct Inner {
-    stdin: ChildStdin,
+    /// Option so Drop can take() it: closing stdin is the sidecar's clean
+    /// shutdown signal (readline EOF → its closeListener + exit path, per
+    /// tests/sidecar_eof_lifecycle.test.ts). DC-19 §4.4: Quit MUST NOT
+    /// SIGKILL the sidecar.
+    stdin: Option<ChildStdin>,
 }
 
 /// Handle to a running sidecar process.
@@ -65,7 +69,7 @@ impl Sidecar {
 
         Ok(Sidecar {
             next_id: AtomicU64::new(1),
-            inner: Mutex::new(Inner { stdin }),
+            inner: Mutex::new(Inner { stdin: Some(stdin) }),
             pending,
             child: Mutex::new(child),
         })
@@ -81,9 +85,13 @@ impl Sidecar {
                 return Err(format!("sidecar exited: {status}"));
             }
             let mut inner = self.inner.lock().map_err(|_| "sidecar lock poisoned")?;
+            let stdin = match inner.stdin.as_mut() {
+                Some(s) => s,
+                None => return Err("sidecar is shutting down (stdin closed)".to_string()),
+            };
             self.pending.lock().unwrap().insert(id, tx);
             let line = json!({ "id": id, "op": op, "args": args }).to_string();
-            if let Err(e) = writeln!(inner.stdin, "{line}").and_then(|_| inner.stdin.flush()) {
+            if let Err(e) = writeln!(stdin, "{line}").and_then(|_| stdin.flush()) {
                 self.pending.lock().unwrap().remove(&id);
                 return Err(format!("sidecar write: {e}"));
             }
@@ -106,9 +114,31 @@ impl Sidecar {
 
 impl Drop for Sidecar {
     fn drop(&mut self) {
-        // Close stdin so the sidecar's readline loop drains cleanly.
-        let _ = self.child.lock().unwrap().kill();
-        let _ = self.child.lock().unwrap().wait();
+        // DC-19 §4.4 clean shutdown: close stdin (EOF) so the sidecar runs
+        // its own closeListener + exit path — NOT kill(). Fall back to kill
+        // only if the child ignores EOF for SHUTDOWN_GRACE.
+        self.inner
+            .lock()
+            .map(|mut inner| inner.stdin.take())
+            .map(|stdin| drop(stdin))
+            .ok();
+        const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + SHUTDOWN_GRACE;
+        loop {
+            match self.child.lock().unwrap().try_wait() {
+                Ok(Some(_status)) => return, // exited cleanly on EOF
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        log::warn!("sidecar ignored stdin EOF for {}s; killing", SHUTDOWN_GRACE.as_secs());
+                        let _ = self.child.lock().unwrap().kill();
+                        let _ = self.child.lock().unwrap().wait();
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(_) => return,
+            }
+        }
     }
 }
 

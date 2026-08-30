@@ -56,7 +56,10 @@ import {
 import { retryQuarantineRecord } from "../../sync/sync_engine.ts";
 // Pkg5 (QA M-2): read-only Conflicts surface (DC-14 §3.2/§5) over the same
 // DB handle — the view-model guarantees ConflictsViewModel-shaped responses.
-import { ConflictsViewModel } from "../../application/conflicts_ui.ts";
+import {
+  ConflictsViewModel,
+  type ResolutionOption,
+} from "../../application/conflicts_ui.ts";
 // TD-006 / DC-16: Tier-1 tracker (in-memory) + state surface for the UI.
 import {
   PeerMisbehaviorTracker,
@@ -530,6 +533,66 @@ export function makeDispatcher(core: EventCore, sync?: SyncManager): Dispatcher 
         }
         const vm = new ConflictsViewModel(core.db, core.selfDeviceId);
         return vm.getDetail(args.conflict_id);
+      }
+      // --- DC-14 §4.3 write path: resolve / skip over RPC. Both delegate to
+      // ConflictsViewModel commands so the write transaction (winning-value
+      // change record + status flip, §6.1) and the TR-2 skip no-op live in
+      // exactly one place (the application layer).
+      case "resolve_conflict": {
+        if (
+          typeof args.conflict_id !== "string" ||
+          args.conflict_id.length === 0
+        ) {
+          fail("resolve_conflict: args.conflict_id must be a non-empty string");
+        }
+        const raw = args.option as Record<string, unknown> | undefined;
+        if (raw === null || typeof raw !== "object") {
+          fail("resolve_conflict: args.option must be an object");
+        }
+        let option: ResolutionOption;
+        switch (raw.kind) {
+          case "keep_mine":
+            option = { kind: "keep_mine" };
+            break;
+          case "keep_theirs":
+            if (
+              raw.change_id !== undefined &&
+              (typeof raw.change_id !== "string" || raw.change_id.length === 0)
+            ) {
+              fail(
+                "resolve_conflict: args.option.change_id must be a non-empty string",
+              );
+            }
+            option =
+              raw.change_id === undefined
+                ? { kind: "keep_theirs" }
+                : { kind: "keep_theirs", change_id: raw.change_id };
+            break;
+          case "keep_both":
+          case "resolved_custom": // frontend alias for resolved_custom value
+            if (!("value" in raw)) {
+              fail("resolve_conflict: args.option.value is required");
+            }
+            option = { kind: "keep_both", value: raw.value };
+            break;
+          default:
+            fail(
+              'resolve_conflict: args.option.kind must be "keep_mine" | "keep_theirs" | "resolved_custom"',
+            );
+        }
+        const vm = new ConflictsViewModel(core.db, core.selfDeviceId);
+        return vm.resolve(args.conflict_id, option);
+      }
+      case "skip_conflict": {
+        if (
+          typeof args.conflict_id !== "string" ||
+          args.conflict_id.length === 0
+        ) {
+          fail("skip_conflict: args.conflict_id must be a non-empty string");
+        }
+        const vm = new ConflictsViewModel(core.db, core.selfDeviceId);
+        vm.skip(args.conflict_id); // TR-2: intentional no-op, zero writes
+        return null;
       }
       default:
         throw new Error(`unknown op: ${op}`);

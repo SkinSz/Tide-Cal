@@ -1,20 +1,17 @@
 // Tide DC-14 Conflicts surface — toolbar badge + resolution dialog.
 //
-// Data access follows the same pattern as store.ts's EventStoreBridge:
-// the desktop runtime may inject a ConflictsBridge on
-// window.__TIDE_CONFLICTS__ backed by src/application/conflicts_ui.ts
-// (ConflictsViewModel over the sidecar's SQLite handle).
-//
-// TODO(backend): no Tauri command or sidecar RPC exposes the conflicts
-// surface yet. Needed plumbing (do NOT invent — wire when it exists):
-//   1. src/persistence/bridges/sidecar_server.ts: stdio methods wrapping
-//      ConflictsViewModel (total_unresolved, list_unresolved, get_detail,
-//      resolve, skip, entity_title).
-//   2. src-tauri proxy commands forwarding those to the sidecar (mirrors
-//      event CRUD IPC from commit c015ce7).
-//   3. Shell injects window.__TIDE_CONFLICTS__. Until then this module
-//     renders an empty state via the fallback, which is honest: with no
-//     sync partners there are no conflicts to show.
+// Data access goes through the same Tauri `sync_op` passthrough the Devices
+// view uses (frontend/devices.ts syncOp). The sidecar dispatcher
+// (src/persistence/bridges/sidecar_server.ts) implements the ops against
+// ConflictsViewModel (src/application/conflicts_ui.ts):
+//   list_conflicts     -> { total_unresolved, conflicts: ConflictListItem[] }
+//   conflict_detail    -> ConflictDetailView
+//   resolve_conflict   -> {conflict_id, option} -> the winning ChangeRecord
+//   skip_conflict      -> {conflict_id} -> null (TR-2 intentional no-op)
+// The Rust proxy allowlist (src-tauri/src/lib.rs sync_op ALLOWED) forwards
+// these to the sidecar. No window injection: in a plain browser (vite dev
+// without the shell) syncOp degrades honestly by throwing, and the dialog
+// surfaces the error inline.
 //
 // The DOM-free helpers (formatCandidateValue, describeConflict,
 // describeCandidateSide) are exported for headless vitest coverage.
@@ -25,11 +22,11 @@ import type {
   ListFilter,
   ResolutionOption,
 } from "../src/application/conflicts_ui.ts";
+import { syncOp } from "./devices.ts";
 
 /**
  * Contract mirroring the relevant slice of ConflictsViewModel
- * (src/application/conflicts_ui.ts). Implemented over IPC by the shell;
- * see TODO(backend) above.
+ * (src/application/conflicts_ui.ts), implemented over the sidecar RPC.
  */
 export interface ConflictsBridge {
   totalUnresolved(): number | Promise<number>;
@@ -48,34 +45,42 @@ export interface ConflictsBridge {
   skip(conflictId: string): void;
 }
 
-declare global {
-  interface Window {
-    __TIDE_CONFLICTS__?: ConflictsBridge;
-  }
-}
+type Json = Record<string, unknown>;
 
-function bridge(): ConflictsBridge | undefined {
-  try {
-    return globalThis.window?.__TIDE_CONFLICTS__;
-  } catch {
-    return undefined;
-  }
-}
-
-/** Empty-state fallback until the backend plumbing lands (TODO above). */
-const EMPTY_FALLBACK: ConflictsBridge = {
-  totalUnresolved: () => 0,
-  listUnresolved: () => [],
-  entityTitle: () => null,
-  getDetail: (id) => {
-    throw new Error(`no conflict ${id}`);
-  },
-  resolve: () => false, // unreachable while list is empty; defensive
-  skip: () => {},
-};
-
+/** ConflictsBridge over the sidecar RPC (sync_op passthrough). */
 function store(): ConflictsBridge {
-  return bridge() ?? EMPTY_FALLBACK;
+  return {
+    totalUnresolved: async () => {
+      const res = await syncOp<{ total_unresolved: number }>(
+        "list_conflicts",
+        {},
+      );
+      return res.total_unresolved;
+    },
+    listUnresolved: async (filter?: ListFilter) => {
+      const res = await syncOp<{
+        conflicts: ConflictListItem[];
+      }>("list_conflicts", filter ? (filter as Json) : {});
+      return res.conflicts;
+    },
+    entityTitle: async (entityId: string) => {
+      // Events are already listed over RPC (list_events); resolve the title
+      // client-side instead of inventing a new op for one label.
+      const events = await syncOp<Array<{ id: string; title: string }>>(
+        "list_events",
+      );
+      return events.find((e) => e.id === entityId)?.title ?? null;
+    },
+    getDetail: (conflictId) =>
+      syncOp<ConflictDetailView>("conflict_detail", { conflict_id: conflictId }),
+    resolve: async (conflictId, option) => {
+      await syncOp("resolve_conflict", { conflict_id: conflictId, option });
+      return true;
+    },
+    skip: async (conflictId) => {
+      await syncOp("skip_conflict", { conflict_id: conflictId });
+    },
+  };
 }
 
 // --- DOM-free presentation helpers ----------------------------------------
