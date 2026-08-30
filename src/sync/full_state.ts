@@ -41,11 +41,24 @@ export interface Snapshot {
 /**
  * Element-wise max of causality_clocks over every `changes` row recorded for
  * an entity — its true version vector (DC-02 §2; DC-09 §7.1 normative form).
+ *
+ * Pkg1 (QA C-1): the PRIMARY source is the durable `entity_versions` table
+ * (schema v6), maintained transactionally at every change application. DC-06
+ * compaction deletes change records; the version vector they represented
+ * must survive independently (INV-1a.3 of pkg1-diagnosis.md). The change-log
+ * derivation remains only as a fallback for entities never rewritten since
+ * the v6 migration.
  */
 function localVersionClock(
   db: Database.Database,
   entityId: string,
 ): VectorClock {
+  const row = db
+    .prepare<[string], { version: string }>(
+      "SELECT version FROM entity_versions WHERE entity_id = ?",
+    )
+    .get(entityId);
+  if (row) return JSON.parse(row.version) as VectorClock;
   const rows = db
     .prepare<[string], { causality_clock: string }>(
       "SELECT causality_clock FROM changes WHERE entity_id = ?",
@@ -64,12 +77,130 @@ function latestProducer(
   entityId: string,
 ): { device_id: string; local_seq: number } | undefined {
   const row = db
+    .prepare<[string], { latest_producer: string; latest_seq: number }>(
+      "SELECT latest_producer, latest_seq FROM entity_versions WHERE entity_id = ?",
+    )
+    .get(entityId);
+  if (row) return { device_id: row.latest_producer, local_seq: row.latest_seq };
+  const change = db
     .prepare<[string], { device_id: string; local_seq: number }>(
       `SELECT device_id, local_seq FROM changes WHERE entity_id = ?
        ORDER BY hlc_timestamp DESC, local_seq DESC LIMIT 1`,
     )
     .get(entityId);
-  return row;
+  return change;
+}
+
+/**
+ * Pkg1: merge a snapshot entry's causality into the receiver's durable
+ * version state for the entity (element-wise max — never regresses), so the
+ * entity stays fully versioned even though snapshot application does not
+ * produce change records. Without this, snapshot-received entities would
+ * carry an empty version clock and be absence-tombstoned by the next
+ * snapshot that omits them.
+ */
+function recordSnapshotEntityVersion(
+  db: Database.Database,
+  entityId: string,
+  entityType: string,
+  clock: VectorClock,
+  producer: string,
+  seq: number,
+): void {
+  const before = localVersionClock(db, entityId);
+  const merged = merge(before, clock);
+  const prev = db
+    .prepare<[string], { latest_producer: string; latest_seq: number }>(
+      "SELECT latest_producer, latest_seq FROM entity_versions WHERE entity_id = ?",
+    )
+    .get(entityId);
+  // Keep the existing latest-producer identity unless the incoming entry
+  // contributes a strictly newer seq from its own producer than the current
+  // version vector records for that producer (latest identity is used for
+  // snapshot-entry provenance and absence tombstone naming only).
+  let out = prev ?? { latest_producer: producer, latest_seq: seq };
+  if (
+    prev === undefined ||
+    (clock[producer] ?? 0) > (before[prev.latest_producer] ?? 0)
+  ) {
+    out = { latest_producer: producer, latest_seq: seq };
+  }
+  db.prepare(`
+    INSERT INTO entity_versions (entity_id, entity_type, version, latest_producer, latest_seq, latest_hlc, updated_hlc)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(entity_id) DO UPDATE SET
+      entity_type = excluded.entity_type,
+      version = excluded.version,
+      latest_producer = excluded.latest_producer,
+      latest_seq = excluded.latest_seq,
+      updated_hlc = excluded.updated_hlc`).run(
+    entityId,
+    entityType,
+    JSON.stringify(merged),
+    out.latest_producer,
+    out.latest_seq,
+    0,
+    Date.now(),
+  );
+}
+
+/** Pkg1: drop version state together with the entity row (absence path). */
+function clearEntityVersion(db: Database.Database, entityId: string): void {
+  db.prepare("DELETE FROM entity_versions WHERE entity_id = ?").run(entityId);
+}
+
+/**
+ * Pkg1: replay idempotence check — does the local live row already equal the
+ * snapshot entry's data byte-for-byte (canonical JSON comparison, so key
+ * order can never cause a false difference)?
+ */
+function localRowMatchesEntry(
+  db: Database.Database,
+  entry: SnapshotEntry,
+): boolean {
+  const table =
+    entry.entity_type === "event"
+      ? "events"
+      : entry.entity_type === "calendar"
+        ? "calendars"
+        : null; // series/occurrence_override snapshots not carried in v1
+  if (table === null) return false;
+  const idColumn = entry.entity_type === "event" ? "event_id" : "calendar_id";
+  const row = db
+    .prepare<[string], Record<string, unknown>>(
+      `SELECT * FROM ${table} WHERE ${idColumn} = ?`,
+    )
+    .get(entry.entity_id);
+  if (row === undefined) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(entry.data);
+  } catch {
+    return false;
+  }
+  // Calendars: ignore the bootstrap bookkeeping columns. Each device
+  // bootstraps the default calendar independently (QA-2 F-1, Pkg6 will fix
+  // the root), so created_hlc/updated_hlc legitimately differ between peers
+  // while the semantic fields (title/color) are identical; staging would
+  // write identical semantics — treat it as the no-op it is.
+  if (entry.entity_type === "calendar") {
+    const a = row as Record<string, unknown>;
+    const b = parsed as Record<string, unknown>;
+    return a["title"] === b["title"] && a["color"] === b["color"];
+  }
+  return canonicalJson(row) === canonicalJson(parsed);
+}
+
+/** Deterministic JSON: object keys sorted recursively. */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (typeof value === "object" && value !== null) {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`);
+    return `{${entries.join(",")}}`;
+  }
+  return JSON.stringify(value);
 }
 
 // ---------------------------------------------------------------------------
@@ -133,21 +264,19 @@ export function buildSnapshot(
     // DC-09 §4.2: each entry carries the real version vector of the entity
     // (element-wise max across its change history) plus the producer identity
     // of the latest contributing record, so the receiver can apply §7.1.
+    // Pkg1 (QA C-1): versions come from durable entity_versions, so this is
+    // exact EVEN AFTER compaction deleted the change history. A live row is
+    // NEVER omitted: omission is what let the absence rule destroy live
+    // events downstream (over-inclusion is benign — the receiver's §7.1
+    // rule reconciles; under-inclusion silently strands data).
     const version = localVersionClock(db, entityId);
     const winner = latestProducer(db, entityId);
-    if (winner === undefined) {
-      // Shouldn't happen: every live entity is backed by change records.
-      console.warn(
-        `[DC-09] buildSnapshot: entity ${entityId} has no change history; skipping`,
-      );
-      continue;
-    }
     buffer.push({
       entity_id: entityId,
       entity_type: "event",
       data: JSON.stringify(e),
-      producer_device_id: winner.device_id,
-      producer_seq: winner.local_seq,
+      producer_device_id: winner?.device_id ?? "_unversioned",
+      producer_seq: winner?.local_seq ?? 0,
       causality_clock: version,
     });
     if (buffer.length >= batchSize) flush();
@@ -227,10 +356,31 @@ export function applySnapshot(
         result.survivedLocal++;
         continue; // local survives; next anti-entropy round reconciles
       }
+      // Pkg1: replay idempotence — if the entry's data is already identical
+      // locally, staging + upsert would write identical bytes (a literal
+      // no-op); skip it. This also keeps the local entity version anchored
+      // to the locally-applied change history (the DC-02 normative form)
+      // instead of absorbing the sender's view of causality.
+      if (localRowMatchesEntry(db, entry)) {
+        continue;
+      }
       db.prepare(
         `INSERT INTO temp.stage_entities (entity_id, entity_type, data) VALUES (?, ?, ?)
          ON CONFLICT(entity_id) DO UPDATE SET data = excluded.data`,
       ).run(entry.entity_id, entry.entity_type, entry.data);
+      // Pkg1 (QA C-1): snapshot application produces no change records, so
+      // record the entry's causality in the receiver's durable version state
+      // (merge — element-wise max, never regresses). Without this the
+      // received entity would carry an empty version clock and be
+      // absence-tombstoned by the next snapshot that omits it.
+      recordSnapshotEntityVersion(
+        db,
+        entry.entity_id,
+        entry.entity_type,
+        entry.causality_clock,
+        entry.producer_device_id,
+        entry.producer_seq,
+      );
       result.appliedEntities++;
     }
 
@@ -297,6 +447,15 @@ export function applySnapshot(
       if (snapshotIds.has(le.event_id)) continue;
       const localVersion = localVersionClock(db, le.event_id);
       if (!dominates(snapshot.snapshot_clock, localVersion)) continue;
+      // Pkg1 (QA C-1): an EMPTY local version proves nothing. dominates()
+      // over an empty clock is vacuously true for ANY snapshot_clock — it is
+      // a missing version state, not a dominated state (INV-1b of
+      // pkg1-diagnosis.md). Without real version state we cannot run the
+      // absence inference; keep the live row (DC-06's own principle: never
+      // fabricate knowledge). Legitimate deletions always leave real version
+      // evidence (entity_versions >= creation clock + sender's advanced
+      // frontier), so this guard does not weaken deletion propagation.
+      if (Object.keys(localVersion).length === 0) continue;
       const winner = latestProducer(db, le.event_id);
       insertTombstone.run({
         entity_id: le.event_id,
@@ -309,6 +468,9 @@ export function applySnapshot(
         deleted_at_hlc: Date.now(),
       });
       deleteEvent.run(le.event_id);
+      // Pkg1: the entity is gone — drop its version state with it so no
+      // stale clock outlives the row.
+      clearEntityVersion(db, le.event_id);
       result.absenceTombstones++;
     }
 

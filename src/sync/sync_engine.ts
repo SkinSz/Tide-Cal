@@ -84,6 +84,15 @@ export type SyncMessage =
       /** DC-09 §3.2: set on user-initiated offers (diagnostics only). */
       user_initiated?: boolean;
       /**
+       * Pkg1 (QA C-1): set when the offer is a DC-09 §3 Trigger A distress
+       * signal (persistent unservable gaps). The receiver answers with its
+       * own offer (a data request), never with the §7.3 device-id race —
+       * the gapped side must RECEIVE full state, and when the gapped side
+       * wins the id race it otherwise streams its own (useless) snapshot
+       * instead, stranding the gap forever.
+       */
+      reason?: "GAP_ROUNDS";
+      /**
        * Engine extension: sender device id so the receiver can run the
        * deterministic §7.3 race resolution without transport-level context.
        */
@@ -335,8 +344,11 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
       const key = offerSessionKey(deps.selfDeviceId, peerKey, "OUTGOING");
       if (sessionDedup.shouldOffer(key, "GAP_ROUNDS")) {
         sessionDedup.markOffered(key);
-        await emitFullStateOffer(transport, stats);
-        await driveFullStateOffer(nextMessage(transport), transport, stats);
+        // Pkg1: marked GAP_ROUNDS — the receiver answers with its full
+        // state instead of racing, and we accept a rival offer instead of
+        // streaming our own (the gap is on OUR side; we need THEIR data).
+        await emitFullStateOffer(transport, stats, false, "GAP_ROUNDS");
+        await driveFullStateOffer(nextMessage(transport), transport, stats, true);
       }
     }
 
@@ -533,6 +545,7 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     transport: SyncTransport,
     stats: SessionStats,
     userInitiated = false,
+    reason?: "GAP_ROUNDS",
   ): Promise<void> {
     await transport.send({
       v: 1,
@@ -540,6 +553,7 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
       snapshot_clock: getDeviceClockDb(),
       sender_device_id: deps.selfDeviceId,
       ...(userInitiated ? { user_initiated: true } : {}),
+      ...(reason ? { reason } : {}),
     });
     stats.sent++;
   }
@@ -630,6 +644,7 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     getNext: () => Promise<SyncMessage | null>,
     transport: SyncTransport,
     stats: SessionStats,
+    ourOfferGapTriggered = false,
   ): Promise<void> {
     for (let poll = 0; poll < 10; poll++) {
       const msg = await receiveWithTimeout(getNext, 5);
@@ -639,6 +654,15 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
         return;
       }
       if (msg.type === "FULL_STATE_OFFER") {
+        // Pkg1 (QA C-1): our offer was a Trigger A distress signal — we have
+        // persistent unservable gaps and need the PEER's full state. The
+        // §7.3 device-id race must not stand between us and the data: when
+        // the gapped side wins the race it would stream its own (useless)
+        // snapshot and the gap strands forever. Accept the rival's offer.
+        if (ourOfferGapTriggered) {
+          await acceptOffer(msg, getNext, transport, stats);
+          return;
+        }
         if (resolveOfferRace(deps.selfDeviceId, msg.sender_device_id ?? "")) {
           continue; // §7.3: ours stands; theirs declined silently
         }
@@ -660,6 +684,20 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     transport: SyncTransport,
     stats: SessionStats,
   ): Promise<void> {
+    // Pkg1 (QA C-1): a Trigger A (GAP_ROUNDS) offer is a request for OUR
+    // full state, not a competing data offer. Answer with our own offer so
+    // the gapped sender accepts and receives it — running the §7.3 race
+    // here would let the id ordering decide whether the gap can ever close.
+    if (offer.reason === "GAP_ROUNDS") {
+      const key = offerSessionKey(deps.selfDeviceId, offer.sender_device_id ?? "", "OUTGOING");
+      if (sessionDedup.shouldOffer(key, "GAP_ROUNDS")) {
+        sessionDedup.markOffered(key);
+        await emitFullStateOffer(transport, stats);
+        await driveFullStateOffer(getNext, transport, stats);
+        return;
+      }
+      // Already offered this session: fall through to race handling.
+    }
     const sender = offer.sender_device_id;
     if (sender !== undefined && resolveOfferRace(deps.selfDeviceId, sender)) {
       // Race victory: proceeding with our own offer is mandated by §7.3 and

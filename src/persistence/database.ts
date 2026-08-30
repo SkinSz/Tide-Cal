@@ -103,10 +103,135 @@ function initializeSchema(db: Database.Database): void {
           id            INTEGER PRIMARY KEY CHECK (id = 1),
           total_pruned  INTEGER NOT NULL DEFAULT 0)`);
       }
+      if (row!.version < 6) {
+        // Pkg1 (QA C-1): durable per-entity version state, so DC-06 compaction
+        // can delete change records without collapsing live entities to an
+        // empty version clock in the DC-09 snapshot pipeline (INV-1a.3 of
+        // docs/qa/remediation/pkg1-diagnosis.md). Backfill from surviving
+        // change history; entities with no remaining records keep no version
+        // row (pre-release wipe is the accepted data-safety decision).
+        db.exec(`CREATE TABLE IF NOT EXISTS entity_versions (
+          entity_id          TEXT PRIMARY KEY,
+          entity_type        TEXT NOT NULL,
+          version            TEXT NOT NULL,
+          latest_producer    TEXT NOT NULL,
+          latest_seq         INTEGER NOT NULL,
+          latest_hlc         INTEGER NOT NULL,
+          updated_hlc        INTEGER NOT NULL)`);
+        backfillEntityVersions(db);
+      }
       db.prepare("UPDATE schema_version SET version = ?").run(SCHEMA_VERSION);
     });
     tx();
   }
+}
+
+// ---------------------------------------------------------------------------
+// Pkg1 (QA C-1) — durable per-entity version state (`entity_versions`)
+// ---------------------------------------------------------------------------
+
+/**
+ * Backfill entity_versions from surviving change history during the v6
+ * migration. Mirrors the DC-02 §2 normative derivation: element-wise max of
+ * causality_clocks over the entity's change records; latest producer by
+ * (hlc_timestamp, local_seq).
+ */
+function backfillEntityVersions(db: Database.Database): void {
+  const rows = db
+    .prepare<
+      [],
+      {
+        entity_id: string;
+        entity_type: string;
+        causality_clock: string;
+        device_id: string;
+        local_seq: number;
+        hlc_timestamp: number;
+      }
+    >(
+      "SELECT entity_id, entity_type, causality_clock, device_id, local_seq, hlc_timestamp FROM changes ORDER BY hlc_timestamp ASC, local_seq ASC",
+    )
+    .all();
+  for (const r of rows) {
+    recordEntityVersion(db, {
+      change_id: changeId(r.device_id, r.local_seq),
+      device_id: r.device_id,
+      local_seq: r.local_seq,
+      entity_id: r.entity_id,
+      entity_type: r.entity_type as ChangeRecord["entity_type"],
+      field_path: "",
+      operation: "set",
+      payload: {},
+      hlc_timestamp: r.hlc_timestamp,
+      causality_clock: JSON.parse(r.causality_clock) as VectorClock,
+      schema_version: 1,
+    });
+  }
+}
+
+/**
+ * Merge one change record's causality into the entity's durable version
+ * vector and advance its latest-producer identity. MUST run inside the same
+ * transaction as the entity mutation + change-record insert (T1/T2), so
+ * state and history can never diverge.
+ *
+ * This is the compaction-proof substrate for DC-09 (INV-1a of
+ * pkg1-diagnosis.md): after sweep() deletes change records, the version
+ * vector they represented survives here.
+ */
+export function recordEntityVersion(
+  db: Database.Database,
+  record: ChangeRecord,
+): void {
+  const get = db.prepare<[string], { version: string; latest_hlc: number; latest_seq: number; latest_producer: string }>(
+    "SELECT version, latest_hlc, latest_seq, latest_producer FROM entity_versions WHERE entity_id = ?",
+  );
+  const existing = get.get(record.entity_id);
+  let version: VectorClock = existing
+    ? (JSON.parse(existing.version) as VectorClock)
+    : {};
+  version = mergeClocks(version, record.causality_clock);
+
+  // Latest-producer identity: newer (hlc, local_seq) wins — the same
+  // ordering latestProducer() used against the change log.
+  let producer = existing?.latest_producer ?? record.device_id;
+  let seq = existing?.latest_seq ?? record.local_seq;
+  let hlc = existing?.latest_hlc ?? record.hlc_timestamp;
+  if (
+    record.hlc_timestamp > hlc ||
+    (record.hlc_timestamp === hlc && record.local_seq > seq)
+  ) {
+    producer = record.device_id;
+    seq = record.local_seq;
+    hlc = record.hlc_timestamp;
+  }
+
+  db.prepare(`
+    INSERT INTO entity_versions (entity_id, entity_type, version, latest_producer, latest_seq, latest_hlc, updated_hlc)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(entity_id) DO UPDATE SET
+      entity_type = excluded.entity_type,
+      version = excluded.version,
+      latest_producer = excluded.latest_producer,
+      latest_seq = excluded.latest_seq,
+      latest_hlc = excluded.latest_hlc,
+      updated_hlc = excluded.updated_hlc`).run(
+    record.entity_id,
+    record.entity_type,
+    JSON.stringify(version),
+    producer,
+    seq,
+    hlc,
+    record.hlc_timestamp,
+  );
+}
+
+function mergeClocks(a: VectorClock, b: VectorClock): VectorClock {
+  const out: VectorClock = { ...a };
+  for (const [d, s] of Object.entries(b)) {
+    out[d] = Math.max(out[d] ?? 0, s);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -174,6 +299,8 @@ export function createLocalChange(
 
     mutate?.(db, record);
     insertChange.run(serializeChange(record));
+    // Pkg1: durable version state rides the same T1 transaction (INV-1a).
+    recordEntityVersion(db, record);
     upsertClock.run({ d: selfDeviceId, s: nextSeq });
   });
   tx();
@@ -324,6 +451,8 @@ export function applyRemoteChange(
         }
         mutate?.(db, record);
         insertChange.run(serializeChange(record));
+        // Pkg1: durable version state rides the same T2 transaction (INV-1a).
+        recordEntityVersion(db, record);
         deletePending.run(step.device_id, step.local_seq);
       }
       setAppliedUpto.run(

@@ -2,7 +2,7 @@
 // One source of truth for table creation. Encryption-at-rest is applied at
 // connection level (SQLCipher key pragma) by the caller, not here.
 
-export const SCHEMA_VERSION = 5; // v2: TD-001 skipped_seqs; v3: TD-005 quarantine lifecycle (resolved_at_hlc, resolved_reason); v4: TD-006/DC-16 hard_blocks + peer_invalid_tally; v5: TD-005 quarantine_prune_stats (retention-cap bookkeeping)
+export const SCHEMA_VERSION = 6; // v2: TD-001 skipped_seqs; v3: TD-005 quarantine lifecycle (resolved_at_hlc, resolved_reason); v4: TD-006/DC-16 hard_blocks + peer_invalid_tally; v5: TD-005 quarantine_prune_stats (retention-cap bookkeeping); v6: Pkg1 entity_versions (durable per-entity version vectors, compaction-proof snapshots)
 
 export const DDL = `
 CREATE TABLE calendars (
@@ -114,6 +114,23 @@ CREATE TABLE changes (
     causality_clock TEXT NOT NULL,
     schema_version  INTEGER NOT NULL DEFAULT 1,
     UNIQUE (device_id, local_seq)
+);
+
+CREATE TABLE entity_versions (
+    -- Pkg1 (QA C-1): durable per-entity version state. The entity's version
+    -- vector and latest-producer identity were previously derivable ONLY by
+    -- aggregating the changes log; DC-06 compaction deletes those records,
+    -- which collapsed live entities to an empty version clock and made the DC-09
+    -- snapshot pipeline omit / absence-tombstone them. This table is STATE
+    -- (mirrors what the deleted history represented), not history: sweep()
+    -- never touches it.
+    entity_id          TEXT PRIMARY KEY,
+    entity_type        TEXT NOT NULL,
+    version            TEXT NOT NULL, -- JSON VectorClock: element-wise max of causality_clocks over all changes applied to the entity
+    latest_producer    TEXT NOT NULL, -- producer of the latest contributing change
+    latest_seq         INTEGER NOT NULL,
+    latest_hlc         INTEGER NOT NULL,
+    updated_hlc        INTEGER NOT NULL
 );
 
 CREATE TABLE device_clock (
