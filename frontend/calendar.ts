@@ -569,7 +569,9 @@ export async function render(): Promise<void> {
 const MINUTES_PER_DAY = 24 * 60;
 
 function fmtHour(h: number): string {
-  return `${pad(h)}:00`;
+  // Week-view hour ruler follows the General time-format setting, same as
+  // the event chips (owner request 2026-08-31).
+  return formatTimeLabel(`${pad(h)}:00`, getTimeFormat());
 }
 
 function pad(n: number): string {
@@ -740,7 +742,7 @@ function weekDayColumn(
     const startMin = h * 60;
     band.style.top = `${(startMin / MINUTES_PER_DAY) * 100}%`;
     band.style.height = `${(60 / MINUTES_PER_DAY) * 100}%`;
-    band.title = `${pad(h)}:00 – ${pad((h + 1) % 24)}:00 (double-click: new appointment)`;
+    band.title = `${formatTimeLabel(`${pad(h)}:00`, getTimeFormat())} – ${formatTimeLabel(`${pad((h + 1) % 24)}:00`, getTimeFormat())} (double-click: new appointment)`;
     col.appendChild(band);
   }
 
