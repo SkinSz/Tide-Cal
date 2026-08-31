@@ -581,13 +581,23 @@ function pad(n: number): string {
 function renderHourRuler(root: HTMLElement): void {
   const ruler = document.createElement("div");
   ruler.className = "hour-ruler";
-  for (let h = 0; h < 24; h++) {
+  // Owner layout (2026-08-31): the label for hour h sits ON the h:00 line
+  // (centred), so the ruler reads 01:00 at the first line and 24:00 at the
+  // bottom after 23:00 — no leading 00:00 slot. h runs 1..24.
+  for (let h = 1; h <= 24; h++) {
     const lbl = document.createElement("div");
     lbl.className = "hour-label";
-    lbl.textContent = fmtHour(h);
+    lbl.textContent = fmtRulerLabel(h);
+    lbl.style.top = `${(h / 24) * 100}%`;
     ruler.appendChild(lbl);
   }
   root.appendChild(ruler);
+}
+
+/** Ruler label for the h:00 line; h=24 is the day boundary (00:00/24:00). */
+function fmtRulerLabel(h: number): string {
+  if (h === 24) return getTimeFormat() === "12h" ? "12:00 AM" : "24:00";
+  return fmtHour(h);
 }
 
 /** Horizontal guide lines across all day columns (call after columns mount). */

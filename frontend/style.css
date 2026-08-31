@@ -203,11 +203,13 @@ dialog menu .spacer { flex: 1 1 auto; }
 .hour-ruler {
   grid-row: 3;
   grid-column: 1;
-  display: flex;
-  flex-direction: column;
+  position: relative;
 }
+/* Labels centre on their hour line (top = h/24 %, translated up half). */
 .hour-label {
-  flex: 1;
+  position: absolute;
+  right: 0;
+  transform: translateY(-50%);
   font-size: 0.68rem;
   color: var(--muted);
   text-align: right;
