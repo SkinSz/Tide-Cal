@@ -196,3 +196,61 @@ stable, blind final verification PASS WITH CONCERNS with zero new issues).
 - **Evidence:** During the c088023 verification run, harness scenario 2 failed once with EADDRINUSE on 41910 (sidecar sync listener could not bind; nothing held the port afterwards; scenario passed on rerun). A second occurrence observed in the blind-review re-run. Pattern: TIME_WAIT or interface-timing race between scenario teardown and next-scenario bind.
 - **Fix direction:** deterministic per-run port bases in RunContext, or a bounded bind-retry with explicit logging in the harness (NOT in agents — agent rule 2 forbids retry-until-green outside the harness itself).
 - **Trigger:** Before the harness becomes the standing release gate for future sync work (it now is), make it deterministic.
+
+## TD-014 — Recurrence expansion: INTERVAL/WEEKLY semantics broken (blind review, CRITICAL+)
+- **ID:** TD-014
+- **Title:** expandOccurrences: DAILY/MONTHLY INTERVAL>1 hangs or collapses; WEEKLY without BYDAY expands daily; WEEKLY INTERVAL>1 picks wrong weeks
+- **Priority:** 9/10 — CRITICAL (UI freeze reachable from the dialog builder)
+- **Status:** OPEN (created 2026-09-01, blind adversarial review F1/F2/F3)
+- **Findings (file:line, empirical probes in reviewer report):**
+  - F1 CRITICAL: `src/domain/recurrence_conflicts.ts:198-212` — skip loop never recomputes `daysSinceBase`, so `DAILY;INTERVAL=2` HANGS the renderer (probe: COUNT=5 never returns); with UNTIL it collapses to 1 occurrence; `MONTHLY;INTERVAL=2` hangs; `periodDays = 28*interval` is not a month.
+  - F2 MAJOR: `:175-176` — `FREQ=WEEKLY` without BYDAY matches every day (comment claims base-weekday restriction; code doesn't do it). Probe: base Wed, 1-week window → 14 daily chips.
+  - F3 MAJOR: `:148-169` — `WEEKLY;INTERVAL=2;BYDAY=MO,WE` lands in off-weeks (weekCursor/day-walk interplay broken).
+- **Reachability:** the DC-12 dialog builder exposes interval + daily/weekly/monthly, so a user picking "every 2 days" freezes the calendar render (calendar.ts:243 expandSeriesEvents). Synced-in rules from other clients hit F2/F3 too.
+- **Fix direction:** rewrite expansion as proper per-FREQ stepping (daily: step days from base with modulo check; weekly: week-anchored stepping against weekStart with BYDAY set membership; monthly: calendar-month stepping, NOT 28-day approximations), recompute the anchor derivative each step, add probes for every FREQ×INTERVAL×BYDAY combination the builder can produce, plus the reviewer's probe cases as regression tests.
+- **Constraint:** INVARIANT 9 (wall-clock preservation) must hold; do not touch tz semantics (reviewer confirmed those clean); tests FIRST, prove each fails on current code.
+- **Trigger:** NEXT IMPLEMENTATION WAVE — this blocks the recurrence wave being owner-visual-passable.
+
+## TD-015 — Occurrence-override identity derived from MOVED start (blind review, data-integrity)
+- **ID:** TD-015
+- **Title:** dialog.ts derives recurrenceId from the override's moved startMs → second edit of a moved occurrence writes an orphan override + duplicate chip
+- **Priority:** 8/10 — HIGH (data integrity, DC-12 R1/R2 violation)
+- **Status:** OPEN (created 2026-09-01, blind adversarial review F4)
+- **Finding:** `frontend/dialog.ts:661,716-719` calls `deriveRecurrenceId(existing.startMs, …)` where `existing` is the rendered chip whose startMs is the override's moved start. calendar.ts:278 already exports `occurrenceOf(ev)` carrying the correct original recurrenceId — dialog.ts never imports it. Second edit/delete of a moved occurrence keys a NEW override under the moved wall-time; the original is orphaned, uneditable from the UI, and the grid renders duplicate chips.
+- **Fix direction:** thread the chip's original `recurrenceId` (via `occurrenceOf`) into the dialog open path and derive from THAT; regression test: move an occurrence, edit it again, assert ONE override row and one chip.
+- **Trigger:** same wave as TD-014 (recurrence follow-up package).
+
+## TD-016 — Unchecking "Repeat" on a series silently deletes the whole series (blind review)
+- **ID:** TD-016
+- **Title:** dialog Save with Repeat unchecked runs deleteEvent(id) on the series — no confirmation, no warning
+- **Priority:** 7/10 — HIGH (destructive action behind an innocuous Save)
+- **Status:** OPEN (created 2026-09-01, blind adversarial review F5)
+- **Finding:** `frontend/dialog.ts:644-653`. Violates the destructive-confirm contract (two-step confirm with warning; `confirm:true` at RPC level) and the UI-interaction-is-owner's-call rule.
+- **Fix direction:** owner decision needed on semantics: (a) unchecking Repeat = "end recurrence here" (convert to single event / set UNTIL), or (b) keep delete-series but route through the two-step destructive confirm. Recommendation: (a) — unchecking a checkbox should never equal deleting data.
+- **Trigger:** owner decision, then same wave as TD-014/015.
+
+## TD-017 — CHANGES_ACK semantics deviate from frozen DC-08 §3.4 (blind review)
+- **ID:** TD-017
+- **Title:** c088023 repurposed CHANGES_ACK as a one-shot bidirectional session terminator without a DC-08 amendment
+- **Priority:** 6/10 — MEDIUM-HIGH (protocol/contract integrity; no correctness break in the homogeneous fleet)
+- **Status:** OPEN (created 2026-09-01, blind adversarial review F2 — sync reviewer)
+- **Finding:** DC-08 §3.4 specifies per-batch ACK ("sent after each batch is fully processed, not coalesced across sessions"); the implementation sends ONE ACK per session before serving the peer's pull, and receiving a peer ACK terminates the barrier. Internally self-consistent (reviewer verified deadlock-free), but (1) a conformant per-batch peer's ACK would cut the barrier short, (2) barrier-mode applications are never ACKed (delays compaction unlock on the peer). Frozen-contract deviation without an amendment is a process violation.
+- **Fix direction:** DC-08 amendment (v2) formalizing the barrier semantics (one ACK as joint terminator; per-batch ACKs retained for compaction knowledge when records are applied in barrier mode), or rework the barrier to a dedicated message. Owner decides via the amendment; do NOT silently conform the code to the old text.
+- **Trigger:** next sync-layer work session; must precede any non-homogeneous (third-party) peer implementation.
+
+## TD-018 — Dead-carrier session masquerades as success (blind review)
+- **ID:** TD-018
+- **Title:** transport error mapped to clean EOF + swallowed pump error → a peer RST mid-session reports a converged session
+- **Priority:** 6/10 — MEDIUM-HIGH (observability/correctness-of-reporting, not data loss)
+- **Status:** OPEN (created 2026-09-01, blind adversarial review F1 — sync reviewer)
+- **Finding:** `noise_transport.ts` feed loop's `finally` close (correct for FIN) plus `sync_runtime`'s error/end/close → receive()=null mapping plus the outbound pump's `void pump.catch(() => {})` mean a dead carrier surfaces as clean session end; pre-fix it surfaced as a loud SyncIdleTimeoutError. DC-05 §6.3 requires transport failure to be terminal (SessionError).
+- **Fix direction:** distinguish FIN from error at the framing layer (error → SessionError, not null-EOF) and propagate pump failure to the session result; regression test with an error-injected carrier. Careful not to re-break the stall fix (FIN must stay clean EOF).
+- **Trigger:** next sync-layer work session (pairs with TD-017 in one package).
+
+## TD-019 — Minor sync-layer hygiene (blind review)
+- **ID:** TD-019
+- **Title:** engine-level message stash leaks across sessions (F3); FrameQueue single-waiter slot + immortal outbound pump (F4); ACK sends possibly-stale applied_upto (F5)
+- **Priority:** 3/10 — LOW (all bounded; no data-loss attack found by the reviewer)
+- **Status:** OPEN (created 2026-09-01, blind adversarial review F3/F4/F5 — sync reviewer)
+- **Details:** stash is pre-existing, not introduced by c088023; pump leak is one closure per session; stale-ACK frontier is safe under max-merge. Fix opportunistically in the next sync package (TD-017/018 wave).
+- **Trigger:** with TD-017/TD-018.
