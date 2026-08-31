@@ -1,6 +1,6 @@
 # TIDE DESIGN CONTRACT DC-20
 # Options Window — Settings Surface
-Status: DRAFT — awaiting owner approval (drafted 2026-08-31).
+Status: APPROVED by project owner (2026-08-31, D1-D7 all decided).
 Depends on: Architecture Spec v0.3 §30 (INV 13); DC-09 (owner amendment:
         MAX_INCREMENTAL_BACKLOG user-adjustable); DC-13 §3.5 (scheduler
         settings + bounds); DC-19 (tray menu; D1 amended 2026-08-31 —
@@ -189,13 +189,19 @@ D2 (DECIDED, owner 2026-08-31): v1 categories = General + Sync (§3.2);
 D3 (DECIDED, owner 2026-08-31): v1 inventory = S1-S4 only (§5); all in
     the Sync category. New settings need contract basis or amendment
     (INV 13).
-D4 (OPEN, owner): Editing model — Save-all atomic commit per §4.2
-    (recommendation: adopt) vs per-field commit.
-D5 (OPEN, owner): S4 restart-required for v1 per §7.2 (recommendation:
-    adopt; promote to live-apply later if a need appears).
-D6 (OPEN, owner): Persistence = config.toml per §6 (recommendation:
-    adopt; alternative would be a DC-07 settings table, deemed the
-    wrong home for non-domain values).
-D7 (OPEN, owner): Window creation — on-demand via WebviewWindowBuilder
-    (recommended: no always-resident webview) vs pre-created hidden at
-    app setup. Implementation detail; either conformant (§2.4).
+D4 (DECIDED, owner 2026-08-31): Save-all atomic commit per §4.2. One
+    Save validates/clamps/persists/applies every changed field; per-field
+    commit rejected (mixed-commit-state trap).
+D5 (DECIDED, owner 2026-08-31): S4 restart-required for v1 per §7.2. The
+    label reads "(takes effect at next start)". Promotion to live-apply
+    is a future amendment if a tuning need appears.
+D6 (DECIDED, owner 2026-08-31): Persistence = config.toml per §6 (DC-15
+    §3.2 precedence chain). A DC-07 settings table rejected — machine-
+    local preferences do not belong in calendar domain data.
+D7 (DECIDED, owner 2026-08-31): Window created ON DEMAND via
+    WebviewWindowBuilder (§2.4). NOT pre-created at startup: a hidden
+    WebKitGTK webview costs ~30-60 MB RSS permanently (~25-40% of the
+    app's footprint) to save a sub-second load on a window opened a few
+    times a year — unacceptable footprint bloat (owner: "I hate such
+    apps"). Resource-lean lifecycle is a design goal; revisit only if
+    real-world open latency is ever complained about.
