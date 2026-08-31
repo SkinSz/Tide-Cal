@@ -1,0 +1,308 @@
+diff --git a/src/network/noise_transport.ts b/src/network/noise_transport.ts
+index dab0190..344791b 100644
+--- a/src/network/noise_transport.ts
++++ b/src/network/noise_transport.ts
+@@ -603,14 +603,21 @@ export async function handshakeOverTransport(
+   });
+ 
+   // Carrier -> inbound feed for the lifetime of the connection.
++  // Sync-stall fix (QA root-cause report, amplifier defect): peer FIN
++  // (inner.receive() === null) and carrier errors must propagate as
++  // inbound.close() so a pending FrameQueue.receive() resolves null (clean
++  // EOF) instead of hanging forever. Without this the engine's designed
++  // clean-EOF handling was unreachable on this path and every peer close
++  // surfaced as a 15 s SyncIdleTimeoutError instead.
+   void (async () => {
+     for (;;) {
+       const frame = await inner.receive();
+       if (frame === null) break;
+       inbound.push(frame);
+     }
++    inbound.close(); // peer FIN → clean EOF for pending/next receives
+   })().catch(() => {
+-    /* carrier died; pending reads will reject/close */
++    inbound.close(); // carrier died → fail the queue closed (no silent hang)
+   });
+ 
+   const fakeQueue = { push: pushOut } as unknown as FrameQueue;
+diff --git a/src/sync/sync_engine.ts b/src/sync/sync_engine.ts
+index 358b14d..1e5525b 100644
+--- a/src/sync/sync_engine.ts
++++ b/src/sync/sync_engine.ts
+@@ -517,6 +517,9 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
+     // DC-09 §3.5: offers_made_this_session is in-memory only; a new session
+     // gets fresh dedup state.
+     sessionDedup = new OfferDedup();
++    // DC-08 §4 (sync-stall fix): fresh per session — an ACK seen in a prior
++    // session must not satisfy this session's end barrier.
++    peerAckSeen = false;
+     // Pkg5b: truthful self-frontier seeding BEFORE the pull loop (see doc).
+     seedSelfAppliedFrontier();
+     // Pkg6 (QA-1 F-6): same GC for long-lived engine instances — a frontier
+@@ -602,10 +605,15 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
+       }
+     }
+ 
+-    // --- serve the peer's pull ---
+-    await serveRequests(nextMessage(transport), transport, peerHello.device_clock, stats);
+-
+-    // --- ACK our applied frontier ---
++    // --- DC-08 §4 (sync-stall fix): the two engine runs that share one DC-08
++    // connection keep independent pull semantics but JOINED LIFETIMES. The
++    // final CHANGES_ACK is a bidirectional session-end barrier: each side
++    // sends its own ACK as soon as its pull is complete, then keeps serving
++    // until it sees the peer's ACK. A side may therefore never end the
++    // session (and never sock.end() via session.done()) while the peer's
++    // pull phase is still pending — the responder-with-empty-ranges early
++    // close that starved the initiator's CHANGES_REQUEST is structurally
++    // impossible now.
+     const ack: SyncMessage = {
+       v: 1,
+       type: "CHANGES_ACK",
+@@ -614,6 +622,9 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
+     await transport.send(ack);
+     stats.sent++;
+ 
++    // --- serve the peer's pull until the peer's own ACK ends the session ---
++    await serveRequests(nextMessage(transport), transport, peerHello.device_clock, stats);
++
+     return stats;
+   }
+ 
+@@ -622,17 +633,24 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
+     transport: SyncTransport,
+     peerClock: VC,
+     stats: SessionStats,
+-    /** stop when the queue is quiet for this many poll ticks */
+-    quietTicks = 2,
+   ): Promise<void> {
+-    let quiet = 0;
+-    while (quiet < quietTicks) {
+-      const msg = await receiveWithTimeout(() => nextMessage(transport), 5);
+-      if (msg === null) {
+-        quiet++;
+-        continue;
++    // DC-08 §4 (sync-stall fix): the serve phase now spans the peer's WHOLE
++    // pull instead of exiting after a ~20 ms quiet window (2 quiet ticks ×
++    // 2 ms polls). Exit conditions: the peer's CHANGES_ACK (the joint
++    // session-end barrier), a clean peer close (EOF), or the Pkg4 idle bound
++    // (SyncIdleTimeoutError — a peer that never finishes deterministically
++    // errors the session instead of hanging).
++    while (!peerAckSeen) {
++      const msg = await receiveIdleBounded(
++        () => nextMessage(transport),
++        "serve/session-end",
++      );
++      if (msg === null) return; // peer closed cleanly (EOF)
++      if (msg.type === "CHANGES_ACK") {
++        mergeAckIntoLastKnownClock(msg.applied_upto);
++        peerAckSeen = true;
++        break;
+       }
+-      quiet = 0;
+       if (msg.type === "CHANGES_REQUEST") {
+         const changes = fetchRanges(msg.ranges);
+         for (let i = 0; i < changes.length; i += maxBatch) {
+@@ -654,8 +672,6 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
+         await handleIncomingOffer(msg, () => nextMessage(transport), transport, stats);
+       } else if (msg.type === "FULL_STATE_SNAPSHOT") {
+         applyIncomingSnapshot(msg, stats);
+-      } else if (msg.type === "CHANGES_ACK") {
+-        mergeAckIntoLastKnownClock(msg.applied_upto);
+       } else if (msg.type === "HELLO") {
+         advancePeerKnowledge(msg.device_clock);
+       } else if (msg.type === "REVOCATION_RECORDS") {
+@@ -689,6 +705,10 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
+   }
+ 
+   const stashed: SyncMessage[] = [];
++  // DC-08 §4 (sync-stall fix): set as soon as the peer's CHANGES_ACK is seen
++  // ANYWHERE in the session (including inline during our own pull), so the
++  // final serve phase can end immediately when the barrier is satisfied.
++  let peerAckSeen = false;
+ 
+   function drainStashed(): SyncMessage | null {
+     return stashed.shift() ?? null;
+@@ -721,6 +741,7 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
+         advancePeerKnowledge(msg.device_clock);
+       } else if (msg.type === "CHANGES_ACK") {
+         mergeAckIntoLastKnownClock(msg.applied_upto);
++        peerAckSeen = true; // DC-08 §4 barrier: peer's pull is complete
+       } else if (msg.type === "FULL_STATE_OFFER") {
+         await handleIncomingOffer(msg, nextMessage, transport, stats);
+       } else if (msg.type === "FULL_STATE_SNAPSHOT") {
+diff --git a/tests/noise_transport.test.ts b/tests/noise_transport.test.ts
+index 0585416..aa515ad 100644
+--- a/tests/noise_transport.test.ts
++++ b/tests/noise_transport.test.ts
+@@ -20,6 +20,8 @@ import {
+   ed25519ToX25519PrivateKey,
+   ed25519ToX25519PublicKey,
+   noiseStaticsFromIdentity,
++  handshakeOverTransport,
++  type FramedByteTransport,
+   SessionError,
+ } from "../src/network/noise_transport.ts";
+ import {
+@@ -68,6 +70,78 @@ async function expectSessionError(p: Promise<unknown>): Promise<SessionError> {
+ }
+ 
+ describe("DC-05 §6: Noise encrypted transport", () => {
++  // Sync-stall fix (QA root-cause report, amplifier defect): an in-memory
++  // FramedByteTransport pair so handshakeOverTransport's carrier→inbound feed
++  // loop is exercised, including the peer-FIN (receive() === null) path.
++  class MemCarrier implements FramedByteTransport {
++    private q: Uint8Array[] = [];
++    private waiter: ((f: Uint8Array | null) => void) | null = null;
++    private isClosed = false;
++    private peer: MemCarrier | null = null;
++
++    static pair(): [MemCarrier, MemCarrier] {
++      const a = new MemCarrier();
++      const b = new MemCarrier();
++      a.peer = b;
++      b.peer = a;
++      return [a, b];
++    }
++
++    send(frame: Uint8Array): Promise<void> {
++      if (this.isClosed || this.peer?.isClosed) throw new Error("carrier closed");
++      this.peer!.deliver(frame);
++      return Promise.resolve();
++    }
++
++    private deliver(frame: Uint8Array): void {
++      if (this.isClosed) return;
++      if (this.waiter !== null) {
++        const w = this.waiter;
++        this.waiter = null;
++        w(frame);
++        return;
++      }
++      this.q.push(frame);
++    }
++
++    receive(): Promise<Uint8Array | null> {
++      const next = this.q.shift();
++      if (next !== undefined) return Promise.resolve(next);
++      if (this.isClosed) return Promise.resolve(null);
++      return new Promise((resolve) => {
++        this.waiter = resolve;
++      });
++    }
++
++    close(): void {
++      this.isClosed = true;
++      if (this.waiter !== null) {
++        const w = this.waiter;
++        this.waiter = null;
++        w(null);
++      }
++    }
++  }
++
++  test("peer FIN on the carrier propagates as clean EOF (null) on the session's inbound queue", { timeout: 120000 }, async () => {
++    const [carrierA, carrierB] = MemCarrier.pair();
++    const [sessionA] = await Promise.all([
++      handshakeOverTransport("initiator", carrierA, new Uint8Array(32).fill(1)),
++      handshakeOverTransport("responder", carrierB, new Uint8Array(32).fill(2)),
++    ]);
++
++    // A waiter is parked on the inbound queue when the peer's carrier closes:
++    // the feed loop must call inbound.close() so the receive resolves null
++    // (clean EOF) instead of pending forever. Before the fix this receive
++    // never resolved — the engine's clean-EOF handling was unreachable and
++    // every peer close surfaced as a 15 s SyncIdleTimeoutError.
++    const parked = sessionA.inbound.receive();
++    carrierB.close();
++    expect(await parked).toBeNull();
++    // Subsequent receives also resolve null (queue closed), never hang.
++    expect(await sessionA.inbound.receive()).toBeNull();
++  });
++
+   test("duplex pair round-trips SyncMessage JSON through encrypt/decrypt", async () => {
+     const [a, b] = await makeLocalDuplexPair();
+ 
+diff --git a/tests/probes/three_device_harness.mjs b/tests/probes/three_device_harness.mjs
+index 479f5bc..7c8823f 100644
+--- a/tests/probes/three_device_harness.mjs
++++ b/tests/probes/three_device_harness.mjs
+@@ -416,11 +416,12 @@ async function updEvent(dev, expected, id, title, dayOffset, hour) {
+ /**
+  * Drive the hub topology (B<->A<->C, plus D if present) with alternating
+  * directions and oracle-checked rounds until `isDone(actualByDevice)` holds
+- * or rounds are exhausted. Every session is a REAL production DC-08 session;
+- * per-session errors are tolerated (recorded) and the oracle decides —
+- * per DC-08 §4 the initiator's resolution does not imply the responder
+- * finished, and a timed-out session may still have transferred data via the
+- * responder's independent pull.
++ * or rounds are exhausted. Every session is a REAL production DC-08 session.
++ * Release gate (sync-stall fix): ANY per-session error now FAILS the scenario
++ * immediately — the old tolerate-and-rerun behavior let the responder early
++ * close race report overall PASS via the reverse-direction session. The
++ * session-error entry stays in sessionLog (kept for the report's
++ * session-error section) before the error is rethrown.
+  */
+ async function driveToConvergence(a, b, c, isDone, sessionLog, extraDevice) {
+   const devices = extraDevice ? [a, b, c, extraDevice] : [a, b, c];
+@@ -430,13 +431,17 @@ async function driveToConvergence(a, b, c, isDone, sessionLog, extraDevice) {
+       try {
+         sessionLog.push(await syncNow(from, to));
+       } catch (e) {
+-        sessionLog.push({ from: from.name, to: to.name, error: String(e.message ?? e), noise_transport: false });
++        const rec = { from: from.name, to: to.name, error: String(e.message ?? e), noise_transport: false };
++        sessionLog.push(rec);
++        throw new Error(`session error ${rec.from}->${rec.to} (release gate: zero session errors): ${rec.error}`);
+       }
+       await pace();
+       try {
+         sessionLog.push(await syncNow(to, from));
+       } catch (e) {
+-        sessionLog.push({ from: to.name, to: from.name, error: String(e.message ?? e), noise_transport: false });
++        const rec = { from: to.name, to: from.name, error: String(e.message ?? e), noise_transport: false };
++        sessionLog.push(rec);
++        throw new Error(`session error ${rec.from}->${rec.to} (release gate: zero session errors): ${rec.error}`);
+       }
+       await pace();
+     }
+@@ -519,6 +524,40 @@ SCENARIOS.independent_offline_changes = async (rec, portBase) => {
+   if (!rec.pass) rec.error = rec.result.detail.join(" | ") || "not converged within rounds";
+ };
+ 
++SCENARIOS.stall_repro = async (rec, portBase) => {
++  // Regression probe for the QA root-cause report (three-device harness sync
++  // stall): the report's deterministic repro recipe — B and C create events,
++  // then a single B→A session is driven BEFORE A has pulled anything to give
++  // B. The responder (A) has neededRanges == [] while the initiator (B) has
++  // pending ranges. Before the fix A exited its serve loop after the ~20 ms
++  // quiet window, sent its ACK and ended the session; B's CHANGES_REQUEST was
++  // never served and B hung 15 s in pull/CHANGES_BATCH. The bidirectional
++  // session-end barrier makes this session complete cleanly.
++  const [a, b, c] = await spawnAndPair(rec, portBase, 3);
++  const expected = new ExpectedState();
++  rec.expected_state =
++    "B and C create one event each offline; a single B->A session must transfer B's event " +
++    "completely (responder A has nothing to pull — the report's repro condition)";
++  await mkEvent(b, expected, "stall-from-B", 1, 10);
++  await mkEvent(c, expected, "stall-from-C", 1, 12);
++
++  rec.sync_sessions = [];
++  rec.stages = ["single B->A session under the repro condition (A up-to-date with B = nothing to pull, B has pending ranges)"];
++  rec.sync_sessions.push(await syncNow(b, a)); // throws on any session error
++
++  const aRows = await readEvents(a);
++  const gotB = aRows.some((r) => (r.event_id ?? r.id) !== undefined && r.title === "stall-from-B");
++  const sessionsClean = rec.sync_sessions.every((s) => !s.error);
++  rec.result = {
++    checks: {
++      initiator_transfer_completed_in_single_session: { ok: gotB, observed: aRows.map((r) => r.title) },
++      zero_session_errors: { ok: sessionsClean, observed: rec.sync_sessions.map((s) => s.error ?? null) },
++    },
++  };
++  rec.pass = gotB && sessionsClean;
++  if (!rec.pass) rec.error = "stall repro checks failed (see result.checks)";
++};
++
+ SCENARIOS.concurrent_modification = async (rec, portBase) => {
+   const [a, b, c] = await spawnAndPair(rec, portBase, 3);
+   const expected = new ExpectedState();
