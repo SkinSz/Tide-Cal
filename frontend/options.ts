@@ -8,11 +8,15 @@
 // fields -> one set_settings call -> applied live or marked next-start
 // (backlog limit).
 
+import { setTheme, setTimeFormat, type Theme, type TimeFormat } from "./theme.ts";
+
 interface TideSettings {
   sync_debounce_seconds: number;
   sweep_interval_minutes: number;
   max_concurrent_sessions: number;
   max_incremental_backlog: number;
+  general_theme: string;
+  general_time_format: string;
 }
 
 const DEFAULTS: TideSettings = {
@@ -20,13 +24,21 @@ const DEFAULTS: TideSettings = {
   sweep_interval_minutes: 10,
   max_concurrent_sessions: 3,
   max_incremental_backlog: 1000,
+  general_theme: "dark",
+  general_time_format: "24h",
 };
 
 // Field id <-> setting key mapping, with the user-facing label used in
-// validation errors.
+// validation errors. (General category radios are handled separately.)
+type NumericSettingKey =
+  | "sync_debounce_seconds"
+  | "sweep_interval_minutes"
+  | "max_concurrent_sessions"
+  | "max_incremental_backlog";
+
 const FIELDS: Array<{
   inputId: string;
-  key: keyof TideSettings;
+  key: NumericSettingKey;
   label: string;
   min: number;
   max: number;
@@ -100,6 +112,57 @@ async function loadSettings(): Promise<void> {
   for (const f of FIELDS) {
     field(f.inputId).value = String(current[f.key]);
   }
+  // General: radios (theme + clock style). Unknown saved values fall back
+  // to the defaults here too.
+  const theme: Theme = current.general_theme === "light" ? "light" : "dark";
+  const fmt: TimeFormat = current.general_time_format === "12h" ? "12h" : "24h";
+  for (const radio of document.querySelectorAll<HTMLInputElement>(
+    'input[name="opt-theme"]',
+  )) {
+    radio.checked = radio.value === theme;
+  }
+  for (const radio of document.querySelectorAll<HTMLInputElement>(
+    'input[name="opt-time-format"]',
+  )) {
+    radio.checked = radio.value === fmt;
+  }
+}
+
+/** Read the General radios into the pending settings (defaults if unset). */
+function readGeneral(pending: TideSettings): void {
+  const theme = document.querySelector<HTMLInputElement>(
+    'input[name="opt-theme"]:checked',
+  );
+  const fmt = document.querySelector<HTMLInputElement>(
+    'input[name="opt-time-format"]:checked',
+  );
+  pending.general_theme = theme?.value === "light" ? "light" : "dark";
+  pending.general_time_format = fmt?.value === "12h" ? "12h" : "24h";
+}
+
+/**
+ * Live-apply the General choices: update this window immediately, then tell
+ * the main window (Tauri event when available, in-window event otherwise)
+ * so the look and clock style change the moment Save is pressed.
+ */
+async function applyGeneralLive(pending: TideSettings): Promise<void> {
+  setTheme(pending.general_theme === "light" ? "light" : "dark");
+  setTimeFormat(pending.general_time_format === "12h" ? "12h" : "24h");
+  const payload = {
+    theme: pending.general_theme,
+    time_format: pending.general_time_format,
+  };
+  document.dispatchEvent(
+    new CustomEvent("tide:settings-changed", { detail: payload }),
+  );
+  if (await hasTauri()) {
+    try {
+      const { emit } = await import("@tauri-apps/api/event");
+      await emit("tide:settings-changed", payload);
+    } catch (err) {
+      console.warn("[tide-options] live-apply emit failed:", err);
+    }
+  }
 }
 
 /**
@@ -125,6 +188,7 @@ async function saveSettings(): Promise<void> {
     }
     pending[f.key] = Math.round(Math.min(f.max, Math.max(f.min, n)));
   }
+  readGeneral(pending);
   if (await hasTauri()) {
     try {
       const { invoke } = await import("@tauri-apps/api/core");
@@ -134,6 +198,7 @@ async function saveSettings(): Promise<void> {
       return;
     }
   }
+  await applyGeneralLive(pending);
   if (Number(field("opt-backlog").value) !== Number(field("opt-backlog").dataset.savedAtLoad ?? "0")) {
     showErr("Saved. The backlog limit takes effect after you restart Tide.");
   } else {

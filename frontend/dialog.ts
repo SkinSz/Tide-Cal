@@ -15,6 +15,7 @@ import {
 } from "./store.ts";
 import { getSelectedDate } from "./calendar.ts";
 import { dialogRecurrenceLine } from "./recurrence.ts";
+import { formatTimeLabel, getTimeFormat } from "./theme.ts";
 
 const dlg = () => document.getElementById("event-dialog") as HTMLDialogElement;
 
@@ -151,7 +152,10 @@ function commitDateField(): void {
 /**
  * Outlook-style dropdown: 15-minute slots (00:00–23:45) as buttons that set
  * the paired <input type="time">. Complements free typing rather than
- * replacing it — the native time input stays editable.
+ * replacing it — the native time input stays editable. Slot strings are
+ * always the internal 24h "HH:MM" (that's what lands in the input's value,
+ * which the DOM keeps in 24h regardless of display format); the visible
+ * label is rendered in the user's chosen clock style (General options).
  */
 const TIME_SLOTS: string[] = Array.from(
   { length: 24 * 4 },
@@ -160,6 +164,7 @@ const TIME_SLOTS: string[] = Array.from(
 
 function openTimeMenu(inputId: string): void {
   const inp = field<HTMLInputElement>(inputId);
+  const fmt = getTimeFormat();
   document.getElementById("time-menu")?.remove();
   const menu = document.createElement("div");
   menu.id = "time-menu";
@@ -174,7 +179,10 @@ function openTimeMenu(inputId: string): void {
     const opt = document.createElement("button");
     opt.type = "button";
     opt.className = "time-option" + (inp.value === slot ? " picked" : "");
-    opt.textContent = slot;
+    opt.textContent = formatTimeLabel(slot, fmt);
+    // Comparisons use the internal 24h strings on both sides, so this
+    // filter is clock-style independent.
+    opt.dataset.value = slot;
     // For the End field, slots earlier than Start are omitted entirely
     // (owner preference: disappear rather than appear disabled).
     if (inputId === "ev-end-t") {

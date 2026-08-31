@@ -109,3 +109,20 @@
   color: var(--danger);
   font-size: 0.8rem;
 }
+
+/* General category: radio choice groups (theme, time format) */
+.opt-choice {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin: 0 0 12px;
+}
+.opt-choice legend { padding: 0 4px; }
+.opt-radio {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: 16px;
+  cursor: pointer;
+}
+.opt-radio input { margin: 0; }

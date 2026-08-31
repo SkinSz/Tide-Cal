@@ -84,6 +84,23 @@ struct TideSettings {
     sweep_interval_minutes: f64,
     max_concurrent_sessions: f64,
     max_incremental_backlog: f64,
+    /// General category: manual light/dark choice (no system-follow).
+    #[serde(default = "default_general_theme", rename = "general.theme")]
+    general_theme: String,
+    /// General category: clock style for the event dialog (12h/24h).
+    #[serde(
+        default = "default_general_time_format",
+        rename = "general.time_format"
+    )]
+    general_time_format: String,
+}
+
+fn default_general_theme() -> String {
+    "dark".to_string()
+}
+
+fn default_general_time_format() -> String {
+    "24h".to_string()
 }
 
 impl Default for TideSettings {
@@ -94,6 +111,8 @@ impl Default for TideSettings {
             sweep_interval_minutes: 10.0,
             max_concurrent_sessions: 3.0,
             max_incremental_backlog: 1000.0,
+            general_theme: "dark".to_string(),
+            general_time_format: "24h".to_string(),
         }
     }
 }
@@ -108,6 +127,13 @@ impl TideSettings {
         self.max_concurrent_sessions = self.max_concurrent_sessions.clamp(1.0, 5.0);
         self.max_incremental_backlog =
             self.max_incremental_backlog.clamp(100.0, 100_000.0);
+        // General: anything unexpected falls back to the default (dark / 24h).
+        if self.general_theme != "light" && self.general_theme != "dark" {
+            self.general_theme = "dark".to_string();
+        }
+        if self.general_time_format != "12h" && self.general_time_format != "24h" {
+            self.general_time_format = "24h".to_string();
+        }
         self
     }
 }
@@ -660,4 +686,59 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod general_settings_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_dark_and_24h() {
+        let s = TideSettings::default();
+        assert_eq!(s.general_theme, "dark");
+        assert_eq!(s.general_time_format, "24h");
+    }
+
+    #[test]
+    fn toml_round_trips_dotted_general_keys() {
+        let text = r#"
+sync_debounce_seconds = 10.0
+sweep_interval_minutes = 10.0
+max_concurrent_sessions = 3.0
+max_incremental_backlog = 1000.0
+"general.theme" = "light"
+"general.time_format" = "12h"
+"#;
+        let s: TideSettings = toml::from_str(text).expect("parse");
+        assert_eq!(s.general_theme, "light");
+        assert_eq!(s.general_time_format, "12h");
+        let out = toml::to_string_pretty(&s).expect("serialize");
+        assert!(out.contains(r#""general.theme" = "light""#));
+        let back: TideSettings = toml::from_str(&out).expect("re-parse");
+        assert_eq!(back.general_theme, "light");
+        assert_eq!(back.general_time_format, "12h");
+    }
+
+    #[test]
+    fn clamped_falls_back_on_unknown_general_values() {
+        let mut s = TideSettings::default();
+        s.general_theme = "auto".to_string();
+        s.general_time_format = "system".to_string();
+        let s = s.clamped();
+        assert_eq!(s.general_theme, "dark");
+        assert_eq!(s.general_time_format, "24h");
+    }
+
+    #[test]
+    fn missing_general_keys_deserialize_to_defaults() {
+        let text = r#"
+sync_debounce_seconds = 10.0
+sweep_interval_minutes = 10.0
+max_concurrent_sessions = 3.0
+max_incremental_backlog = 1000.0
+"#;
+        let s: TideSettings = toml::from_str(text).expect("parse");
+        assert_eq!(s.general_theme, "dark");
+        assert_eq!(s.general_time_format, "24h");
+    }
 }

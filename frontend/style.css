@@ -322,10 +322,16 @@ dialog menu .spacer { flex: 1 1 auto; }
 .time-wrap { position: relative; display: flex; align-items: center; gap: 4px; }
 .time-wrap input[type="time"] { flex: 1; margin-top: 4px; }
 
-/* Belt-and-braces for WebKitGTK: even with a 24h document language it can
-   render an AM/PM field (and a picker indicator) in <input type="time">
-   shadow DOM. Hide them so no 12h suffix can ever appear. */
-input[type="time"]::-webkit-datetime-edit-ampm-field { display: none; }
+/* Belt-and-braces for WebKitGTK in the default 24h clock: even with a 24h
+   document language it can render an AM/PM field (and a picker indicator)
+   in <input type="time"> shadow DOM. Hide them so no 12h suffix can ever
+   appear. In 12h mode (General options) the AM/PM field is wanted, so the
+   suppression is scoped to the 24h mode only; document lang is then
+   en-US so WebKit renders the AM/PM suffix itself. */
+:root:not([data-time-format="12h"])
+  input[type="time"]::-webkit-datetime-edit-ampm-field {
+  display: none;
+}
 input[type="time"]::-webkit-time-picker-indicator { display: none; }
 .time-arrow {
   padding: 4px 6px;

@@ -45,6 +45,33 @@
         </section>
         <section class="options-category" data-category-content="general" hidden>
           <h2>General</h2>
+          <p class="muted">
+            How Tide looks and reads times. Changes apply when you save.
+          </p>
+          <fieldset class="opt-field opt-choice" id="opt-theme-group">
+            <legend class="opt-label">Look</legend>
+            <label class="opt-radio">
+              <input type="radio" name="opt-theme" value="dark" />
+              <span>Dark</span>
+            </label>
+            <label class="opt-radio">
+              <input type="radio" name="opt-theme" value="light" />
+              <span>Light</span>
+            </label>
+            <span class="opt-hint">Pick how Tide looks. Tide keeps your choice — it never changes on its own.</span>
+          </fieldset>
+          <fieldset class="opt-field opt-choice" id="opt-time-format-group">
+            <legend class="opt-label">Time format</legend>
+            <label class="opt-radio">
+              <input type="radio" name="opt-time-format" value="24h" />
+              <span>24-hour (13:45)</span>
+            </label>
+            <label class="opt-radio">
+              <input type="radio" name="opt-time-format" value="12h" />
+              <span>12-hour (1:45 PM)</span>
+            </label>
+            <span class="opt-hint">How times appear when you add or edit events. Calendar data is stored the same way either way.</span>
+          </fieldset>
         </section>
         <div class="options-footer">
           <span class="dialog-error" id="options-error" role="alert" hidden></span>

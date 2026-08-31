@@ -5,9 +5,35 @@ import { initConflicts } from "./conflicts.ts";
 import { initDevices } from "./devices.ts";
 import { initSyncErrors } from "./sync_errors.ts";
 import { initPairedDevices } from "./paired_devices.ts";
-import { applyTheme, getTheme } from "./theme.ts";
+import { applyTheme, getTheme, setTheme, setTimeFormat, type Theme, type TimeFormat } from "./theme.ts";
 
-applyTheme(getTheme()); // theme layer ready; no UI toggle yet (options-owned)
+applyTheme(getTheme()); // theme layer; the General options own the choice
+
+// General options live in a separate window. Live-apply (Save in the
+// options window): Tauri event from there, mirrored as an in-window event
+// for non-Tauri/test contexts. localStorage is kept in sync as the cache.
+interface GeneralChange {
+  theme?: string;
+  time_format?: string;
+}
+function applyGeneralChange(msg: GeneralChange): void {
+  const theme: Theme = msg.theme === "light" ? "light" : "dark";
+  const fmt: TimeFormat = msg.time_format === "12h" ? "12h" : "24h";
+  setTheme(theme);
+  setTimeFormat(fmt);
+}
+document.addEventListener("tide:settings-changed", (e) => {
+  applyGeneralChange((e as CustomEvent<GeneralChange>).detail ?? {});
+});
+if ("__TAURI_INTERNALS__" in globalThis) {
+  void import("@tauri-apps/api/event")
+    .then(({ listen }) =>
+      listen<GeneralChange>("tide:settings-changed", (ev) =>
+        applyGeneralChange(ev.payload),
+      ),
+    )
+    .catch((err) => console.warn("[tide] event listen unavailable:", err));
+}
 
 function wire(id: string, fn: () => void): void {
   document.getElementById(id)?.addEventListener("click", fn);
