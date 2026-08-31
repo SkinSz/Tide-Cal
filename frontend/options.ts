@@ -28,6 +28,46 @@ const DEFAULTS: TideSettings = {
   general_time_format: "24h",
 };
 
+/**
+ * TD-011: the Rust TideSettings persists the General category under dotted
+ * TOML keys (`general.theme`, `general.time_format`), and its serde
+ * `rename` applies to the JSON IPC shape too — so get_settings returns
+ * `general.theme` (not `general_theme`) and set_settings only accepts
+ * `general.theme`. The old flat mapping silently fell back to defaults on
+ * load and never persisted the General choices at all. These helpers are
+ * the single conversion point between the frontend's flat shape and the
+ * shell's dotted wire shape (exported for tests).
+ */
+export type ShellSettings = Record<string, unknown>;
+
+/** Flat frontend key -> dotted shell key (the General category only). */
+const FLAT_TO_SHELL: Record<string, string> = {
+  general_theme: "general.theme",
+  general_time_format: "general.time_format",
+};
+
+/** Shell -> frontend: accept the dotted IPC keys (fall back to flat keys). */
+export function settingsFromShell(raw: ShellSettings): Partial<TideSettings> {
+  const out: ShellSettings = {};
+  for (const key of Object.keys(DEFAULTS)) {
+    const dotted = FLAT_TO_SHELL[key];
+    const value = (dotted !== undefined ? raw[dotted] : undefined) ?? raw[key];
+    if (value !== undefined) out[key] = value;
+  }
+  return out as Partial<TideSettings>;
+}
+
+/** Frontend -> shell: send the dotted keys serde's rename expects. */
+export function settingsToShell(s: TideSettings): ShellSettings {
+  const out: ShellSettings = {};
+  for (const key of Object.keys(s) as Array<keyof TideSettings>) {
+    const dotted = FLAT_TO_SHELL[key];
+    if (dotted) out[dotted] = s[key];
+    else out[key] = s[key];
+  }
+  return out;
+}
+
 // Field id <-> setting key mapping, with the user-facing label used in
 // validation errors. (General category radios are handled separately.)
 type NumericSettingKey =
@@ -102,8 +142,8 @@ async function loadSettings(): Promise<void> {
   if (await hasTauri()) {
     try {
       const { invoke } = await import("@tauri-apps/api/core");
-      const fromShell = await invoke<Partial<TideSettings>>("get_settings");
-      current = { ...current, ...fromShell };
+      const fromShell = await invoke<ShellSettings>("get_settings");
+      current = { ...current, ...settingsFromShell(fromShell) };
     } catch (err) {
       console.warn("[tide-options] get_settings failed; showing defaults:", err);
       showErr(`Could not load settings: ${String(err)} (showing defaults)`);
@@ -192,7 +232,7 @@ async function saveSettings(): Promise<void> {
   if (await hasTauri()) {
     try {
       const { invoke } = await import("@tauri-apps/api/core");
-      await invoke("set_settings", { settings: pending });
+      await invoke("set_settings", { settings: settingsToShell(pending) });
     } catch (err) {
       showErr(`Failed to save settings: ${String(err)}`);
       return;
@@ -215,8 +255,8 @@ async function refreshSavedMarker(): Promise<void> {
   if (await hasTauri()) {
     try {
       const { invoke } = await import("@tauri-apps/api/core");
-      const fromShell = await invoke<Partial<TideSettings>>("get_settings");
-      savedSnapshot = { ...DEFAULTS, ...fromShell };
+      const fromShell = await invoke<ShellSettings>("get_settings");
+      savedSnapshot = { ...DEFAULTS, ...settingsFromShell(fromShell) };
       for (const f of FIELDS) {
         field(f.inputId).dataset.savedAtLoad = String(savedSnapshot[f.key]);
       }

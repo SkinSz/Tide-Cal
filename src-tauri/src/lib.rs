@@ -591,6 +591,19 @@ fn open_options_window(app: &tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // TD-011 bug 4 (window X / titlebar buttons hard to click on Wayland):
+    // verified upstream, not ours — tao's client-side decorations on Wayland
+    // stop the titlebar buttons from receiving hover/click events
+    // (tauri-apps/tauri#13440, fixed by tauri-apps/tao#1218 "fix(wayland):
+    // fix client-side decorations", released in tao 0.36.0). Tide is pinned
+    // to tao 0.35 via tauri-runtime-wry 2.11.4 (requires ^0.35.0), so the
+    // fix cannot be picked up until a tauri release bumps tao. Verified that
+    // nothing in this repo causes it: native decorations are on (no
+    // `decorations: false`), there are no drag regions, no transparent
+    // windows, and no CSS overlays the titlebar (GTK decorations live
+    // outside the webview). Mitigation until the upgrade: launch under
+    // XWayland (`GDK_BACKEND=x11` in the launch environment) or by
+    // double-clicking the titlebar once (the buttons then keep working).
     tauri::Builder::default()
         .setup(|app| {
             // Runtime window icon: in a dev launch (cargo run) nothing else

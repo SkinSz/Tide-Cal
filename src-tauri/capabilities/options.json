@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "options",
+  "description": "TD-011: the on-demand Options window. Without a capability covering the \"options\" label every core-plugin call from that webview is denied by the ACL: emit() (core:event:allow-emit) was rejected, so the live theme/time-format change never reached the main window, and getCurrentWindow().close() was rejected because core:window:default deliberately excludes allow-close, so Cancel did nothing.",
+  "windows": ["options"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-close"
+  ]
+}
