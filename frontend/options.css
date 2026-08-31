@@ -76,7 +76,7 @@
   width: 140px;
 }
 .opt-field input:focus { outline: 1px solid var(--accent); }
-.opt-hint { font-size: 0.72rem; color: var(--muted); }
+.opt-hint { font-size: 0.72rem; color: var(--muted); line-height: 1.45; max-width: 460px; }
 
 /* Footer: error + Save/Cancel */
 .options-footer {

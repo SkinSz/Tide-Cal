@@ -1,12 +1,12 @@
-// Tide DC-20 options window entry: Outlook-style settings (left nav pane +
-// right content). Reachable ONLY from the tray menu "Options…" item (DC-19
-// D9) — never from the calendar UI.
+// Tide options window entry: Outlook-style settings (left nav pane + right
+// content). Reachable ONLY from the tray menu "Options…" item — never from
+// the calendar UI.
 //
 // Data flow: reads/writes settings through Tauri commands
 // get_settings/set_settings (Rust shell persists to
-// ~/.config/tide/config.toml per DC-20 §6). Save-all atomic commit (§4.2):
-// validate+clamp all fields -> one set_settings call -> applied live (S1-S3
-// via the sidecar's scheduler runtime) or marked next-start (S4 backlog).
+// ~/.config/tide/config.toml). Save-all atomic commit: validate+clamp all
+// fields -> one set_settings call -> applied live or marked next-start
+// (backlog limit).
 
 interface TideSettings {
   sync_debounce_seconds: number;
@@ -22,23 +22,44 @@ const DEFAULTS: TideSettings = {
   max_incremental_backlog: 1000,
 };
 
-// Field id <-> TOML key mapping (§5.2 key names).
+// Field id <-> setting key mapping, with the user-facing label used in
+// validation errors.
 const FIELDS: Array<{
   inputId: string;
   key: keyof TideSettings;
+  label: string;
   min: number;
   max: number;
   restartNote?: boolean;
 }> = [
-  { inputId: "opt-sync-debounce", key: "sync_debounce_seconds", min: 5, max: 120 },
-  { inputId: "opt-sweep-interval", key: "sweep_interval_minutes", min: 1, max: 1440 },
-  { inputId: "opt-max-concurrent", key: "max_concurrent_sessions", min: 1, max: 5 },
+  {
+    inputId: "opt-sync-debounce",
+    key: "sync_debounce_seconds",
+    label: "Sync debounce",
+    min: 5,
+    max: 120,
+  },
+  {
+    inputId: "opt-sweep-interval",
+    key: "sweep_interval_minutes",
+    label: "Sweep interval",
+    min: 1,
+    max: 1440,
+  },
+  {
+    inputId: "opt-max-concurrent",
+    key: "max_concurrent_sessions",
+    label: "Max concurrent sync sessions",
+    min: 1,
+    max: 5,
+  },
   {
     inputId: "opt-backlog",
     key: "max_incremental_backlog",
+    label: "Incremental backlog limit",
     min: 100,
     max: 100000,
-    restartNote: true, // §7.2: restart-scoped for v1
+    restartNote: true, // restart-scoped for v1
   },
 ];
 
@@ -62,7 +83,7 @@ async function hasTauri(): Promise<boolean> {
   return "__TAURI_INTERNALS__" in globalThis;
 }
 
-/** Load settings from the shell and populate the inputs (§4.1: fresh per open). */
+/** Load settings from the shell and populate the inputs (fresh per open). */
 async function loadSettings(): Promise<void> {
   clearErr();
   let current: TideSettings = { ...DEFAULTS };
@@ -82,9 +103,9 @@ async function loadSettings(): Promise<void> {
 }
 
 /**
- * Save-all atomic commit (§4.2): validate+clamp every field FIRST; only
- * if all clean, one set_settings call persists; backend applies live where
- * applicable (S1-S3) and marks S4 next-start (§7.2).
+ * Save-all atomic commit: validate+clamp every field FIRST; only if all
+ * clean, one set_settings call persists; backend applies live where
+ * applicable and marks the backlog limit next-start.
  */
 async function saveSettings(): Promise<void> {
   clearErr();
@@ -93,16 +114,15 @@ async function saveSettings(): Promise<void> {
     const raw = field(f.inputId).value.trim();
     const n = Number(raw);
     if (!Number.isFinite(n) || raw === "") {
-      showErr(`${f.key}: value must be a number.`);
+      showErr(`${f.label}: please enter a number.`);
       field(f.inputId).focus();
       return;
     }
     if (n < f.min || n > f.max) {
-      showErr(`${f.key}: must be between ${f.min} and ${f.max}.`);
+      showErr(`${f.label}: must be between ${f.min} and ${f.max}.`);
       field(f.inputId).focus();
       return;
     }
-    // Clamp to contract bounds before persisting (§4.3).
     pending[f.key] = Math.round(Math.min(f.max, Math.max(f.min, n)));
   }
   if (await hasTauri()) {
@@ -114,17 +134,15 @@ async function saveSettings(): Promise<void> {
       return;
     }
   }
-  // Restart-scoped note (§7.2): S4 informs the user instead of applying.
-  const backlogNow = Number(field("opt-backlog").value);
-  if (backlogNow !== Number(field("opt-backlog").dataset.savedAtLoad ?? backlogNow)) {
-    showErr("Saved. The backlog limit takes effect at next start.");
+  if (Number(field("opt-backlog").value) !== Number(field("opt-backlog").dataset.savedAtLoad ?? "0")) {
+    showErr("Saved. The backlog limit takes effect after you restart Tide.");
   } else {
     showErr("Saved.");
   }
   void refreshSavedMarker();
 }
 
-/** Track the persisted values so Cancel can restore them (§4.4 discard). */
+/** Track the persisted values so Cancel can restore them before closing. */
 let savedSnapshot: TideSettings = { ...DEFAULTS };
 
 async function refreshSavedMarker(): Promise<void> {
@@ -143,23 +161,31 @@ async function refreshSavedMarker(): Promise<void> {
   }
 }
 
-/** Cancel: restore last-saved values into the inputs (discard edits, §4.4). */
-function cancelEdits(): void {
+/** Cancel: discard edits (restore last-saved values), then close the window. */
+async function cancelEdits(): Promise<void> {
   for (const f of FIELDS) {
     field(f.inputId).value = String(savedSnapshot[f.key]);
   }
   clearErr();
+  if (await hasTauri()) {
+    try {
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      getCurrentWindow().close();
+    } catch (err) {
+      console.warn("[tide-options] closing window failed:", err);
+    }
+  }
 }
 
-/** Left nav pane: category switching swaps only the right content (§3.1). */
+/** Left nav pane: category switching swaps only the right content. */
 function initNav(): void {
   const items = document.querySelectorAll<HTMLButtonElement>(".options-nav-item");
   items.forEach((item) => {
     item.addEventListener("click", () => {
       const target = item.dataset.category;
       if (!target) return;
-      // Unsaved-edits guard (§4.4): switching categories discards in-window,
-      // using an in-window prompt — never a native dialog.
+      // Switching categories discards in-window edits (values reload from
+      // the saved snapshot); no native dialog is used.
       items.forEach((i) => i.classList.toggle("active", i === item));
       document.querySelectorAll<HTMLElement>(".options-category").forEach((sec) => {
         sec.hidden = sec.dataset.categoryContent !== target;
@@ -174,7 +200,7 @@ async function init(): Promise<void> {
   await loadSettings();
   await refreshSavedMarker();
   document.getElementById("options-save")?.addEventListener("click", () => void saveSettings());
-  document.getElementById("options-cancel")?.addEventListener("click", cancelEdits);
+  document.getElementById("options-cancel")?.addEventListener("click", () => void cancelEdits());
 }
 
 void init();
