@@ -1,4 +1,9 @@
-:root {
+/* Theme layer (CSS custom properties). The un-scoped :root values are the
+   current (dark) look and remain the default; a future light/dark setting
+   can set <html data-theme="..."> to switch palettes. No UI toggle yet —
+   the General settings (options window) will own that later. */
+:root,
+:root[data-theme="dark"] {
   --bg: #101418;
   --panel: #171c22;
   --border: #262d36;
@@ -8,6 +13,17 @@
   --accent-soft: rgba(74, 163, 223, 0.18);
   --danger: #e05561;
   font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+:root[data-theme="light"] {
+  --bg: #f5f6f8;
+  --panel: #ffffff;
+  --border: #d7dce2;
+  --text: #1c2430;
+  --muted: #66707c;
+  --accent: #2f7fc1;
+  --accent-soft: rgba(47, 127, 193, 0.14);
+  --danger: #c73f4b;
 }
 
 * { box-sizing: border-box; }

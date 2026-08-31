@@ -5,6 +5,9 @@ import { initConflicts } from "./conflicts.ts";
 import { initDevices } from "./devices.ts";
 import { initSyncErrors } from "./sync_errors.ts";
 import { initPairedDevices } from "./paired_devices.ts";
+import { applyTheme, getTheme } from "./theme.ts";
+
+applyTheme(getTheme()); // theme layer ready; no UI toggle yet (options-owned)
 
 function wire(id: string, fn: () => void): void {
   document.getElementById(id)?.addEventListener("click", fn);
