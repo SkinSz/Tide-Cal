@@ -16,11 +16,15 @@ interface GeneralChange {
   theme?: string;
   time_format?: string;
 }
-function applyGeneralChange(msg: GeneralChange): void {
+function applyGeneralChange(msg: Partial<GeneralChange>): void {
   const theme: Theme = msg.theme === "light" ? "light" : "dark";
   const fmt: TimeFormat = msg.time_format === "12h" ? "12h" : "24h";
   setTheme(theme);
   setTimeFormat(fmt);
+  // Time format is baked into rendered labels (chips, hour ruler), so the
+  // calendar must re-render for it to show up without a restart (theme
+  // applies via CSS alone and needs no repaint).
+  void render();
 }
 document.addEventListener("tide:settings-changed", (e) => {
   applyGeneralChange((e as CustomEvent<GeneralChange>).detail ?? {});
