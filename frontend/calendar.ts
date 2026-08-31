@@ -581,14 +581,14 @@ function pad(n: number): string {
 function renderHourRuler(root: HTMLElement): void {
   const ruler = document.createElement("div");
   ruler.className = "hour-ruler";
-  // Owner layout (2026-08-31): the label for hour h sits ON the h:00 line
-  // (centred), so the ruler reads 01:00 at the first line and 24:00 at the
-  // bottom after 23:00 — no leading 00:00 slot. h runs 1..24.
+  // Owner layout (2026-08-31, refined): 24 slots, one label per bar —
+  // 01:00 centred in the FIRST bar, 24:00 in the last, right after 23:00.
+  // Slot-centred (not on the line) so the ruler starts at the top edge.
   for (let h = 1; h <= 24; h++) {
     const lbl = document.createElement("div");
     lbl.className = "hour-label";
     lbl.textContent = fmtRulerLabel(h);
-    lbl.style.top = `${(h / 24) * 100}%`;
+    lbl.style.top = `${((h - 0.5) / 24) * 100}%`;
     ruler.appendChild(lbl);
   }
   root.appendChild(ruler);
