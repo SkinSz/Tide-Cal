@@ -134,6 +134,7 @@ Measured against the frozen outline (commit 1226d6e, 2026-08-25):
 | ID | Priority | Status | Note |
 |---|---|---|---|
 | TD-001 | 7/10 HIGH | OPEN (registry) | Quarantine-and-skip semantics; lead recommendation (Option 3) written, PENDING OWNER APPROVAL. NOTE: commits 271e86c/96a257a implemented skipped_seqs (schema v2) + restart revalidation — the registry entry predates them and needs status reconciliation against the code. Gates multi-device release. |
+| TD-011 | 6/10 MEDIUM-HIGH | OPEN — assigned to OWNER | Visual verification pass for the 2026-08-31 wave: tray menu (Open Tide/Sync now/Options…/Quit), options window (4 settings, config.toml persistence, live-apply), conflict resolution end-to-end, UX wave (whole-day solid banner, drag-drop + ghost, Del-delete), toolbar cleanup. Full click-through checklist in docs/technical-debt.md TD-011. RELEASE GATE. |
 | TD-010 | 3/10 | OPEN | Tray ERROR-PRESENT marker (quarantines/conflicts need attention). Deferred from DC-19 v1 by owner; DC-19 §3.3 holds the normative spec. Natural companion to DC-20 options-window work. |
 | TD-003 | 4/10 | DEFERRED | Legacy dev-* identity migration; correctly deferred until an upgrade release exists. |
 | TD-007 | 2/10 | OPEN | Hygiene nits (prepared statements, monotonic windows, resolved_at_hlc naming, onHardBlock guard). |
@@ -165,17 +166,22 @@ Measured against the frozen outline (commit 1226d6e, 2026-08-25):
 - .ics import (needs its own contract)
 - CalDAV (explicitly skipped by owner)
 
-## 7. RECOMMENDED ORDER (lead's pick, with reasoning)
+## 7. RECOMMENDED ORDER (updated 2026-08-31 — DC-20 options window LANDED)
 
-1. **DC-20 options window** — contract freshly approved; small
-   self-contained package; delivers the settings surface and closes the
-   DC-20 implementation gap.
-2. **TD-001 status reconciliation** — paper exercise against the code
+Landed this session (all committed on master, agent-verified):
+DC-14 conflict-resolution write path, DC-13 scheduler runtime + DC-19 tray
+(options window included), TD-009 cancel button, DC-19/DC-20 contracts.
+
+1. **TD-011 — owner visual verification pass (RELEASE GATE).** All landed
+   work is agent-verified only. Full click-through checklist in
+   docs/technical-debt.md TD-011. Everything below can proceed in
+   parallel; nothing blocks the owner pass.
+2. **mDNS→sidecar endpoint plumbing** — closes §3.4 and makes sync
+   actually automatic (the tray's whole point). Needs the small contract
+   bridge item from §5.5 first.
+3. **TD-001 status reconciliation** — paper exercise against the code
    (271e86c/96a257a landed most of it) + owner ratification; gates
    multi-device release.
-3. **mDNS→sidecar endpoint plumbing** — closes §3.4 and makes sync
-   actually automatic (the tray's whole point). Needs the small
-   contract bridge item from §5.5 first.
 4. **.ics export (DC-18)** — on the owner's word; self-contained.
 5. **Recurrence creation UI** — largest UI piece.
 6. **TD-010 tray error marker** — pairs naturally with any tray work.

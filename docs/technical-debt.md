@@ -142,3 +142,39 @@ stable, blind final verification PASS WITH CONCERNS with zero new issues).
 - **Semantics (DC-19 §3.3, normative when implemented):** boolean marker on the tray icon shown when at least one of: (a) non-resolved quarantine rows exist (Sync-Errors dialog domain), (b) unresolved conflict rows exist (Conflicts dialog domain). Source of truth: `quarantine_stats` + `list_conflicts` via existing sync_op RPC. Marker is boolean — NEVER duplicates dialog detail. Clears when both counts reach zero. v1 tray states remain IDLE + SYNCING only (DC-19 D7).
 - **Relevant files:** src-tauri/src/lib.rs (tray wiring, DC-19 implementation), frontend dialogs already expose the underlying counters.
 - **Trigger:** with the DC-13 runtime wrapper/tray implementation, or on owner request.
+
+## TD-011 — Owner visual verification pass for the 2026-08-31 wave
+- **ID:** TD-011
+- **Title:** Owner visual smoke test: tray menu/options window, conflict resolution, UX wave (whole-day banner, drag-drop, Del-delete), toolbar cleanup
+- **Priority:** 6/10 — MEDIUM-HIGH (release gate: all landed work is agent-verified only; owner visual checks are the final gate per established discipline)
+- **Status:** OPEN (created 2026-08-31; assigned to the project owner)
+- **Scope (what to click through, per DC-19/DC-20/DC-14 and the UX wave):**
+  1. TRAY: icon present in KDE Plasma; right-click menu shows exactly
+     Open Tide / Sync now / Options… / Quit (no Sync Errors, no Settings).
+     Open Tide shows/focuses the window; window X hides to tray (process +
+     sidecar stay alive); Quit exits cleanly (sidecar exits via stdin EOF,
+     no SIGKILL).
+  2. OPTIONS WINDOW (tray → Options…): opens as a SEPARATE window with
+     left nav (General + Sync) + right content; Sync shows the 4 settings
+     with contract bounds; Save persists to ~/.config/tide/config.toml
+     (verify the file after Save); out-of-range input is refused with an
+     inline error; Cancel restores last-saved values; live-apply of
+     debounce/sweep/concurrent takes effect without restart; backlog limit
+     is labeled next-start.
+  3. CONFLICT RESOLUTION (DC-14): with two devices, create a genuine
+     same-field conflict; Conflicts dialog lists it; Keep/Discard resolve
+     it; the resolution propagates to the peer; skip writes nothing.
+  4. UX WAVE (week view): overlapping appointments render side by side;
+     whole-day appointment paints a SOLID full-height accent block (not a
+     translucent wash); timed drag-drop shows a live ghost with the real
+     snapped time range and lands exactly there; whole-day chips drag to
+     another day; selecting a chip + Del arms ("Confirm delete?"), second
+     Del deletes, any other key cancels.
+  5. TOOLBAR CLEANUP: no Sync now / Quit buttons in the toolbar; only
+     prev/today/next, Conflicts, Sync errors, New event, Month/Week.
+- **Known non-issues during verification:** libayatana deprecation warning
+  in the log (Tauri upstream library notice, tray works — DC-15 packaging
+  note); the scheduler logs "[tide] runtime started…" to stderr (by design,
+  stdout is the RPC channel).
+- **Launch recipe:** terminal 1: `cd /home/skins/tide && npm run ui:dev`;
+  terminal 2: `cd /home/skins/tide/src-tauri && TIDE_SIDECAR_PATH=/home/skins/tide/dist/sidecar.mjs cargo run`.
