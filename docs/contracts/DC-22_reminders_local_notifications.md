@@ -5,10 +5,10 @@ Status: APPROVED by project owner (2026-09-01)
 OWNER DECISIONS (2026-09-01):
 - D1 missed-while-not-running: show-on-launch with missed-marking;
   discard once the event itself has ended.
-- D2 all-day events: global "day before" reminder time (DC-20
-  setting, default 20:00 local); minutes_before offsets measure
-  from that base moment; today-created events fire immediately
-  as missed reminders.
+- D2 all-day events: reminder fires the day before (fixed);
+  PER EVENT the user ticks it on and picks the exact time in
+  the event dialog (corrected 2026-09-01: not a global Options
+  setting).
 
 Depends on: Architecture Spec v0.3 §3, §4, §5, §6, §7, §31;
             DC-01 (change records); DC-07 §reminders (storage);
@@ -212,16 +212,18 @@ Frozen constraints implemented here:
 
      - Floating/local events: fire_at computed in local wall time
        directly.
-     - All-day events: base fire moment = a GLOBAL owner-picked
-       time on the DAY BEFORE the event (DC-20 setting, e.g.
-       "remind me the day before at 20:00"; default 20:00 local;
-       set-and-forget per owner settings philosophy). Relative
-       minutes_before offsets measure back from that base moment.
-       Edge case: all-day event created for TODAY, after the
-       day-before moment has already passed -> fires immediately
-       as a missed reminder on next rebuild (D1 policy: never
-       silently swallow). Setting copy in plain English, no
-       internal jargon. (Sub-point D2 decided by owner.)
+     - All-day events: the reminder fires on the DAY BEFORE the
+       event (fixed). Per event, the user ticks reminder on/off and
+       picks the exact time of day for that day-before moment
+       (e.g. 20:00) in the event dialog — NOT a global Options
+       setting (owner correction 2026-09-01). The picked time is
+       the base fire moment; relative minutes_before offsets
+       measure back from it. Edge case: all-day event created for
+       TODAY, after the day-before moment has already passed ->
+       fires immediately as a missed reminder on next rebuild (D1
+       policy: never silently swallow). No default time in v1:
+       reminder is opt-in per all-day event, user picks the time
+       when ticking it on.
 
 5.5  CLOCK JUMPS (DECIDED)
 
@@ -337,9 +339,10 @@ spirit): a lost notification loses nothing replicated.
   - Per-event snooze from the notification (OS action buttons) —
     future contract if the owner wants it; requires an interaction
     surface this contract deliberately avoids.
-  - Reminder settings UI (default minutes_before for new events,
-    all-day day-before time) — implemented as a DC-20 settings
-    amendment at implementation time, not a separate contract.
+  - Reminder settings UI (default minutes_before for new events) —
+    implemented as a DC-20 settings amendment at implementation
+    time, not a separate contract. (All-day day-before reminder
+    time is PER-EVENT per D2 — no global setting exists.)
   - Notification content beyond title+time (opt-in fields).
   - Non-Linux delivery specifics (DC-15 packaging scope).
 
@@ -350,11 +353,13 @@ spirit): a lost notification loses nothing replicated.
 D1. Missed-while-not-running policy: show-on-launch with
     missed-marking; discard once the event itself has ended.
     DECIDED by owner (2026-09-01) — recommendation (a) accepted.
-D2. All-day events: global owner-picked "day before" reminder
-    time (DC-20 setting, default 20:00 local); minutes_before
-    offsets measure from that base moment; today-created events
-    fall back to immediate missed-reminder. DECIDED by owner
-    (2026-09-01).
+D2. All-day events: reminder fires on the DAY BEFORE the event
+    (fixed); per event the user ticks it on and picks the exact
+    time in the event dialog (not a global Options setting);
+    minutes_before offsets measure from the picked moment;
+    today-created events fire immediately as missed reminders.
+    DECIDED by owner (2026-09-01, corrected: per-event, not
+    global).
 D3. Reminder representation is RELATIVE minutes_before; absolute
     times always derived locally. DECIDED (DC-07 constraint + §2.2).
 D4. Multiple reminders per event allowed. DECIDED (§2.3).
