@@ -159,10 +159,12 @@ Right-click opens the menu. Items, in order:
      (DC-09 amendment; DC-13 §3.5). A settings surface before the runtime
      wrapper exists would be UI for values nobody changes.
 
-6.2  When settings become necessary, they enter as a single "Settings"
-     submenu under §4's menu with EXACTLY the DC-09/DC-13 bounded fields —
-     never a free-form dialog — via an amendment to this contract. The
-     app-UI settings button remains FORBIDDEN by owner directive.
+6.2  (SUPERSEDED by DC-20, drafted 2026-08-31): settings enter as a
+     DEDICATED OPTIONS WINDOW (Outlook-style: left navigation pane +
+     right content), reachable ONLY from the tray menu "Options…" item —
+     never a free-form dialog inside the calendar webview, never a
+     toolbar button. The app-UI settings button remains FORBIDDEN by
+     owner directive (D1).
      -> DC-20 IS that amendment (drafted; pending owner approval).
 
 ==================================================
@@ -179,20 +181,31 @@ Right-click opens the menu. Items, in order:
 8. DECISIONS
 ==================================================
 
-D1 (DECIDED, owner directive 2026-08-30): No options/settings button in
-    the app UI; the tray context menu is the configuration surface for v1.
-D2 (DECIDED): Menu catalog v1 = Open Tide, Sync now, [Sync Errors],
-    Quit — order per §4. "Sync Errors" recommended, MAY be omitted.
+D1 (AMENDED, owner 2026-08-31): No options/settings button in the MAIN
+    calendar UI (toolbar). A dedicated Options WINDOW, reachable ONLY
+    from the tray context menu ("Options…" item), is the configuration
+    surface — see DC-20. The prohibition targets cluttering the calendar
+    toolbar; it does not forbid a separate settings window.
+D2 (AMENDED, owner 2026-08-31): Menu catalog = Open Tide, Sync now,
+    Options…, Quit — order per §4. ("Sync Errors" omitted per D6.)
+    "Options…" opens the DC-20 options window.
 D3 (DECIDED): Window close hides to tray; Quit is menu-only (§4.4) and
     performs a clean sidecar stdin-EOF shutdown.
 D4 (DECIDED): "Sync now" routes through the existing sync_now RPC with
     manualSyncBypassesBackoff = true; disabled while a session is in
     flight or no peers are paired.
-D5 (DECIDED): No settings submenu in v1 (§6.1); any future settings enter
-    as a bounded tray submenu via amendment, never an app-UI button (D1).
+D5 (SUPERSEDED by DC-20): tray-submenu stepping replaced by the DC-20
+    dedicated options window (Outlook-style: left navigation pane +
+    right content). Still true: no settings entry in the calendar
+    toolbar.
 D6 (DECIDED, owner 2026-08-31): NO "Sync Errors" menu item in v1 (§4.3).
     Error surfacing deferred to TD-010 (tray ERROR-PRESENT marker).
 D7 (DECIDED, owner 2026-08-31): v1 tray states = IDLE + SYNCING only. The
     ERROR-PRESENT marker (§3.3) is deferred to TD-010.
+D9 (DECIDED, owner 2026-08-31): The options window is a SEPARATE window
+    (not a dialog inside the calendar webview), NOT reachable from the
+    calendar UI — tray menu only. Layout is Outlook-style: persistent
+    left navigation pane (category tabs) + right content pane, sized for
+    growth as settings accumulate.
 D8 (OPEN, implementation detail, non-blocking): polling cadence for the
     SYNCING state (§3.2).
