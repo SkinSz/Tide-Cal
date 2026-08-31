@@ -2,6 +2,7 @@
 import type { CalendarEvent } from "./store.ts";
 import { listEvents, listSeries, updateEvent, deleteEvent, type SeriesRow } from "./store.ts";
 import { recurrenceBadge, type SeriesInfo } from "./recurrence.ts";
+import { formatTimeLabel, getTimeFormat } from "./theme.ts";
 
 export type ViewMode = "month" | "week";
 
@@ -42,10 +43,11 @@ function sameDay(a: Date, b: Date): boolean {
 }
 
 function fmtTime(ms: number): string {
-  return new Date(ms).toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+  // Calendar chips follow the General time-format setting (the grid itself
+  // is and stays 24h; this is the visible "9:00 AM" / "09:00" label).
+  const d = new Date(ms);
+  const hhmm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  return formatTimeLabel(hhmm, getTimeFormat());
 }
 
 const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
