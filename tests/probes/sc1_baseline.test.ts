@@ -12,6 +12,7 @@ import {
   dumpState,
   saveResult,
   type Device,
+  guardProcess,
 } from "./sync_probe_helpers.ts";
 
 function mkEvent(d: Device, title: string) {
@@ -24,6 +25,8 @@ function mkEvent(d: Device, title: string) {
     allDay: false,
   });
 }
+
+guardProcess();
 
 test("SC1 baseline: A creates 5 events, bidirectional sessions converge A<->B", async () => {
   const a = makeDevice("A");

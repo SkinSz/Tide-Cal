@@ -3,7 +3,9 @@
 //    unresolved conflict rows on EVERY device (DC-03 §3.4), not silent loss.
 // 2) Backup-restore attack on neededRanges self-exclusion (see test 2 below).
 import { expect, test } from "vitest";
-import { makeDevice, pairDevices, sessionOnce } from "./sync_probe_helpers.ts";
+import { makeDevice, pairDevices, sessionOnce,
+  guardProcess,
+} from "./sync_probe_helpers.ts";
 function mkEvent(d: any, title: string) {
   const t = Date.now();
   return d.core.createEvent({ title, description: "c", startMs: t, endMs: t + 3600000, allDay: false });
@@ -15,6 +17,8 @@ function conflictsFor(db: any, entityId: string) {
     .prepare("SELECT conflict_id, entity_id, field_path, status FROM conflicts WHERE entity_id = ?")
     .all(entityId);
 }
+
+guardProcess();
 
 test("SC8 delete-vs-edit: divergence backed by unresolved conflict rows on all devices", async () => {
   const a = makeDevice("HUB");

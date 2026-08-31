@@ -3,6 +3,7 @@
 // not causal-AFTER), 3.3 conflicting set empty (not concurrent) → "apply C
 // normally". Characterize actual behavior.
 import { describe, expect, test, afterEach } from "vitest";
+import { guardProcess } from "./sync_probe_helpers.ts";
 import {
   makeDevice,
   closeDevices,
@@ -31,6 +32,8 @@ function deliver(dst: Device, src: Device, changeId: string): string {
   };
   return applyRemoteChange(dst.db, record, loadKnowledgeFromDb(dst.db), makeEntityMutator());
 }
+
+guardProcess();
 
 test("P10: causal-before (stale) differing delivery — contract says apply; document actual result", async () => {
   const a = makeDevice("a");

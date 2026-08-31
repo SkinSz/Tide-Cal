@@ -254,3 +254,40 @@ stable, blind final verification PASS WITH CONCERNS with zero new issues).
 - **Status:** OPEN (created 2026-09-01, blind adversarial review F3/F4/F5 — sync reviewer)
 - **Details:** stash is pre-existing, not introduced by c088023; pump leak is one closure per session; stale-ACK frontier is safe under max-merge. Fix opportunistically in the next sync package (TD-017/018 wave).
 - **Trigger:** with TD-017/TD-018.
+
+
+## TD-020 — c088023 session-end barrier regresses 4 suite tests (blind review follow-up + full-suite run)
+- **ID:** TD-020
+- **Title:** DC-08 barrier change causes revocation-queue non-drain (TRP-1/TRP-4b) and serve/barrier hangs under in-memory transports (Pkg5b, DC-09 gap rounds)
+- **Priority:** 9/10 — CRITICAL/BLOCKING (master suite is red: 681 passed / 4 failed of 685)
+- **Status:** OPEN (created 2026-09-01; owner instruction: substantial → debt, no improvisation)
+- **Evidence (full-suite run 2026-09-01, /tmp/full-suite3.log):**
+  - `tests/revocation_propagation.test.ts` TRP-1 + TRP-4b (DETERMINISTIC, also fails file-alone):
+    `expect(a.queue.queue(b.id)).toHaveLength(0)` got 1 — B's REVOCATIONS_ACK arrives while A has
+    already exited the barrier on B's CHANGES_ACK (barrier-exit cuts sibling ack handling),
+    so A never records the ack and the revocation re-sends next session.
+  - `tests/pkg5b_snapshot_conflicts.test.ts` "genuinely gapped peer..." — timeout at 5000ms test bound.
+  - `tests/full_state_triggers.test.ts` "gap rounds -> exactly one offer..." — `SyncIdleTimeoutError:
+    no message for 15000ms in serve/barrier` (engine.ts:379 via receiveIdleBounded). Both are
+    barrier-wait geometry with the test msgPipePair transports; in-memory pipes only deliver EOF
+    if a side calls close(), and runSession never closes the transport — a side that exits its
+    barrier leaves the peer's receiveIdleBounded parked for the full idle bound.
+  - Suite totals: 3 files failed / 68 passed, 4 tests failed / 681 passed (685).
+  - Corroborating: blind reviewer F2 (sync) predicted exactly this class — barrier semantics
+    deviate from DC-08 §3.4 and "records applied during barrier mode are never ACKed".
+- **Why the release gate missed it:** the three-device harness (real TCP) passes 7/7 — real
+  transports propagate FIN as EOF, so barrier waits terminate quickly. The regression only
+  surfaces under in-memory transports without close propagation + ack-ordering geometry.
+- **Fix direction (one package, must precede release):**
+  1. Amend the barrier per reviewer F2: on peer CHANGES_ACK, drain remaining queued messages
+     (bounded) instead of returning immediately, so sibling acks (REVOCATIONS_ACK) and
+     late batches are processed; consider DC-08 v2 amendment formalizing barrier semantics.
+  2. Give SyncTransport a close() (or have runSession signal end-of-session) so in-memory AND
+     real transports deliver deterministic EOF at session end instead of relying on the 15s
+     idle bound.
+  3. Tests FIRST: revive the 4 failing tests as the regression proof; each must fail on
+     current code and pass after.
+- **Constraint:** no timeout changes (agent rule 2); no weakening; INVARIANT 14 (safe under
+  duplicated/reordered comms) must hold for the amended barrier.
+- **Trigger:** IMMEDIATELY — blocks TD-012 closure and any further sync-layer work.
+

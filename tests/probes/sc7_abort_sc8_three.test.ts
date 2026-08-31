@@ -16,12 +16,15 @@ import {
   dumpState,
   saveResult,
   type Device,
+  guardProcess,
 } from "./sync_probe_helpers.ts";
 
 function mkEvent(d: Device, title: string) {
   const t = Date.now();
   return d.core.createEvent({ title, description: "c", startMs: t, endMs: t + 3600_000, allDay: false });
 }
+
+guardProcess();
 
 test("SC7 abrupt abort mid-session x5 + restart: converge, no duplication", async () => {
   const runs: unknown[] = [];

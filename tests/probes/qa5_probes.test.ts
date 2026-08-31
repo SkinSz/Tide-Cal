@@ -7,6 +7,7 @@
 // Probes only; not part of the remediation suite. Imports production code
 // read-only; devices use their own temp dirs (no ports).
 import { describe, expect, test, afterEach } from "vitest";
+import { guardProcess } from "./sync_probe_helpers.ts";
 import {
   makeDevice,
   restartDevice,
@@ -91,6 +92,8 @@ function seedShared(a: Device, peers: Device[]): string {
 }
 
 // ---------------------------------------------------------------- P1 boundary
+guardProcess();
+
 describe("P1 boundary: incoming equals local (no row) vs differs (row)", () => {
   test("equal-to-row concurrent record → noop, zero rows; differing → one row", async () => {
     const a = makeDevice("a");

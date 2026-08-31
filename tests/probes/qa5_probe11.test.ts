@@ -8,6 +8,7 @@
 // tech debt / candidate DC-02/DC-03 clarification. This test PINS the
 // contract-literal behavior so any silent change to it is caught.
 import { describe, expect, test, afterEach } from "vitest";
+import { guardProcess } from "./sync_probe_helpers.ts";
 import { makeDevice, closeDevices, convergeRound, type Device } from "../pkg1_helpers.ts";
 import { makeEntityMutator } from "../../src/persistence/bridges/sync_service.ts";
 import { applyRemoteChange, loadKnowledgeFromDb } from "../../src/persistence/database.ts";
@@ -31,6 +32,8 @@ function deliver(dst: Device, src: Device, changeId: string): string {
   };
   return applyRemoteChange(dst.db, record, loadKnowledgeFromDb(dst.db), makeEntityMutator());
 }
+
+guardProcess();
 
 test("P11: causal-before record drained from gap — stale value vs newer local row", async () => {
   const a = makeDevice("a");
