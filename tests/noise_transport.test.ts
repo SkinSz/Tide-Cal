@@ -17,10 +17,13 @@ import {
   wrapWithEncryption,
   deriveSessionKeys,
   generateNoiseStaticKeypair,
+  handshakeOverTransport,
+  NoiseSessionTransport,
   ed25519ToX25519PrivateKey,
   ed25519ToX25519PublicKey,
   noiseStaticsFromIdentity,
   SessionError,
+  type FramedByteTransport,
 } from "../src/network/noise_transport.ts";
 import {
   createSyncEngine,
@@ -68,6 +71,80 @@ async function expectSessionError(p: Promise<unknown>): Promise<SessionError> {
 }
 
 describe("DC-05 §6: Noise encrypted transport", () => {
+  // Regression (root-cause doc 2026-08-31, amplifier defect): a peer FIN on
+  // the TCP carrier must propagate as a clean EOF (null receive) through the
+  // carrier→inbound feed loop, not leave the session's receive pending forever.
+  class MemCarrier implements FramedByteTransport {
+    private q: Uint8Array[] = [];
+    private waiter: ((f: Uint8Array | null) => void) | null = null;
+    private closed = false;
+    peer: MemCarrier | null = null;
+    async send(frame: Uint8Array): Promise<void> {
+      if (this.peer && !this.peer.closed) this.peer.deliver(frame);
+    }
+    deliver(frame: Uint8Array): void {
+      if (this.waiter) {
+        const w = this.waiter;
+        this.waiter = null;
+        w(frame);
+      } else {
+        this.q.push(frame);
+      }
+    }
+    async receive(): Promise<Uint8Array | null> {
+      const next = this.q.shift();
+      if (next !== undefined) return next;
+      if (this.closed) return null;
+      return new Promise((resolve) => {
+        this.waiter = resolve;
+      });
+    }
+    close(): void {
+      this.closed = true;
+      const w = this.waiter;
+      this.waiter = null;
+      if (w) w(null);
+    }
+  }
+
+  test("peer FIN on the carrier propagates as clean EOF to session receive()", async () => {
+    const { generateIdentity } = await import("../src/security/identity.ts");
+    const identA = generateIdentity();
+    const identB = generateIdentity();
+
+    const ca = new MemCarrier();
+    const cb = new MemCarrier();
+    ca.peer = cb;
+    cb.peer = ca;
+
+    const [hA, hB] = await Promise.all([
+      handshakeOverTransport("initiator", ca, identA.privateKey),
+      handshakeOverTransport("responder", cb, identB.privateKey),
+    ]);
+    const tA = new NoiseSessionTransport(
+      hA.sendCipher, hA.receiveCipher, hA.handshakeHash(), hA.remoteStaticKey(),
+      hA.inbound, hA.outbound, "initiator",
+    );
+    const tB = new NoiseSessionTransport(
+      hB.sendCipher, hB.receiveCipher, hB.handshakeHash(), hB.remoteStaticKey(),
+      hB.inbound, hB.outbound, "responder",
+    );
+
+    // Traffic flows normally over the carrier first.
+    await tA.send(hello({ n: 1 }));
+    expect(await tB.receive()).toEqual(hello({ n: 1 }));
+
+    // B parks on receive(); then A closes the connection — the FIN arrives on
+    // B's local carrier (cb), which is what B's feed loop reads from.
+    const pending = tB.receive();
+    ca.close();
+    cb.close();
+    // Clean EOF — NOT a hang and NOT a crypto failure.
+    await expect(pending).resolves.toBeNull();
+    // EOF is sticky: a receive after the close resolves null immediately.
+    await expect(tB.receive()).resolves.toBeNull();
+  });
+
   test("duplex pair round-trips SyncMessage JSON through encrypt/decrypt", async () => {
     const [a, b] = await makeLocalDuplexPair();
 

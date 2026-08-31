@@ -602,10 +602,14 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
       }
     }
 
-    // --- serve the peer's pull ---
-    await serveRequests(nextMessage(transport), transport, peerHello.device_clock, stats);
-
     // --- ACK our applied frontier ---
+    // DC-08 amendment (root-cause doc 2026-08-31): CHANGES_ACK is the
+    // BIDIRECTIONAL SESSION-END BARRIER. Each side sends its own ACK
+    // immediately after its pull completes, then keeps serving until it
+    // receives the peer's ACK (or a clean EOF). This joins the two engine
+    // runs' lifetimes: a responder with nothing to pull can no longer tear
+    // down the shared session inside the initiator's HELLO/pull setup
+    // window, because it still owes the session its post-ACK serve phase.
     const ack: SyncMessage = {
       v: 1,
       type: "CHANGES_ACK",
@@ -613,6 +617,9 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     };
     await transport.send(ack);
     stats.sent++;
+
+    // --- serve the peer's pull until the peer's session-end ACK / EOF ---
+    await serveRequests(nextMessage(transport), transport, peerHello.device_clock, stats, 2, true);
 
     return stats;
   }
@@ -624,11 +631,24 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     stats: SessionStats,
     /** stop when the queue is quiet for this many poll ticks */
     quietTicks = 2,
+    /**
+     * DC-08 amendment (root-cause doc 2026-08-31): session-end barrier mode.
+     * Our own CHANGES_ACK has already been sent; keep serving the peer's
+     * pull until (a) the peer's CHANGES_ACK arrives — the joint terminator,
+     * or (b) a clean EOF (peer closed). Uses the Pkg4 idle bound so a peer
+     * that neither ACKs nor closes still terminates deterministically
+     * (SyncIdleTimeoutError) instead of hanging. No timeout value is
+     * changed: the barrier reuses SYNC_IDLE_TIMEOUT_MS as designed.
+     */
+    untilPeerAck = false,
   ): Promise<void> {
     let quiet = 0;
     while (quiet < quietTicks) {
-      const msg = await receiveWithTimeout(() => nextMessage(transport), 5);
+      const msg = untilPeerAck
+        ? await receiveIdleBounded(() => nextMessage(transport), "serve/barrier")
+        : await receiveWithTimeout(() => nextMessage(transport), 5);
       if (msg === null) {
+        if (untilPeerAck) return; // clean EOF: peer closed after its ACK
         quiet++;
         continue;
       }
@@ -656,6 +676,7 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
         applyIncomingSnapshot(msg, stats);
       } else if (msg.type === "CHANGES_ACK") {
         mergeAckIntoLastKnownClock(msg.applied_upto);
+        if (untilPeerAck) return; // joint session-end barrier satisfied
       } else if (msg.type === "HELLO") {
         advancePeerKnowledge(msg.device_clock);
       } else if (msg.type === "REVOCATION_RECORDS") {

@@ -603,14 +603,24 @@ export async function handshakeOverTransport(
   });
 
   // Carrier -> inbound feed for the lifetime of the connection.
+  // DC-08 root-cause fix (doc 2026-08-31, amplifier defect): when the carrier
+  // returns null (peer FIN from sock.end()) or the feed loop throws (carrier
+  // died), the inbound FrameQueue MUST be closed so a pending/receive resolves
+  // as clean EOF (null). Previously the loop just broke, leaving waiters
+  // pending forever — the engine's clean-EOF handling was unreachable and the
+  // session hung until the idle bound fired.
   void (async () => {
-    for (;;) {
-      const frame = await inner.receive();
-      if (frame === null) break;
-      inbound.push(frame);
+    try {
+      for (;;) {
+        const frame = await inner.receive();
+        if (frame === null) break; // peer FIN
+        inbound.push(frame);
+      }
+    } finally {
+      inbound.close(); // propagate EOF to pending receives (idempotent)
     }
   })().catch(() => {
-    /* carrier died; pending reads will reject/close */
+    /* carrier died; inbound already closed above */
   });
 
   const fakeQueue = { push: pushOut } as unknown as FrameQueue;

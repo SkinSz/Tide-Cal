@@ -416,28 +416,22 @@ async function updEvent(dev, expected, id, title, dayOffset, hour) {
 /**
  * Drive the hub topology (B<->A<->C, plus D if present) with alternating
  * directions and oracle-checked rounds until `isDone(actualByDevice)` holds
- * or rounds are exhausted. Every session is a REAL production DC-08 session;
- * per-session errors are tolerated (recorded) and the oracle decides —
- * per DC-08 §4 the initiator's resolution does not imply the responder
- * finished, and a timed-out session may still have transferred data via the
- * responder's independent pull.
+ * or rounds are exhausted. Every session is a REAL production DC-08 session.
+ * Root-cause remediation (2026-08-31): per-session errors are NO LONGER
+ * tolerated — any session error fails the scenario (release gate).
  */
 async function driveToConvergence(a, b, c, isDone, sessionLog, extraDevice) {
   const devices = extraDevice ? [a, b, c, extraDevice] : [a, b, c];
   const peers = extraDevice ? [[b, a], [c, a], [extraDevice, a]] : [[b, a], [c, a]];
   for (let round = 1; round <= CONVERGE_MAX_ROUNDS; round++) {
     for (const [from, to] of peers) {
-      try {
-        sessionLog.push(await syncNow(from, to));
-      } catch (e) {
-        sessionLog.push({ from: from.name, to: to.name, error: String(e.message ?? e), noise_transport: false });
-      }
+      // Root-cause remediation (2026-08-31): the harness is the release gate —
+      // ANY session error is now fatal, no longer tolerated-and-recorded.
+      // The engine's session-end barrier plus carrier EOF propagation make
+      // session errors a real protocol failure, not a masked race.
+      sessionLog.push(await syncAttempt(from, to, false));
       await pace();
-      try {
-        sessionLog.push(await syncNow(to, from));
-      } catch (e) {
-        sessionLog.push({ from: to.name, to: from.name, error: String(e.message ?? e), noise_transport: false });
-      }
+      sessionLog.push(await syncAttempt(to, from, false));
       await pace();
     }
     for (const d of devices) d._lastListEvents = await readEvents(d);
@@ -675,6 +669,39 @@ SCENARIOS.fresh_peer = async (rec, portBase) => {
   rec.result = verifyDevices([a, b, c, d4], expected);
   rec.pass = rec.result.ok && drive.converged;
   if (!rec.pass) rec.error = rec.result.detail.join(" | ") || "not converged within rounds";
+};
+
+SCENARIOS.stall_repro = async (rec, portBase) => {
+  // Root-cause pin (docs/qa/three-device-harness-sync-stall-ROOT-CAUSE.md):
+  // initiator with pending ranges + responder with empty neededRanges must
+  // converge in a SINGLE session with ZERO session errors. This is the exact
+  // deterministic condition that stalled pre-fix (responder closed inside the
+  // initiator's HELLO/pull setup window).
+  const [a, b, c] = await spawnAndPair(rec, portBase, 3);
+  const expected = new ExpectedState();
+  rec.expected_note =
+    "responder (A) has empty neededRanges while initiator (B) still has pending ranges — one B→A session must carry B's pending pull and end cleanly";
+
+  await mkEvent(b, expected, "from-B", 1, 10);
+  rec.sync_sessions = [];
+  rec.sync_sessions.push(await syncAttempt(b, a, false)); // A pulls from-B; A now fully up to date with B
+  await mkEvent(a, expected, "from-A", 1, 9); // A gains data B lacks
+
+  // Single session, B as initiator: B has pending ranges (from-A), responder
+  // A has empty neededRanges (it already holds everything B has).
+  const s = await syncAttempt(b, a, false);
+  rec.sync_sessions.push(s);
+
+  rec.expected_events = expected.array();
+  a._lastListEvents = await readEvents(a);
+  b._lastListEvents = await readEvents(b);
+  rec.result = verifyDevices([a, b], expected);
+  rec.pass = rec.result.ok && !s.error;
+  if (!rec.pass) {
+    rec.error =
+      rec.result.detail.join(" | ") ||
+      (s.error ? `session error: ${s.error}` : "did not converge in a single session");
+  }
 };
 
 // --- report formatting -------------------------------------------------------
