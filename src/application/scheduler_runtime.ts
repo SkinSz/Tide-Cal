@@ -245,6 +245,13 @@ export interface SchedulerRuntimeHandle {
   manualSyncNow(): void;
   onLocalChange(): void;
   stop(): void;
+  /**
+   * DC-20 §7.1 live-apply: clamp+apply partial scheduler settings. The
+   * runtime restarts its timers so the new intervals take effect without
+   * an app restart (in-flight sessions are unaffected). Clamped to DC-13
+   * §3.5 bounds by Scheduler.updateSettings.
+   */
+  updateSchedulerSettings(partial: Partial<SchedulerSettings>): void;
 }
 
 /**
@@ -269,5 +276,19 @@ export function startSchedulerRuntime(deps: {
     manualSyncNow: () => runtime.manualSyncNow(),
     onLocalChange: () => runtime.onLocalChange(),
     stop: () => runtime.stop(),
+    // DC-20 §7.1: live-apply — stop (clears timers), update the Scheduler's
+    // clamped settings, restart (rebuilds the sweep interval timer; the
+    // debounce timer is only armed by the next local change). In-flight
+    // sessions are unaffected (beginSession/endSession bookkeeping lives in
+    // the Scheduler, not the timers).
+    updateSchedulerSettings: (partial) => {
+      runtime.stop();
+      scheduler.updateSettings(partial);
+      runtime.start();
+      const s = scheduler.getSettings();
+      deps.log?.(
+        `settings live-applied (debounce=${s.debounceSeconds}s, sweep=${s.sweepMinutes}min, maxConcurrent=${s.maxConcurrentSessions})`,
+      );
+    },
   };
 }

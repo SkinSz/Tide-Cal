@@ -879,8 +879,33 @@ function main(): void {
   const sync = new SyncManager(core, syncIdentity);
   const dispatch = makeDispatcher(core);
   const syncDispatch = makeSyncDispatcher(sync, core);
+  // DC-20: the scheduler runtime handle is registered when main() wires the
+  // runtime (below); update_settings live-applies S1-S3 through it.
+  let schedulerHandle: ReturnType<typeof startSchedulerRuntime> | null = null;
   const combined: Dispatcher = (op, args) =>
-    op.startsWith("sync_") || op === "device_info" ||
+    op === "update_settings"
+      ? (() => {
+          // DC-20 §7.1: live-apply scheduler settings (S1-S3). The Rust
+          // shell has already persisted config.toml and clamped; clamp
+          // again here (defence in depth) via Scheduler.updateSettings.
+          if (schedulerHandle === null) {
+            throw new Error("scheduler runtime not started");
+          }
+          const partial: Record<string, number> = {};
+          for (const key of [
+            "sync_debounce_seconds",
+            "sweep_interval_minutes",
+            "max_concurrent_sessions",
+          ] as const) {
+            const v = (args as Record<string, unknown>)[key];
+            if (typeof v === "number" && Number.isFinite(v)) {
+              partial[key] = v;
+            }
+          }
+          schedulerHandle.updateSchedulerSettings(partial);
+          return { applied: true, next_start_only: "max_incremental_backlog" };
+        })()
+      : op.startsWith("sync_") || op === "device_info" ||
     op === "pairing_offer" || op === "pairing_accept" ||
     op === "cancel_pairing_offer" ||
     op === "list_quarantine" || op === "quarantine_stats" ||
@@ -904,7 +929,7 @@ function main(): void {
   // sidecar, so every peer starts endpoint-less and is skipped with a log
   // line — automatic sessions begin once DC-11 endpoints arrive. Manual
   // sync_now (tray/toolbar) is unaffected: it takes its endpoint explicitly.
-  startSchedulerRuntime({
+  const schedulerRuntime = startSchedulerRuntime({
     now: () => Date.now(),
     listPeers: () =>
       listTrustedPeers(core.db).map((p) => ({
@@ -917,6 +942,10 @@ function main(): void {
     }),
     log: (m: string) => console.error(`[tide] ${m}`),
   });
+  // DC-20 §7.1: register the runtime handle so the update_settings op
+  // (Rust shell, after an options-window Save) can live-apply S1-S3
+  // without a restart.
+  schedulerHandle = schedulerRuntime;
   rl.on("close", () => {
     // Parent GUI closed our stdin — it is dead or dying (hard kill included:
     // no Rust Drop runs there, but the pipe still EOFs). Close the sync

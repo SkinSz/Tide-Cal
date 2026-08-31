@@ -110,6 +110,13 @@ impl Sidecar {
     pub fn ping(&self) -> Result<Value, String> {
         self.call("ping", json!({}))
     }
+
+    /// DC-20 §7.1 live-apply: push new scheduler settings to the sidecar.
+    /// Fire-and-forget from the caller's perspective (errors logged there);
+    /// the sidecar's update_settings op applies them to its scheduler runtime.
+    pub fn notify_settings(&self, settings: Value) -> Result<(), String> {
+        self.call("update_settings", settings).map(|_| ())
+    }
 }
 
 impl Drop for Sidecar {

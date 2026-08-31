@@ -20,6 +20,15 @@
 //   §3    tray states v1 = IDLE + SYNCING (D7). This build ships the
 //         in-flight tracking + tooltip state; the IDLE/SYNCING icon bitmap
 //         swap is deferred (single icon asset) — see report, D8.
+//
+// DC-20 (options window, APPROVED 2026-08-31):
+//   D9    the options window is a SEPARATE window reachable ONLY from the
+//         tray menu "Options…" item — never from the calendar UI.
+//   §4.2  Save-all atomic commit: set_settings validates/clamps in Rust too
+//         (defence in depth), persists to config.toml, returns the effective
+//         values; get_settings returns the effective (env>file>default).
+//   §6    persistence = ~/.config/tide/config.toml (DC-15 §3.2 layout),
+//         fail-open on malformed files (defaults), env vars win.
 
 mod sidecar;
 
@@ -62,6 +71,136 @@ struct SyncFlight(AtomicBool);
 
 /// Tray "Sync now" menu item handle, so the shell can grey it during flight.
 struct TraySyncItem(Mutex<Option<MenuItem<tauri::Wry>>>);
+
+// ---------------------------------------------------------------------------
+// DC-20 settings: persistence in ~/.config/tide/config.toml (DC-15 §3.2
+// layout; non-secret only), env-var-wins precedence, fail-open on malformed
+// files. S1-S4 per DC-20 §5.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TideSettings {
+    sync_debounce_seconds: f64,
+    sweep_interval_minutes: f64,
+    max_concurrent_sessions: f64,
+    max_incremental_backlog: f64,
+}
+
+impl Default for TideSettings {
+    fn default() -> Self {
+        // DC-13 §3.5 + DC-09 defaults (owner-tuned).
+        Self {
+            sync_debounce_seconds: 10.0,
+            sweep_interval_minutes: 10.0,
+            max_concurrent_sessions: 3.0,
+            max_incremental_backlog: 1000.0,
+        }
+    }
+}
+
+/// Clamp to the contract bounds (DC-13 §3.5 / DC-09). Defence in depth:
+/// the options window clamps too, but a hand-edited config.toml must not
+/// poison the scheduler.
+impl TideSettings {
+    fn clamped(mut self) -> Self {
+        self.sync_debounce_seconds = self.sync_debounce_seconds.clamp(5.0, 120.0);
+        self.sweep_interval_minutes = self.sweep_interval_minutes.clamp(1.0, 1440.0);
+        self.max_concurrent_sessions = self.max_concurrent_sessions.clamp(1.0, 5.0);
+        self.max_incremental_backlog =
+            self.max_incremental_backlog.clamp(100.0, 100_000.0);
+        self
+    }
+}
+
+fn config_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    // DC-15 §3.2: $XDG_CONFIG_HOME/tide/ (~/.config/tide/). Tauri's
+    // app_config_dir resolves the same location per the XDG spec.
+    app.path()
+        .app_config_dir()
+        .map_err(|e| format!("config dir: {e}"))
+}
+
+fn config_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    Ok(config_dir(app)?.join("config.toml"))
+}
+
+/// Precedence per DC-15 §3.2: env var > config.toml > built-in default.
+/// (Env names mirror the TIDE_* convention; unset env leaves the file value.)
+fn apply_env_overrides(mut s: TideSettings) -> TideSettings {
+    let env_num = |key: &str| -> Option<f64> {
+        std::env::var(key).ok().and_then(|v| v.trim().parse::<f64>().ok())
+    };
+    if let Some(v) = env_num("TIDE_SYNC_DEBOUNCE_SECONDS") {
+        s.sync_debounce_seconds = v;
+    }
+    if let Some(v) = env_num("TIDE_SWEEP_MINUTES") {
+        s.sweep_interval_minutes = v;
+    }
+    if let Some(v) = env_num("TIDE_MAX_CONCURRENT_SESSIONS") {
+        s.max_concurrent_sessions = v;
+    }
+    if let Some(v) = env_num("TIDE_MAX_INCREMENTAL_BACKLOG") {
+        s.max_incremental_backlog = v;
+    }
+    s.clamped()
+}
+
+fn load_settings(app: &tauri::AppHandle) -> TideSettings {
+    let from_file = config_path(app)
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|text| toml::from_str::<TideSettings>(&text).ok()); // fail-open (§6.2)
+    apply_env_overrides(from_file.unwrap_or_default())
+}
+
+fn persist_settings(app: &tauri::AppHandle, s: &TideSettings) -> Result<(), String> {
+    let path = config_path(app)?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| "config path has no parent".to_string())?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("create config dir: {e}"))?;
+    let text = toml::to_string_pretty(s).map_err(|e| format!("toml serialize: {e}"))?;
+    std::fs::write(&path, text).map_err(|e| format!("write config: {e}"))
+}
+
+/// DC-20 §4.2: read the effective settings (env > file > default).
+#[tauri::command]
+fn get_settings(app: tauri::AppHandle) -> Result<TideSettings, String> {
+    Ok(load_settings(&app))
+}
+
+/// DC-20 §4.2/§4.3: Save-all atomic commit. Clamps in Rust (defence in
+/// depth; the options window clamps too), persists atomically (write temp +
+/// rename), then returns the effective values. Live-apply to the sidecar's
+/// scheduler runtime rides the NEXT settings read by the runtime (S1-S3 are
+/// read per decision pass through the scheduler's updateSettings; S4 is
+/// next-start per DC-20 §7.2). The sidecar is notified so its scheduler
+/// runtime re-reads immediately (live-apply for S1-S3).
+#[tauri::command]
+async fn set_settings(
+    app: tauri::AppHandle,
+    sc: tauri::State<'_, SidecarState>,
+    settings: TideSettings,
+) -> Result<TideSettings, String> {
+    let clamped = settings.clamped();
+    persist_settings(&app, &clamped)?;
+    // Live-apply (DC-20 §7.1): notify the sidecar so its scheduler runtime
+    // updateSettings() runs immediately (S1-S3). S4 is next-start (§7.2).
+    if let Ok(handle) = sidecar_handle(&sc) {
+        let args = json!({
+            "sync_debounce_seconds": clamped.sync_debounce_seconds,
+            "sweep_interval_minutes": clamped.sweep_interval_minutes,
+            "max_concurrent_sessions": clamped.max_concurrent_sessions,
+        });
+        let h = handle.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            if let Err(e) = h.notify_settings(args) {
+                log::warn!("settings live-apply notify failed: {e}");
+            }
+        });
+    }
+    Ok(clamped)
+}
 
 // ---------------------------------------------------------------------------
 // IPC commands (proxy to the sidecar)
@@ -138,7 +277,7 @@ async fn sync_op(
     op: String,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    const ALLOWED: [&str; 18] = [
+    const ALLOWED: [&str; 19] = [
         "device_info",
         "pairing_offer",
         "pairing_accept",
@@ -161,6 +300,9 @@ async fn sync_op(
         // DC-14 §4.3 write path: conflict resolution actions.
         "resolve_conflict",
         "skip_conflict",
+        // DC-20 §7.1 live-apply: options-window Save pushes scheduler
+        // settings to the already-running scheduler runtime.
+        "update_settings",
     ];
     if !ALLOWED.contains(&op.as_str()) {
         return Err(format!("op not allowed over this command: {op}"));
@@ -339,7 +481,7 @@ fn resolve_sidecar_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     dev.is_file().then_some(dev)
 }
 
-/// DC-19 §4: tray icon + context menu [Open Tide, Sync now, Quit].
+/// DC-19 §4: tray icon + context menu [Open Tide, Sync now, Options…, Quit].
 /// Returns Err when the desktop has no StatusNotifier/AppIndicator support —
 /// the caller degrades to a windowed app (§2.3).
 fn build_tray(app: &tauri::AppHandle) -> Result<(), String> {
@@ -349,12 +491,19 @@ fn build_tray(app: &tauri::AppHandle) -> Result<(), String> {
     // no-peers-paired disable is enforced in trigger_sync_now (§4.2).
     let sync_item = MenuItem::with_id(app, "sync-now", "Sync now", true, None::<&str>)
         .map_err(|e| format!("menu item: {e}"))?;
+    // DC-20: "Options…" opens the dedicated options window (D9: tray-only
+    // reachability, never from the calendar UI).
+    let options_item = MenuItem::with_id(app, "options", "Options…", true, None::<&str>)
+        .map_err(|e| format!("menu item: {e}"))?;
     let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)
         .map_err(|e| format!("menu item: {e}"))?;
     // §4.5: at most one separator between the functional group and Quit.
     let separator = PredefinedMenuItem::separator(app).map_err(|e| format!("separator: {e}"))?;
-    let menu = Menu::with_items(app, &[&open_item, &sync_item, &separator, &quit_item])
-        .map_err(|e| format!("tray menu: {e}"))?;
+    let menu = Menu::with_items(
+        app,
+        &[&open_item, &sync_item, &options_item, &separator, &quit_item],
+    )
+    .map_err(|e| format!("tray menu: {e}"))?;
 
     let icon = app
         .default_window_icon()
@@ -380,6 +529,7 @@ fn build_tray(app: &tauri::AppHandle) -> Result<(), String> {
                     log::info!("Sync now skipped: {e}");
                 }
             }
+            "options" => open_options_window(app),
             "quit" => quit_app(app),
             _ => {}
         })
@@ -388,6 +538,29 @@ fn build_tray(app: &tauri::AppHandle) -> Result<(), String> {
 
     app.manage(TraySyncItem(Mutex::new(Some(sync_item))));
     Ok(())
+}
+
+/// DC-20 §2: open (or focus) the dedicated options window. Created on demand
+/// (D7: no always-resident webview); at most one instance (§2.3); closing it
+/// never touches the app or sidecar.
+fn open_options_window(app: &tauri::AppHandle) {
+    if let Some(win) = app.get_webview_window("options") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+        return;
+    }
+    let url = tauri::WebviewUrl::App("options.html".into());
+    let window = tauri::WebviewWindowBuilder::new(app, "options", url)
+        .title("Tide — Options")
+        .inner_size(720.0, 520.0)
+        .min_inner_size(600.0, 420.0)
+        .resizable(true)
+        .build()
+        .map_err(|e| format!("options window: {e}"));
+    if let Err(e) = window {
+        log::error!("failed to open options window: {e}");
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -481,7 +654,9 @@ pub fn run() {
             update_event,
             delete_event,
             manual_sync_now,
-            quit_tide
+            quit_tide,
+            get_settings,
+            set_settings
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

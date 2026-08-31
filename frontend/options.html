@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Tide — Options</title>
+    <link rel="icon" type="image/png" sizes="32x32" href="./assets/tide-icon-32.png" />
+    <link rel="stylesheet" href="./style.css" />
+    <link rel="stylesheet" href="./options.css" />
+  </head>
+  <body class="options-body">
+    <div class="options-layout">
+      <!-- DC-20 §3.1: persistent left navigation pane -->
+      <nav class="options-nav" aria-label="Settings categories">
+        <h1 class="options-title">Tide Options</h1>
+        <button class="options-nav-item active" data-category="sync" type="button">Sync</button>
+        <button class="options-nav-item" data-category="general" type="button">General</button>
+      </nav>
+      <!-- DC-20 §3.1: right content pane (swaps per nav selection) -->
+      <main class="options-content" id="options-content">
+        <section class="options-category" data-category-content="sync">
+          <h2>Sync</h2>
+          <p class="muted">
+            Tuning for how Tide syncs with paired devices. All values are
+            clamped to their contract bounds (DC-13 §3.5, DC-09) when saved.
+          </p>
+          <label class="opt-field">
+            <span class="opt-label">Sync debounce (seconds)</span>
+            <input id="opt-sync-debounce" type="number" min="5" max="120" step="1" />
+            <span class="opt-hint">After a local change, wait this long before pushing (5–120).</span>
+          </label>
+          <label class="opt-field">
+            <span class="opt-label">Sweep interval (minutes)</span>
+            <input id="opt-sweep-interval" type="number" min="1" max="1440" step="1" />
+            <span class="opt-hint">How often maintenance sweeps are considered (DC-13 §3.5).</span>
+          </label>
+          <label class="opt-field">
+            <span class="opt-label">Max concurrent sync sessions</span>
+            <input id="opt-max-concurrent" type="number" min="1" max="5" step="1" />
+            <span class="opt-hint">Simultaneous peer sessions during a sync pass (1–5).</span>
+          </label>
+          <label class="opt-field">
+            <span class="opt-label">Incremental backlog limit</span>
+            <input id="opt-backlog" type="number" min="100" max="100000" step="100" />
+            <span class="opt-hint">Above this many pending changes a full-state resync is offered (100–100,000). Takes effect at next start.</span>
+          </label>
+        </section>
+        <section class="options-category" data-category-content="general" hidden>
+          <h2>General</h2>
+          <p class="muted">
+            No general settings yet. Future categories (display, locale)
+            will appear here as their contracts are approved.
+          </p>
+        </section>
+        <div class="options-footer">
+          <span class="dialog-error" id="options-error" role="alert" hidden></span>
+          <span class="spacer"></span>
+          <button type="button" id="options-cancel">Cancel</button>
+          <button type="button" id="options-save" class="primary">Save</button>
+        </div>
+      </main>
+    </div>
+    <script type="module" src="./options.ts"></script>
+  </body>
+</html>
