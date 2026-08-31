@@ -149,7 +149,11 @@ Right-click opens the menu. Items, in order:
 6. SETTINGS SUBMENU — RECOMMENDATION (v1: NONE)
 ==================================================
 
-6.1  RECOMMENDATION: v1 ships NO settings submenu. Rationale: the only
+6.1  (SUPERSEDED by DC-20, drafted 2026-08-31): v1 originally shipped no
+     settings submenu (rationale preserved below for history). DC-20 now
+     defines a concrete bounded Settings submenu — four contract-grounded
+     settings, change semantics, and persistence — superseding this
+     recommendation once approved. Original rationale: the only
      user-adjustable values (DC-09 MAX_INCREMENTAL_BACKLOG 100..100000;
      DC-13 §3.5 scheduler intervals) have safe defaults tuned by the owner
      (DC-09 amendment; DC-13 §3.5). A settings surface before the runtime
@@ -159,6 +163,7 @@ Right-click opens the menu. Items, in order:
      submenu under §4's menu with EXACTLY the DC-09/DC-13 bounded fields —
      never a free-form dialog — via an amendment to this contract. The
      app-UI settings button remains FORBIDDEN by owner directive.
+     -> DC-20 IS that amendment (drafted; pending owner approval).
 
 ==================================================
 7. OUT OF SCOPE
