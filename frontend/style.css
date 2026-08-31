@@ -544,11 +544,19 @@ input[type="time"]::-webkit-time-picker-indicator { display: none; }
   border-left: 3px solid var(--accent, #4aa3df);
   border-radius: 4px;
 }
-/* DC-12: recurrence rule builder + occurrence scope (event dialog). */
+/* DC-12: recurrence rule builder + occurrence scope (event dialog).
+   OPT-IN (owner feedback, 2026-08-31): the whole builder block is revealed
+   by the "Repeat" checkbox (#ev-repeat-on) next to "Whole day". */
+#ev-rule-builder {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(128, 128, 128, 0.25);
+}
 #ev-repeat-row { display: flex; gap: 10px; align-items: end; }
 #ev-repeat-row label:first-child { flex: 1; }
 #ev-repeat-row select { width: 100%; margin-top: 4px; }
 #ev-every-wrap input { width: 64px; margin-top: 4px; }
+#ev-until-wrap input { margin-top: 4px; }
 #ev-byday-row { margin-top: 6px; }
 .byday-buttons { display: flex; gap: 4px; }
 .byday-toggle {

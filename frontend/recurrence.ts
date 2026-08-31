@@ -31,6 +31,8 @@ interface RRuleParts {
   freq: "DAILY" | "WEEKLY" | "MONTHLY" | "YEARLY";
   interval: number;
   byday: string[];
+  /** UNTIL date form "YYYYMMDD" (inclusive end), or null when open-ended. */
+  until: string | null;
 }
 
 const DAY_NAMES: Record<string, string> = {
@@ -51,7 +53,38 @@ const FREQ_LABEL: Record<RRuleParts["freq"], string> = {
 };
 
 /** Supported RRULE keys for structured rendering; anything else → raw fallback. */
-const SUPPORTED_KEYS = new Set(["FREQ", "INTERVAL", "BYDAY"]);
+const SUPPORTED_KEYS = new Set(["FREQ", "INTERVAL", "BYDAY", "UNTIL"]);
+
+/** En-GB short month names for the "until 5 Oct 2026" rendering. */
+const MONTHS_SHORT = [
+  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/** UNTIL date form "YYYYMMDD" (RFC 5545 DATE; datetime forms stay raw). */
+function parseUntilDate(value: string): string | null {
+  if (!/^\d{8}$/.test(value)) return null;
+  const y = Number(value.slice(0, 4));
+  const m = Number(value.slice(4, 6));
+  const d = Number(value.slice(6, 8));
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  if (
+    dt.getUTCFullYear() !== y ||
+    dt.getUTCMonth() !== m - 1 ||
+    dt.getUTCDate() !== d
+  ) {
+    return null;
+  }
+  return value;
+}
+
+/** "YYYYMMDD" -> "5 Oct 2026" (plain-language, en-GB day-first). */
+export function formatUntilDate(until: string): string {
+  const day = Number(until.slice(6, 8));
+  const month = Number(until.slice(4, 6));
+  const year = until.slice(0, 4);
+  return `${day} ${MONTHS_SHORT[month - 1] ?? month} ${year}`;
+}
 
 /**
  * Parse an RRULE string into the common-case subset we render in plain
@@ -91,10 +124,18 @@ export function parseRRule(rule: string): RRuleParts | null {
       if (!Object.prototype.hasOwnProperty.call(DAY_NAMES, d)) return null;
     }
   }
+  let until: string | null = null;
+  if (kv.has("UNTIL")) {
+    // Only the DATE form ("YYYYMMDD") is rendered in plain language —
+    // datetime forms (…T000000Z) stay raw so nothing is misrepresented.
+    until = parseUntilDate(kv.get("UNTIL") ?? "");
+    if (!until) return null;
+  }
   return {
     freq: freqRaw as RRuleParts["freq"],
     interval,
     byday,
+    until,
   };
 }
 
@@ -121,9 +162,10 @@ export function describeRule(rule: string): string {
     const days = parts.byday
       .map((d) => DAY_NAMES[d] ?? d)
       .join(", ");
-    return `${every} on ${days}`;
+    const base = `${every} on ${days}`;
+    return parts.until ? `${base}, until ${formatUntilDate(parts.until)}` : base;
   }
-  return every;
+  return parts.until ? `${every}, until ${formatUntilDate(parts.until)}` : every;
 }
 
 /**

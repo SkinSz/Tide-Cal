@@ -20,6 +20,13 @@ export interface RuleDraft {
   interval: number;
   /** WEEKLY only: selected weekday codes (MO..SU); empty = base weekday. */
   byDay: string[];
+  /**
+   * Mandatory end date, local "YYYY-MM-DD" (the last occurrence date,
+   * INCLUSIVE — RFC 5545 UNTIL names the final occurrence). Required for
+   * every rule (DC-12 owner decision, 2026-08-31): an open-ended rule can
+   * no longer be built.
+   */
+  until: string | null;
 }
 
 export const WEEKDAY_CODES = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"] as const;
@@ -33,9 +40,30 @@ export function weekdayCode(jsDay: number): string {
  * Build an RRULE string from a draft. Returns null for "does not repeat"
  * (a plain single event — no series). WEEKLY with no selected day falls back
  * to the base date's weekday (the natural user intent).
+ *
+ * UNTIL is MANDATORY (owner decision, 2026-08-31): every built rule carries
+ * `UNTIL=YYYYMMDD` derived from draft.until. The picked date is the last
+ * occurrence, INCLUSIVE (RFC 5545 UNTIL semantics), so UNTIL equal to the
+ * event's own day is valid and any earlier date is rejected. Throws a
+ * user-presentable error when the end date is missing or before the event's
+ * day — the dialog surfaces it as its friendly inline error.
  */
 export function buildRRule(draft: RuleDraft, baseDate: Date): string | null {
   if (draft.freq === "NONE") return null;
+  if (!draft.until || !/^\d{4}-\d{2}-\d{2}$/.test(draft.until)) {
+    throw new Error("Choose an end date (Until) for the repeating event.");
+  }
+  const untilMs = new Date(`${draft.until}T00:00:00`).getTime();
+  const baseMs = new Date(
+    baseDate.getFullYear(),
+    baseDate.getMonth(),
+    baseDate.getDate(),
+  ).getTime();
+  if (!Number.isFinite(untilMs) || untilMs < baseMs) {
+    throw new Error(
+      "The end date must be on or after the event's own day.",
+    );
+  }
   const interval = Number.isInteger(draft.interval) && draft.interval >= 1 ? draft.interval : 1;
   const parts: string[] = [`FREQ=${draft.freq}`];
   if (interval > 1) parts.push(`INTERVAL=${interval}`);
@@ -46,13 +74,16 @@ export function buildRRule(draft: RuleDraft, baseDate: Date): string | null {
     const ordered = WEEKDAY_CODES.filter((d) => days.includes(d));
     parts.push(`BYDAY=${ordered.join(",")}`);
   }
+  parts.push(`UNTIL=${draft.until.replaceAll("-", "")}`);
   return parts.join(";");
 }
 
 /**
  * Recover an editable draft from a stored RRULE. Returns null when the rule
- * is not coverable by the builder subset (COUNT/UNTIL, exotic keys, bad
- * values) — the caller then shows the raw string and keeps it verbatim.
+ * is not coverable by the builder subset (COUNT, exotic keys, bad values) —
+ * the caller then shows the raw string and keeps it verbatim. UNTIL date
+ * form round-trips ("YYYYMMDD" -> "YYYY-MM-DD"); datetime-form UNTIL is
+ * outside the subset.
  */
 export function draftFromRule(rule: string): RuleDraft | null {
   const parsed = parseRRule(rule);
@@ -61,6 +92,9 @@ export function draftFromRule(rule: string): RuleDraft | null {
     freq: parsed.freq,
     interval: parsed.interval,
     byDay: parsed.byday,
+    until: parsed.until
+      ? `${parsed.until.slice(0, 4)}-${parsed.until.slice(4, 6)}-${parsed.until.slice(6, 8)}`
+      : null,
   };
 }
 

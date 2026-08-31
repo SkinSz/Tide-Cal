@@ -174,6 +174,7 @@ function readDraft(): {
   freq: "NONE" | "DAILY" | "WEEKLY" | "MONTHLY" | "YEARLY";
   interval: number;
   byDay: string[];
+  until: string | null;
 } {
   const freq = (field<HTMLSelectElement>("ev-repeat").value || "NONE") as
     | "NONE"
@@ -186,7 +187,26 @@ function readDraft(): {
   const byDay = Array.from(
     dlg().querySelectorAll<HTMLButtonElement>(".byday-toggle.picked"),
   ).map((b) => b.dataset.day!);
-  return { freq, interval, byDay };
+  const until = field<HTMLInputElement>("ev-until").value || null;
+  return { freq, interval, byDay, until };
+}
+
+/**
+ * OPT-IN builder (owner feedback, 2026-08-31): the rule builder is shown
+ * only when the "Repeat" checkbox (next to "Whole day") is checked.
+ */
+function repeatOn(): boolean {
+  return (field<HTMLInputElement>("ev-repeat-on") as HTMLInputElement).checked;
+}
+
+/** Reset the builder draft to "does not repeat" (unchecked / fresh open). */
+function clearRuleDraft(): void {
+  field<HTMLSelectElement>("ev-repeat").value = "NONE";
+  field<HTMLInputElement>("ev-every").value = "1";
+  field<HTMLInputElement>("ev-until").value = "";
+  for (const btn of dlg().querySelectorAll<HTMLButtonElement>(".byday-toggle")) {
+    btn.classList.remove("picked");
+  }
 }
 
 /** RRULE built from the dialog controls; null = does not repeat. */
@@ -197,14 +217,17 @@ function builderRule(): string | null {
   return buildRRule(d, base);
 }
 
-/** Show/hide interval + weekday pickers + preview for the current draft. */
+/** Show/hide the builder + interval/weekday/Until pickers for the current draft. */
 function syncRepeatVisibility(): void {
+  const on = repeatOn();
+  field<HTMLDivElement>("ev-rule-builder").hidden = !on;
   const freq = readDraft().freq;
   field<HTMLDivElement>("ev-every-wrap").hidden = freq === "NONE";
+  field<HTMLDivElement>("ev-until-wrap").hidden = freq === "NONE";
   field<HTMLDivElement>("ev-byday-row").hidden = freq !== "WEEKLY";
   const preview = document.getElementById("ev-rule-preview");
   if (!preview) return;
-  if (freq === "NONE") {
+  if (!on || freq === "NONE") {
     preview.hidden = true;
     preview.textContent = "";
     return;
@@ -221,12 +244,12 @@ function syncRepeatVisibility(): void {
  */
 function syncRecurrenceControls(existing: CalendarEvent): void {
   const repeatSel = field<HTMLSelectElement>("ev-repeat");
+  const repeatBox = field<HTMLInputElement>("ev-repeat-on");
   const everyWrap = field<HTMLDivElement>("ev-every-wrap");
   const bydayRow = field<HTMLDivElement>("ev-byday-row");
   const scopeRow = field<HTMLDivElement>("ev-scope-row");
   if (!currentSeries) {
-    // New / non-series event: builder active from "does not repeat".
-    repeatSel.value = "NONE";
+    // New / non-series event: builder stays hidden until "Repeat" is ticked.
     repeatSel.disabled = false;
     everyWrap.hidden = true;
     bydayRow.hidden = true;
@@ -234,7 +257,9 @@ function syncRecurrenceControls(existing: CalendarEvent): void {
     syncRepeatVisibility();
     return;
   }
-  // Editing a series base event: prefill from the stored rule.
+  // Editing a series base event: the builder shows CHECKED (it IS a series)
+  // and prefills from the stored rule.
+  repeatBox.checked = true;
   scopeRow.hidden = false;
   field<HTMLSelectElement>("ev-scope").value = "series";
   const draft = draftFromRule(currentSeries.recurrenceRule);
@@ -248,11 +273,15 @@ function syncRecurrenceControls(existing: CalendarEvent): void {
     return;
   }
   repeatSel.disabled = false;
-  // "Does not repeat" would mean deleting the series — not a rule edit;
-  // DC-12 §8 routes series ending through RRULE edits (e.g. UNTIL).
+  // "Does not repeat" inside a checked builder would mean deleting the
+  // series — not a rule edit (DC-12 §8 routes series ending through RRULE
+  // UNTIL edits). Unchecking the Repeat checkbox is the removal path.
   repeatSel.querySelector<HTMLOptionElement>('option[value="NONE"]')!.disabled = true;
   repeatSel.value = draft.freq;
   field<HTMLInputElement>("ev-every").value = String(draft.interval);
+  // Older series may predate the mandatory UNTIL (null): the Until field
+  // starts empty and Save asks for an end date before writing.
+  field<HTMLInputElement>("ev-until").value = draft.until ?? "";
   for (const btn of dlg().querySelectorAll<HTMLButtonElement>(".byday-toggle")) {
     btn.classList.toggle("picked", draft.byDay.includes(btn.dataset.day!));
   }
@@ -416,17 +445,14 @@ function openFor(date: Date, existing?: CalendarEvent): void {
   (dlg().querySelector("#dialog-title") as HTMLElement).textContent = existing
     ? "Edit event"
     : "New event";
-  // DC-12 controls: reset the builder + scope BEFORE the series lookup may
-  // re-prefill them (listSeries is async).
+  // DC-12 controls: reset the builder (OPT-IN: unchecked + draft cleared) +
+  // scope BEFORE the series lookup may re-prefill them (listSeries is async).
+  field<HTMLInputElement>("ev-repeat-on").checked = false;
   const repeatSel = field<HTMLSelectElement>("ev-repeat");
-  repeatSel.value = "NONE";
   repeatSel.disabled = false;
   const noneOpt = repeatSel.querySelector<HTMLOptionElement>('option[value="NONE"]');
   if (noneOpt) noneOpt.disabled = false;
-  field<HTMLInputElement>("ev-every").value = "1";
-  for (const btn of dlg().querySelectorAll<HTMLButtonElement>(".byday-toggle")) {
-    btn.classList.remove("picked");
-  }
+  clearRuleDraft();
   syncRepeatVisibility();
   field<HTMLDivElement>("ev-scope-row").hidden = true;
   syncRecurrenceLine(existing);
@@ -502,6 +528,17 @@ export function initDialog(): void {
   // DC-12 rule builder: freq select, interval, weekday toggles.
   field("ev-repeat").addEventListener("change", syncRepeatVisibility);
   field("ev-every").addEventListener("input", syncRepeatVisibility);
+  // OPT-IN builder (owner feedback, 2026-08-31): the "Repeat" checkbox next
+  // to "Whole day" reveals the rule builder. Unchecking hides it and CLEARS
+  // the draft rule so Save writes a plain event (on a series event, the
+  // whole-series removal path applies — see the Save handler).
+  field("ev-repeat-on").addEventListener("change", () => {
+    if (!repeatOn()) clearRuleDraft();
+    syncRepeatVisibility();
+  });
+  // Mandatory end date: editing it refreshes the live preview.
+  field("ev-until").addEventListener("input", syncRepeatVisibility);
+  field("ev-until").addEventListener("change", syncRepeatVisibility);
   for (const btn of Array.from(
     dlg().querySelectorAll<HTMLButtonElement>(".byday-toggle"),
   )) {
@@ -558,9 +595,38 @@ export function initDialog(): void {
       const input = readInput();
       if (!input) return;
       const id = field<HTMLInputElement>("ev-id").value;
+      // Mandatory end date (owner decision, 2026-08-31): every built rule
+      // carries UNTIL. Friendly inline validation before any write; the
+      // picked date is INCLUSIVE (last occurrence) and must be on or after
+      // the event's own day (buildRRule enforces the same, defensively).
+      if (repeatOn() && readDraft().freq !== "NONE") {
+        const until = field<HTMLInputElement>("ev-until").value;
+        const day = field<HTMLInputElement>("ev-date").value;
+        if (!until) {
+          showInlineError("Choose an end date (Until) for the repeating event.");
+          field<HTMLInputElement>("ev-until").focus();
+          return;
+        }
+        if (day && until < day) {
+          showInlineError("The end date must be on or after the event's own day.");
+          field<HTMLInputElement>("ev-until").focus();
+          return;
+        }
+      }
       try {
         if (id) {
           const existing = dialogEvent;
+          if (existing && currentSeries && !repeatOn() && !occurrenceScope()) {
+            // OPT-IN removal path: unchecking "Repeat" on a series event
+            // removes the whole series' rule — which in DC-12 IS the
+            // whole-series delete (§4.2 D7: deleteEvent on the base event
+            // structurally removes the series + all overrides), the same
+            // existing path the Delete button uses below. No new semantics.
+            await deleteEvent(id);
+            dlg().close();
+            document.dispatchEvent(new CustomEvent("tide:refresh"));
+            return;
+          }
           if (existing && occurrenceScope()) {
             // DC-12 §2.2/§4.1: THIS-occurrence-only edit -> occurrence
             // override keyed (series_id, recurrence_id). The recurrence_id

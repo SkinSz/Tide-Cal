@@ -52,6 +52,7 @@
           <input type="date" id="ev-date" required />
         </label>
         <label class="check"><input type="checkbox" id="ev-allday" /> Whole day</label>
+        <label class="check"><input type="checkbox" id="ev-repeat-on" /> Repeat</label>
         <div id="ev-time-row">
           <label>Start
             <span class="time-wrap">
@@ -69,32 +70,41 @@
           </label>
         </div>
         <input type="hidden" id="ev-id" />
-        <div id="ev-repeat-row">
-          <label>Repeats
-            <select id="ev-repeat">
-              <option value="NONE">Does not repeat</option>
-              <option value="DAILY">Daily</option>
-              <option value="WEEKLY">Weekly</option>
-              <option value="MONTHLY">Monthly</option>
-              <option value="YEARLY">Yearly</option>
-            </select>
-          </label>
-          <label id="ev-every-wrap" hidden>Every
-            <input type="number" id="ev-every" min="1" max="999" step="1" value="1" />
-          </label>
+        <!-- DC-12 recurrence rule builder: OPT-IN via the "Repeat" checkbox
+             above. Hidden until checked; unchecking clears the draft so a
+             plain event is saved (on a series, the whole-series removal
+             path — D7 — applies). -->
+        <div id="ev-rule-builder" hidden>
+          <div id="ev-repeat-row">
+            <label>Repeats
+              <select id="ev-repeat">
+                <option value="NONE">Does not repeat</option>
+                <option value="DAILY">Daily</option>
+                <option value="WEEKLY">Weekly</option>
+                <option value="MONTHLY">Monthly</option>
+                <option value="YEARLY">Yearly</option>
+              </select>
+            </label>
+            <label id="ev-every-wrap" hidden>Every
+              <input type="number" id="ev-every" min="1" max="999" step="1" value="1" />
+            </label>
+            <label id="ev-until-wrap" hidden>Until
+              <input type="date" id="ev-until" />
+            </label>
+          </div>
+          <div id="ev-byday-row" hidden>
+            <span class="byday-buttons" id="ev-byday">
+              <button type="button" class="byday-toggle" data-day="MO">M</button>
+              <button type="button" class="byday-toggle" data-day="TU">T</button>
+              <button type="button" class="byday-toggle" data-day="WE">W</button>
+              <button type="button" class="byday-toggle" data-day="TH">T</button>
+              <button type="button" class="byday-toggle" data-day="FR">F</button>
+              <button type="button" class="byday-toggle" data-day="SA">S</button>
+              <button type="button" class="byday-toggle" data-day="SU">S</button>
+            </span>
+          </div>
+          <p id="ev-rule-preview" class="recurrence-info" hidden></p>
         </div>
-        <div id="ev-byday-row" hidden>
-          <span class="byday-buttons" id="ev-byday">
-            <button type="button" class="byday-toggle" data-day="MO">M</button>
-            <button type="button" class="byday-toggle" data-day="TU">T</button>
-            <button type="button" class="byday-toggle" data-day="WE">W</button>
-            <button type="button" class="byday-toggle" data-day="TH">T</button>
-            <button type="button" class="byday-toggle" data-day="FR">F</button>
-            <button type="button" class="byday-toggle" data-day="SA">S</button>
-            <button type="button" class="byday-toggle" data-day="SU">S</button>
-          </span>
-        </div>
-        <p id="ev-rule-preview" class="recurrence-info" hidden></p>
         <div id="ev-scope-row" hidden>
           <label>Apply to
             <select id="ev-scope">
