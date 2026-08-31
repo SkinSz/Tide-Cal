@@ -141,6 +141,10 @@ dialog textarea {
   font-size: 0.85rem;
 }
 dialog menu { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0 0; padding: 0; }
+/* "Done" (date-picker escape hatch): only visible while the Day picker is
+   open — never part of the dialog's normal action row. */
+#ev-date-ok { display: none; }
+dialog.date-picking #ev-date-ok { display: inline-block; }
 dialog menu .spacer { flex: 1 1 auto; }
 /* Smoke-test fix: the delete confirm warning (width:100% inside a flex menu)
    forced the event dialog to jump ~2x wider. Cap the dialog and let the

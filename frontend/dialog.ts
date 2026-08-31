@@ -306,12 +306,17 @@ export function initDialog(): void {
 
   field("ev-allday").addEventListener("change", syncTimeVisibility);
   // Date picker: WebKit's popover only closes on blur, and Enter/ESC inside
-  // it are swallowed by the popover itself. So: auto-blur as soon as a value
-  // is committed, plus the "Done" menu button as the visible escape hatch.
-  field("ev-date").addEventListener("change", commitDateField);
-  document
-    .getElementById("ev-date-ok")
-    ?.addEventListener("click", commitDateField);
+  // it are swallowed by the popover itself. The "Done" escape hatch exists
+  // ONLY while the Day field's picker is open (shown via .date-picking on
+  // the dialog); auto-blur on change closes the popover in the normal case.
+  const dateOk = document.getElementById("ev-date-ok");
+  field("ev-date").addEventListener("focus", () => dlg().classList.add("date-picking"));
+  field("ev-date").addEventListener("blur", () => dlg().classList.remove("date-picking"));
+  field("ev-date").addEventListener("change", () => {
+    commitDateField();
+    dlg().classList.remove("date-picking");
+  });
+  dateOk?.addEventListener("click", commitDateField);
 
   // Time fields: free typing in the native input OR the ▾ 15-min dropdown.
   for (const btn of Array.from(
