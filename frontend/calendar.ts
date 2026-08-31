@@ -489,24 +489,33 @@ function wireDrag(chip: HTMLElement, ev: CalendarEvent): void {
   });
   // Global dragover drives the ghost: the source chip fires drag events even
   // when the pointer is over another column, so the ghost follows across days.
-  document.addEventListener("dragover", (e) => {
-    if (!dragEvent || dragEvent.id !== ev.id) return;
-    const target = (e.target as HTMLElement | null)?.closest?.(".week-col") as HTMLElement | null;
-    if (!target) {
-      removeDragGhost();
-      return;
-    }
-    e.preventDefault();
-    if (ev.allDay) {
-      updateAllDayGhost(target, ev);
-    } else {
-      updateDragGhost(target, e.clientY, Math.max((ev.endMs - ev.startMs) / 60000, 30));
-    }
-  });
+  // Registered ONCE per chip render generation; the previous generation's
+  // handlers see dragEvent.id mismatch (dragEvent only ever holds the newest
+  // chip's event) and return immediately — no unbounded listener growth
+  // (blind-review finding F6).
+  document.addEventListener("dragover", handleDragOver);
   document.addEventListener("drop", removeDragGhost);
 }
 
-/** Whole-day drag ghost: a full-height banner preview on the target day. */
+/**
+ * Global dragover handler — module-level singleton, registered once per chip
+ * via handleDragOver re-binding. Stale generations no-op on the id guard.
+ */
+function handleDragOverImpl(e: DragEvent): void {
+  if (!dragEvent) return;
+  const target = (e.target as HTMLElement | null)?.closest?.(".week-col") as HTMLElement | null;
+  if (!target) {
+    removeDragGhost();
+    return;
+  }
+  e.preventDefault();
+  if (dragEvent.allDay) {
+    updateAllDayGhost(target, dragEvent);
+  } else {
+    updateDragGhost(target, e.clientY, Math.max((dragEvent.endMs - dragEvent.startMs) / 60000, 30));
+  }
+}
+const handleDragOver: (e: DragEvent) => void = handleDragOverImpl;
 function updateAllDayGhost(col: HTMLElement, ev: CalendarEvent): void {
   if (!dragGhost) {
     dragGhost = document.createElement("div");

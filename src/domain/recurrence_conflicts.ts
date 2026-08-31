@@ -264,7 +264,10 @@ export function conflictEntityFor(
 export function isRecurrenceConflictPair(pathA: string, pathB: string): boolean {
   if (pathA === pathB) {
     return (
-      pathA.includes("recurrence_rule") || isSameOverrideEntity(pathA)
+      // endsWith, not includes: a hypothetical path like
+      // "x.recurrence_rule_old" must not false-positive as a rule path
+      // (blind-review finding F8).
+      pathA.endsWith("recurrence_rule") || isSameOverrideEntity(pathA)
     );
   }
   const isRule = (p: string) => p.endsWith("recurrence_rule");
