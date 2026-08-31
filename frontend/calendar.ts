@@ -2,6 +2,7 @@
 import type { CalendarEvent } from "./store.ts";
 import { listEvents, listSeries, updateEvent, deleteEvent, type SeriesRow } from "./store.ts";
 import { recurrenceBadge, type SeriesInfo } from "./recurrence.ts";
+import { expandOccurrences } from "../src/domain/recurrence_conflicts.ts";
 import { formatTimeLabel, getTimeFormat } from "./theme.ts";
 
 export type ViewMode = "month" | "week";
@@ -138,6 +139,7 @@ async function seriesByBaseEvent(): Promise<Map<string, SeriesInfo>> {
   } catch (e) {
     console.warn("[tide] series lookup unavailable:", e);
   }
+  seriesRowsCache = rows; // raw rows feed series expansion in render()
   const map = new Map<string, SeriesInfo>();
   for (const r of rows) {
     map.set(r.baseEventId, {
@@ -150,15 +152,151 @@ async function seriesByBaseEvent(): Promise<Map<string, SeriesInfo>> {
   return map;
 }
 
+// ---------------------------------------------------------------------------
+// DC-12: series expansion on the calendar read path.
+//
+// listEvents() returns only BASE event rows, so without this a recurring
+// series rendered a single chip on its start day (owner bug report). Here we
+// expand each series within the rendered window using the domain core's
+// expandOccurrences (wall-clock naive arithmetic, DST-correct by construction)
+// and honour occurrence overrides: cancelled occurrences render NO chip,
+// edited occurrences render with the override fields and a ✎ marker.
+// ---------------------------------------------------------------------------
+
+/** Zero-padded 2-digit number (local pad helper — calendar's pad takes 1 arg). */
+function pad2(n: number): string {
+  return String(n).padStart(2, "0");
+}
+
+/** 'YYYYMMDDTHHMMSS' from epoch ms (local wall clock, matching chip labels). */
+function wallIdFromMs(ms: number): string {
+  const d = new Date(ms);
+  return (
+    `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}` +
+    `T${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`
+  );
+}
+
+/** Epoch ms from a 'YYYYMMDD[THHMMSS]' wall-clock id (local time). */
+function msFromWallId(id: string): number {
+  const digits = id.replace(/\D/g, "");
+  const y = +digits.slice(0, 4);
+  const mo = +digits.slice(4, 6);
+  const dd = +digits.slice(6, 8);
+  const hh = +digits.slice(8, 10) || 0;
+  const mi = +digits.slice(10, 12) || 0;
+  const ss = +digits.slice(12, 14) || 0;
+  return new Date(y, mo - 1, dd, hh, mi, ss, 0).getTime();
+}
+
+/** 'YYYY-MM-DDTHH:MM' naive wall clock from epoch ms (SeriesState form). */
+function baseStartWall(ms: number): string {
+  const d = new Date(ms);
+  return (
+    `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}` +
+    `T${pad2(d.getHours())}:${pad2(d.getMinutes())}`
+  );
+}
+
+/** Per-chip occurrence metadata consumed by decorateRecurrence (✎ marker). */
+export interface OccurrenceMeta {
+  recurrenceId: string;
+  /** An override (title/start/end) applies to this occurrence. */
+  edited: boolean;
+}
+
+const occurrenceMeta = new WeakMap<CalendarEvent, OccurrenceMeta>();
+
+/** Occurrence metadata for a chip event, if it came from series expansion. */
+export function occurrenceOf(ev: CalendarEvent): OccurrenceMeta | undefined {
+  return occurrenceMeta.get(ev);
+}
+
+/**
+ * Expand recurring series into per-occurrence chip events for the rendered
+ * window. Non-series events pass through untouched; series base events are
+ * replaced by their occurrence chips (the base day's occurrence included —
+ * the first expansion hit is the base start itself). Best-effort: a series
+ * whose rule fails to expand falls back to its base-event chip.
+ */
+export function expandSeriesEvents(
+  events: CalendarEvent[],
+  seriesRows: SeriesRow[],
+  rangeStart: Date,
+  rangeEnd: Date,
+): CalendarEvent[] {
+  const seriesByBase = new Map<string, SeriesRow>();
+  for (const s of seriesRows) seriesByBase.set(s.baseEventId, s);
+
+  const winLo = `${wallIdFromMs(rangeStart.getTime()).slice(0, 8)}T000000`;
+  const winHi = `${wallIdFromMs(rangeEnd.getTime() - 1).slice(0, 8)}T235959`;
+
+  const out: CalendarEvent[] = [];
+  for (const ev of events) {
+    const row = seriesByBase.get(ev.id);
+    if (!row) {
+      out.push(ev); // plain, non-recurring event
+      continue;
+    }
+    let occIds: string[] = [];
+    try {
+      occIds = expandOccurrences(
+        {
+          series_id: row.seriesId,
+          base_start_wall: baseStartWall(ev.startMs),
+          tz_id: "local",
+          recurrence_rule: row.recurrenceRule,
+        },
+        winLo,
+        winHi,
+      );
+    } catch (e) {
+      console.warn("[tide] series expansion failed, showing base chip:", e);
+      out.push(ev);
+      continue;
+    }
+    if (occIds.length === 0) {
+      // Rule yields nothing in-window (e.g. base predates an edited rule) —
+      // keep the base chip so the event never silently disappears.
+      out.push(ev);
+      continue;
+    }
+    const overrides = new Map(row.overrides.map((o) => [o.recurrenceId, o]));
+    const durMs = Math.max(ev.endMs - ev.startMs, 0);
+    for (const occId of occIds) {
+      const ov = overrides.get(occId);
+      if (ov?.cancelled) continue; // cancelled occurrence: NO chip
+      const startMs = ov?.startWall ? msFromWallId(ov.startWall) : msFromWallId(occId);
+      const endMs = ov?.endWall ? msFromWallId(ov.endWall) : startMs + durMs;
+      const chipEvent: CalendarEvent = {
+        ...ev,
+        id: ev.id, // chips act on the base event (select/edit/delete)
+        title: ov?.title ?? ev.title,
+        startMs,
+        endMs,
+      };
+      occurrenceMeta.set(chipEvent, {
+        recurrenceId: occId,
+        edited: ov !== undefined,
+      });
+      out.push(chipEvent);
+    }
+  }
+  return out;
+}
+
 /**
  * Append the read-only recurrence indicator to a chip: 🔁 glyph + tooltip
  * with the plain-language rule (raw RRULE fallback), plus a "changed
  * occurrence" marker when overrides exist (DC-12 §2.2).
+ * `occurrence` (set on series-expansion chips) scopes the ✎ marker to THAT
+ * occurrence; base chips keep the series-level marker.
  */
 function decorateRecurrence(
   chip: HTMLElement,
   ev: CalendarEvent,
   series: Map<string, SeriesInfo>,
+  occurrence?: OccurrenceMeta,
 ): void {
   const info = series.get(ev.id);
   if (!info) return;
@@ -168,7 +306,8 @@ function decorateRecurrence(
   glyph.textContent = badge.glyph;
   glyph.title = badge.tooltip;
   chip.appendChild(glyph);
-  if (badge.hasOverride) {
+  const showOverride = occurrence ? occurrence.edited : badge.hasOverride;
+  if (showOverride) {
     const marker = document.createElement("span");
     marker.className = "override-marker";
     marker.textContent = "✎";
@@ -188,7 +327,9 @@ function eventChip(
   chip.dataset.eventId = ev.id;
   chip.textContent = allDayStyle ? ev.title : `${fmtTime(ev.startMs)} ${ev.title}`;
   chip.title = ev.title;
-  decorateRecurrence(chip, ev, series);
+  // Every occurrence chip carries the 🔁 glyph + tooltip (occurrence metadata
+  // scopes the ✎ "changed occurrence" marker to the overridden occurrence).
+  decorateRecurrence(chip, ev, series, occurrenceOf(ev));
   // UX contract (owner rule): single-click SELECTS, double-click OPENS the
   // edit dialog. Never open on single click. Delete key deletes (with the
   // dialog's two-step confirm), drag moves (week view).
@@ -268,7 +409,7 @@ function disarmDelete(chip: HTMLElement): void {
       ? ev.title
       : `${fmtTime(ev.startMs)} ${ev.title}`;
     chip.title = ev.title;
-    decorateRecurrence(chip, ev, seriesLookup ?? new Map());
+    decorateRecurrence(chip, ev, seriesLookup ?? new Map(), occurrenceOf(ev));
   }
 }
 
@@ -286,6 +427,8 @@ function cancelDeleteArms(root: ParentNode): void {
 
 let dragEvent: CalendarEvent | null = null;
 let seriesLookup: Map<string, SeriesInfo> | null = null;
+/** Raw series rows from the last render (input to series expansion). */
+let seriesRowsCache: SeriesRow[] = [];
 let dragGhost: HTMLElement | null = null;
 
 /** Remove the live drag ghost (owner request: real-time time feedback). */
@@ -536,11 +679,14 @@ export async function render(): Promise<void> {
   const cells = mode === "month" ? monthGrid() : weekCells();
   const rangeStart = cells[0]!.date;
   const rangeEnd = addDays(cells[cells.length - 1]!.date, 1);
-  const [events, series] = await Promise.all([
+  const [baseEvents, series] = await Promise.all([
     eventsForRange(rangeStart, rangeEnd),
     seriesByBaseEvent(),
   ]);
   seriesLookup = series;
+  // DC-12: expand recurring series into per-occurrence chips (cancelled
+  // occurrences dropped, edited occurrences carry their override fields).
+  const events = expandSeriesEvents(baseEvents, seriesRowsCache, rangeStart, rangeEnd);
   // Re-check: async gap may mean the user navigated meanwhile.
   if (seq !== renderSeq) {
     return;

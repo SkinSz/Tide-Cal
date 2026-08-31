@@ -116,8 +116,14 @@ export function expandOccurrences(
     ),
   );
 
-  const winLo = windowStartId.replace(/[-T:]/g, "").slice(0, 15);
-  const winHi = windowEndId.replace(/[-T:]/g, "").slice(0, 15);
+  // Window bounds compare on the DATE part only (occurrence ids carry a
+  // wall-clock time that must not be excluded by a lexicographic accident —
+  // 'T' (0x54) sorts above digits, which silently dropped any occurrence ON
+  // the window-end date). End date is INCLUSIVE (DC-12: UNTIL semantics).
+  const winLoDate = windowStartId.replace(/\D/g, "").slice(0, 8);
+  const winHiDate = windowEndId.replace(/\D/g, "").slice(0, 8);
+  const winLo = `${winLoDate}T000000`;
+  const winHi = `${winHiDate}T235959`;
 
   const out: string[] = [];
   const occurrenceDate = new Date(base.getTime());
@@ -179,7 +185,7 @@ export function expandOccurrences(
 
     if (matches) {
       const id = formatId(occurrenceDate);
-      if (id >= winLo && id <= winHi + "235959".slice(0, Math.max(0, 6))) {
+      if (id >= winLo && id <= winHi) {
         out.push(id);
       }
       generated++;

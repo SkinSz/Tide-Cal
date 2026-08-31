@@ -342,6 +342,15 @@ function commitDateField(): void {
 }
 
 /**
+ * DC-12 owner bug: the Until (end date) picker must behave like the Day
+ * picker — WebKit's date popover only closes on blur, so auto-blur on change
+ * closes it; the Done button stays available while the picker is open.
+ */
+function commitUntilField(): void {
+  field<HTMLInputElement>("ev-until").blur();
+}
+
+/**
  * Outlook-style dropdown: 15-minute slots (00:00–23:45) as buttons that set
  * the paired <input type="time">. Complements free typing rather than
  * replacing it — the native time input stays editable. Slot strings are
@@ -560,6 +569,22 @@ export function initDialog(): void {
     dlg().classList.remove("date-picking");
   });
   dateOk?.addEventListener("click", commitDateField);
+
+  // Until picker: same WebKitGTK treatment as the Day picker (owner bug —
+  // the popover stayed open after picking an end date). Auto-blur on change
+  // closes it; the Done escape hatch shows while EITHER picker is open
+  // (.date-picking / .until-picking on the dialog, see style.css).
+  field("ev-until").addEventListener("focus", () => dlg().classList.add("until-picking"));
+  field("ev-until").addEventListener("blur", () => dlg().classList.remove("until-picking"));
+  field("ev-until").addEventListener("change", () => {
+    syncRepeatVisibility();
+    commitUntilField();
+    dlg().classList.remove("until-picking");
+  });
+  dateOk?.addEventListener("click", () => {
+    if (dlg().classList.contains("until-picking")) commitUntilField();
+    else commitDateField();
+  });
 
   // Time fields: free typing in the native input OR the ▾ 15-min dropdown.
   // 12h mode: the AM/PM toggle flips the field's half-cycle in place.
