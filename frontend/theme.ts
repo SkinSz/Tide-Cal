@@ -9,25 +9,47 @@ export type TimeFormat = "24h" | "12h";
 const LS_KEY = "tide.theme";
 const TF_KEY = "tide.time_format";
 
+/**
+ * localStorage is unavailable in some bare test environments (and in
+ * non-browser contexts generally); prefer a guarded accessor over an
+ * import-time crash. The app always runs in a webview where it exists.
+ */
+function lsGet(key: string): string | null {
+  try {
+    return typeof localStorage === "undefined" ? null : localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function lsSet(key: string, value: string): void {
+  try {
+    if (typeof localStorage !== "undefined") localStorage.setItem(key, value);
+  } catch {
+    /* non-fatal: cache-only write */
+  }
+}
+
 export function getTheme(): Theme {
-  return localStorage.getItem(LS_KEY) === "light" ? "light" : "dark";
+  return lsGet(LS_KEY) === "light" ? "light" : "dark";
 }
 
 export function setTheme(theme: Theme): void {
-  localStorage.setItem(LS_KEY, theme);
+  lsSet(LS_KEY, theme);
   applyTheme(theme);
 }
 
 export function applyTheme(theme: Theme): void {
+  if (typeof document === "undefined") return; // bare test/non-DOM context
   document.documentElement.dataset.theme = theme;
 }
 
 export function getTimeFormat(): TimeFormat {
-  return localStorage.getItem(TF_KEY) === "12h" ? "12h" : "24h";
+  return lsGet(TF_KEY) === "12h" ? "12h" : "24h";
 }
 
 export function setTimeFormat(format: TimeFormat): void {
-  localStorage.setItem(TF_KEY, format);
+  lsSet(TF_KEY, format);
   applyTimeFormat(format);
 }
 
@@ -38,6 +60,7 @@ export function setTimeFormat(format: TimeFormat): void {
  * value stays 24h "HH:MM" either way, so commit/read code is untouched.
  */
 export function applyTimeFormat(format: TimeFormat): void {
+  if (typeof document === "undefined") return; // bare test/non-DOM context
   const root = document.documentElement;
   root.dataset.timeFormat = format;
   root.lang = format === "12h" ? "en-US" : "en-GB";
