@@ -219,20 +219,26 @@ describe("TD-badge: badge refresh causality (0 with fix, ? without)", () => {
 
     expect(elements.get("sync-errors-count")!.textContent).toBe("0");
     expect(elements.get("btn-sync-errors")!.title).toBe(
-      "No active quarantined records",
+      "No sync problems",
     );
   });
 
-  test("failing stats RPC (sidecar gone/stale bundle) renders ?", async () => {
+  test("failing stats RPC (sidecar gone/stale bundle) -> pending then honest ? after retries", async () => {
     const elements = stubToolbar();
     // Both quarantine_stats AND the list_quarantine fallback reject — the
     // exact signature of a missing/stale sidecar bundle (the owner's state).
+    // TD-011: the channel failure is first treated as not-ready ("…" +
+    // bounded retry); "?" only appears once every retry is exhausted.
+    vi.useFakeTimers();
     (syncOp as ReturnType<typeof vi.fn>).mockRejectedValue(
       new Error("sidecar request timed out after 15s"),
     );
-
-    await refreshSyncErrorsBadge();
-
+    const done = refreshSyncErrorsBadge();
+    let total = 0;
+    for (const d of [250, 500, 1000, 2000, 4000, 8000]) total += d;
+    await vi.advanceTimersByTimeAsync(total + 10);
+    await done;
+    vi.useRealTimers();
     expect(elements.get("sync-errors-count")!.textContent).toBe("?");
   });
 });

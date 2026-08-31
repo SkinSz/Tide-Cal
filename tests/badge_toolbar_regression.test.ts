@@ -78,9 +78,8 @@ describe("Sync-Errors toolbar badge (toolbar-scope regression)", () => {
 
     expect(elements.get("sync-errors-count")!.textContent).toBe("4");
     expect(elements.get("btn-sync-errors")!.title).toContain(
-      "4 active quarantined record(s)",
+      "4 items couldn't be synced — click to review",
     );
-    expect(elements.get("btn-sync-errors")!.title).toContain("2 resolved");
   });
 
   test("badge shows 0 when there are no active rows", async () => {
@@ -95,19 +94,26 @@ describe("Sync-Errors toolbar badge (toolbar-scope regression)", () => {
 
     expect(elements.get("sync-errors-count")!.textContent).toBe("0");
     expect(elements.get("btn-sync-errors")!.title).toBe(
-      "No active quarantined records",
+      "No sync problems",
     );
   });
 
-  test("stats-op failure degrades to '?' — never a silent death", async () => {
+  test("stats-op failure degrades to '…' then honest '?' after retries — never silent", async () => {
     // First quarantine_stats throws, then the list_quarantine fallback
-    // throws too: the badge must show "?" rather than leave stale text.
+    // throws too. TD-011: a channel failure is first treated as not-ready
+    // ("…" + bounded retry); "?" only after every retry is exhausted.
+    vi.useFakeTimers();
     (syncOp as ReturnType<typeof vi.fn>).mockRejectedValue(
       new Error("sidecar gone"),
     );
-
-    await refreshSyncErrorsBadge();
-
+    const done = refreshSyncErrorsBadge();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(elements.get("sync-errors-count")!.textContent).toBe("…");
+    let total = 0;
+    for (const d of [250, 500, 1000, 2000, 4000, 8000]) total += d;
+    await vi.advanceTimersByTimeAsync(total + 10);
+    await done;
+    vi.useRealTimers();
     expect(elements.get("sync-errors-count")!.textContent).toBe("?");
   });
 

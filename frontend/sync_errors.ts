@@ -363,23 +363,53 @@ async function fetchQuarantineStats(): Promise<QuarantineStats> {
 }
 
 /** Update the toolbar badge count (called on init + dialog close + syncs). */
-export async function refreshSyncErrorsBadge(): Promise<void> {
+function setBadgeCount(text: string): void {
+  document.getElementById("sync-errors-count")!.textContent = text;
+}
+
+/**
+ * Startup channel-readiness retry (TD-011): the main webview starts loading
+ * while the Rust shell's `setup()` is still spawning/pinging the sidecar, so
+ * the badge's first quarantine_stats call can hit "tide sidecar unavailable".
+ * That is a TRANSIENT channel-not-ready state, not a data problem — so the
+ * badge shows a loading ellipsis and retries on a short bounded backoff
+ * until the first successful answer. The "?" is shown only when every
+ * retry is exhausted (sidecar genuinely absent/dead), never during the
+ * startup window. Bounded so a permanently broken install still reports.
+ */
+const BADGE_RETRY_DELAYS_MS = [250, 500, 1000, 2000, 4000, 8000];
+let badgeRetryTimer: ReturnType<typeof setTimeout> | undefined;
+
+export async function refreshSyncErrorsBadge(attempt = 0): Promise<void> {
   const btn = document.getElementById("btn-sync-errors");
   if (!btn) return;
   let stats: QuarantineStats;
   try {
     stats = await fetchQuarantineStats();
   } catch (err) {
-    console.warn("[tide] quarantine stats unavailable:", err);
-    document.getElementById("sync-errors-count")!.textContent = "?";
+    console.warn(
+      `[tide] quarantine stats unavailable (attempt ${attempt + 1}):`,
+      err,
+    );
+    if (attempt < BADGE_RETRY_DELAYS_MS.length) {
+      // Channel not ready yet (startup race): show "pending", retry.
+      setBadgeCount("…");
+      clearTimeout(badgeRetryTimer);
+      badgeRetryTimer = setTimeout(
+        () => void refreshSyncErrorsBadge(attempt + 1),
+        BADGE_RETRY_DELAYS_MS[attempt],
+      );
+      return;
+    }
+    setBadgeCount("?");
     return;
   }
-  document.getElementById("sync-errors-count")!.textContent = String(stats.active);
+  clearTimeout(badgeRetryTimer);
+  setBadgeCount(String(stats.active));
   btn.title =
     stats.active > 0
-      ? `${stats.active} active quarantined record(s)` +
-        (stats.resolved > 0 ? `, ${stats.resolved} resolved` : "")
-      : "No active quarantined records";
+      ? `${stats.active} item${stats.active === 1 ? "" : "s"} couldn't be synced — click to review`
+      : "No sync problems";
 }
 
 function renderList(rows: QuarantineRow[]): void {
@@ -410,7 +440,7 @@ async function renderListAsync(rows: QuarantineRow[]): Promise<void> {
   const label = (id: string): string => resolveDeviceLabel(id, paired, selfId);
   if (rows.length === 0) {
     list.innerHTML =
-      '<p class="muted">No quarantined records. Sync is healthy.</p>';
+      '<p class="muted">Nothing needs your attention. Sync is healthy.</p>';
     return;
   }
   const views = shapeQuarantineRows(rows);
@@ -418,7 +448,7 @@ async function renderListAsync(rows: QuarantineRow[]): Promise<void> {
   const resolved = views.filter((v) => v.resolved);
   if (active.length === 0 && resolved.length > 0) {
     list.innerHTML =
-      '<p class="muted">No active quarantined records. Sync is healthy.</p>';
+      '<p class="muted">Nothing needs your attention. Sync is healthy.</p>';
   } else {
     const heading = document.createElement("h3");
     heading.textContent = `Active (${active.length})`;
