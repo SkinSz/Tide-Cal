@@ -178,3 +178,21 @@ stable, blind final verification PASS WITH CONCERNS with zero new issues).
   stdout is the RPC channel).
 - **Launch recipe:** terminal 1: `cd /home/skins/tide && npm run ui:dev`;
   terminal 2: `cd /home/skins/tide/src-tauri && TIDE_SIDECAR_PATH=/home/skins/tide/dist/sidecar.mjs cargo run`.
+
+## TD-012 — Post-freeze full-suite verification pass
+- **ID:** TD-012
+- **Title:** Post sync-stall-fix full suite re-run (npm test + tsc + cargo build) not yet executed
+- **Priority:** 5/10 — MEDIUM
+- **Status:** OPEN (created 2026-09-01)
+- **Why it matters:** The c088023 sync-stall fix is verified by scoped suites (transport 17/17, sync suites 8/8, recurrence 24/24) and the full three-device harness (7/7 scenarios, 50 sessions, 0 session errors) — but the FULL vitest suite has not been re-run since the fix. The one-suite-at-a-time rule (postmortem c13e457) deliberately deferred it while the two blind adversarial reviewers hold the repo.
+- **Resolving action:** One clean full `npm test` + `npx tsc --noEmit` + `cargo build` pass, recorded here with COMMAND + EXIT STATUS. Expected: all green (no other production code changed in c088023 beyond sync_engine/noise_transport). Any failure here is a finding, not a flake — investigate, never ratchet.
+- **Trigger:** Immediately after both blind reviewers deliver.
+
+## TD-013 — Transient EADDRINUSE on harness port bands
+- **ID:** TD-013
+- **Title:** Three-device harness scenarios occasionally fail with EADDRINUSE on a port that nothing holds afterwards
+- **Priority:** 4/10 — MEDIUM (test-infrastructure flake, not protocol)
+- **Status:** OPEN (created 2026-09-01; observed twice independently)
+- **Evidence:** During the c088023 verification run, harness scenario 2 failed once with EADDRINUSE on 41910 (sidecar sync listener could not bind; nothing held the port afterwards; scenario passed on rerun). A second occurrence observed in the blind-review re-run. Pattern: TIME_WAIT or interface-timing race between scenario teardown and next-scenario bind.
+- **Fix direction:** deterministic per-run port bases in RunContext, or a bounded bind-retry with explicit logging in the harness (NOT in agents — agent rule 2 forbids retry-until-green outside the harness itself).
+- **Trigger:** Before the harness becomes the standing release gate for future sync work (it now is), make it deterministic.
