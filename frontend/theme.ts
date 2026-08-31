@@ -63,7 +63,10 @@ export function applyTimeFormat(format: TimeFormat): void {
   if (typeof document === "undefined") return; // bare test/non-DOM context
   const root = document.documentElement;
   root.dataset.timeFormat = format;
-  root.lang = format === "12h" ? "en-US" : "en-GB";
+  // Keep en-GB in both modes: the visible 12h presentation is carried by
+  // the .ampm-toggle button + dropdown, not the native input's suffix
+  // (which is CSS-suppressed; exactly one AM/PM surface, owner design).
+  root.lang = "en-GB";
 }
 
 const pad = (n: number): string => String(n).padStart(2, "0");

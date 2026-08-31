@@ -96,11 +96,13 @@ describe("time format: 12h rendering, 24h internal", () => {
     }
   });
 
-  it("applyTimeFormat stamps the mode and drives document lang", async () => {
+  it("applyTimeFormat stamps the mode; lang stays 24h-friendly (AM/PM is a button)", async () => {
     const t = await themeModule();
     t.applyTimeFormat("12h");
     expect(dom.documentElement.dataset.timeFormat).toBe("12h");
-    expect(dom.documentElement.lang).toBe("en-US");
+    // 12h presentation is carried by the .ampm-toggle button + dropdown;
+    // the document language stays en-GB so the native suffix never renders.
+    expect(dom.documentElement.lang).toBe("en-GB");
     t.applyTimeFormat("24h");
     expect(dom.documentElement.dataset.timeFormat).toBe("24h");
     expect(dom.documentElement.lang).toBe("en-GB");
@@ -119,7 +121,7 @@ describe("time format: 12h rendering, 24h internal", () => {
     await themeModule();
     expect(dom.documentElement.dataset.theme).toBe("light");
     expect(dom.documentElement.dataset.timeFormat).toBe("12h");
-    expect(dom.documentElement.lang).toBe("en-US");
+    expect(dom.documentElement.lang).toBe("en-GB");
   });
 });
 
@@ -215,10 +217,14 @@ describe("event dialog: 12h display, 24h storage", () => {
     expect(dialogTs).toMatch(/inp\.value = slot/);
   });
 
-  it("24h CSS backstops yield in 12h mode", () => {
-    expect(styleCss).toMatch(
-      /:root:not\(\[data-time-format="12h"\]\)[\s\S]*?datetime-edit-ampm-field/,
+  it("AM/PM native suffix is suppressed unconditionally (toggle button owns it)", () => {
+    // Owner design 2026-08-31: exactly one AM/PM surface — the
+    // .ampm-toggle button; the native shadow-DOM field is always hidden.
+    const rule = styleCss.match(
+      /input\[type="time"\]::-webkit-datetime-edit-ampm-field\s*\{\s*display:\s*none/,
     );
+    expect(rule).not.toBeNull();
+    expect(styleCss).toMatch(/\.ampm-toggle\s*\{/);
   });
 
   it("index.html default document language remains 24h-friendly", () => {
