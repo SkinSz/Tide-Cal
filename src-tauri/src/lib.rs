@@ -504,7 +504,23 @@ fn resolve_sidecar_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
         }
     }
     let dev = std::path::PathBuf::from("../../dist/sidecar.mjs");
-    dev.is_file().then_some(dev)
+    if dev.is_file() {
+        return Some(dev);
+    }
+    // `tauri dev` runs the binary with cwd = src-tauri, so the repo's
+    // dist/ is ONE level up (../dist), not two (../../dist). Also try
+    // cwd/dist for direct runs from the repo root. Without these the
+    // sidecar silently fails to spawn in dev and every sync/stats RPC
+    // reports unavailable (owner-reported "(?)" badge, 2026-08-31).
+    let dev_parent = std::path::PathBuf::from("../dist/sidecar.mjs");
+    if dev_parent.is_file() {
+        return Some(dev_parent);
+    }
+    let cwd_dist = std::path::PathBuf::from("dist/sidecar.mjs");
+    if cwd_dist.is_file() {
+        return Some(cwd_dist);
+    }
+    None
 }
 
 /// DC-19 §4: tray icon + context menu [Open Tide, Sync now, Options…, Quit].
