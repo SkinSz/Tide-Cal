@@ -544,3 +544,26 @@ input[type="time"]::-webkit-time-picker-indicator { display: none; }
   border-left: 3px solid var(--accent, #4aa3df);
   border-radius: 4px;
 }
+/* DC-12: recurrence rule builder + occurrence scope (event dialog). */
+#ev-repeat-row { display: flex; gap: 10px; align-items: end; }
+#ev-repeat-row label:first-child { flex: 1; }
+#ev-repeat-row select { width: 100%; margin-top: 4px; }
+#ev-every-wrap input { width: 64px; margin-top: 4px; }
+#ev-byday-row { margin-top: 6px; }
+.byday-buttons { display: flex; gap: 4px; }
+.byday-toggle {
+  min-width: 28px;
+  padding: 3px 0;
+  border: 1px solid rgba(128, 128, 128, 0.4);
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.byday-toggle.picked {
+  background: var(--accent, #4aa3df);
+  border-color: var(--accent, #4aa3df);
+  color: #fff;
+}
+#ev-scope-row { margin-top: 6px; }
+#ev-scope-row select { width: 100%; margin-top: 4px; }

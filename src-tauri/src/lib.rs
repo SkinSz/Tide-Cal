@@ -303,7 +303,7 @@ async fn sync_op(
     op: String,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    const ALLOWED: [&str; 19] = [
+    const ALLOWED: [&str; 21] = [
         "device_info",
         "pairing_offer",
         "pairing_accept",
@@ -320,6 +320,9 @@ async fn sync_op(
         "reset_peer_state",
         "unblock_peer",
         "list_series",
+        // DC-12: recurrence write paths (series rule + occurrence overrides).
+        "update_series_rule",
+        "update_occurrence",
         // Pkg5 (QA M-2): read-only Conflicts surface (DC-14).
         "list_conflicts",
         "conflict_detail",

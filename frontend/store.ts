@@ -29,6 +29,12 @@ export interface EventInput {
   startMs: number;
   endMs: number;
   allDay: boolean;
+  /**
+   * DC-12 §2.1: optional RFC 5545 RRULE — CREATE only (makes the event the
+   * base event of a recurring series). Never sent on update_event (rule
+   * edits go through updateSeriesRule).
+   */
+  recurrenceRule?: string;
 }
 
 /**
@@ -51,16 +57,55 @@ export interface EventStoreBridge {
         seriesId: string;
         baseEventId: string;
         recurrenceRule: string;
-        overrides: Array<{ recurrenceId: string; cancelled: boolean }>;
+        overrides: Array<{
+          recurrenceId: string;
+          cancelled: boolean;
+          title?: string | null;
+          startWall?: string | null;
+          endWall?: string | null;
+          tzId?: string | null;
+        }>;
       }>
     | Promise<
         Array<{
           seriesId: string;
           baseEventId: string;
           recurrenceRule: string;
-          overrides: Array<{ recurrenceId: string; cancelled: boolean }>;
+          overrides: Array<{
+            recurrenceId: string;
+            cancelled: boolean;
+            title?: string | null;
+            startWall?: string | null;
+            endWall?: string | null;
+            tzId?: string | null;
+          }>;
         }>
       >;
+  /**
+   * DC-12 §2.1 write path: edit a series' recurrence rule (its own conflict
+   * entity). Optional — bridges without it degrade to a rejected save.
+   */
+  updateSeriesRule?(
+    seriesId: string,
+    rule: string,
+  ): { seriesId: string; recurrenceRule: string } | Promise<{ seriesId: string; recurrenceRule: string }>;
+  /**
+   * DC-12 §2.2/§4.1 write path: create/edit one occurrence override keyed
+   * (series_id, recurrence_id). Optional.
+   */
+  updateOccurrence?(
+    seriesId: string,
+    recurrenceId: string,
+    patch: {
+      cancelled?: boolean;
+      title?: string;
+      start_wall?: string;
+      end_wall?: string;
+      tz_id?: string;
+    },
+  ):
+    | { seriesId: string; recurrenceId: string; changed: string[] }
+    | Promise<{ seriesId: string; recurrenceId: string; changed: string[] }>;
 }
 
 declare global {
@@ -81,6 +126,33 @@ function injectedBridge(): EventStoreBridge | undefined {
 // --- localStorage fallback -------------------------------------------------
 
 const LS_KEY = "tide.events.v1";
+// DC-12: localStorage fallback series/overrides store (plain-browser dev only;
+// the real store keeps these in SQLite via EventCore / the sidecar).
+const LS_SERIES_KEY = "tide.series.v1";
+const LS_OVERRIDES_KEY = "tide.overrides.v1";
+
+interface LsSeries {
+  seriesId: string;
+  baseEventId: string;
+  recurrenceRule: string;
+}
+interface LsOverride {
+  seriesId: string;
+  recurrenceId: string;
+  cancelled: boolean;
+  title?: string | null;
+  start_wall?: string | null;
+  end_wall?: string | null;
+  tz_id?: string | null;
+}
+
+function lsJson<T>(key: string): T[] {
+  try {
+    return JSON.parse(localStorage.getItem(key) ?? "[]") as T[];
+  } catch {
+    return [];
+  }
+}
 
 function lsLoad(): CalendarEvent[] {
   try {
@@ -135,7 +207,14 @@ export interface SeriesRow {
   seriesId: string;
   baseEventId: string;
   recurrenceRule: string;
-  overrides: Array<{ recurrenceId: string; cancelled: boolean }>;
+  overrides: Array<{
+    recurrenceId: string;
+    cancelled: boolean;
+    title?: string | null;
+    startWall?: string | null;
+    endWall?: string | null;
+    tzId?: string | null;
+  }>;
 }
 
 /**
@@ -155,6 +234,26 @@ export function listSeries(): Promise<SeriesRow[]> {
   // Poisoning the global flag here silently diverted all subsequent event
   // CRUD to localStorage in the desktop app (verifier-found MAJOR bug).
   return run().catch((e) => {
+    // Plain-browser fallback store: return the LS series data (DC-12) when
+    // there is no bridge at all; with a bridge, a failed lookup is simply
+    // "no indicators" (never poison event CRUD — see comment above).
+    if (!bridge) {
+      return lsJson<LsSeries>(LS_SERIES_KEY).map((s) => ({
+        seriesId: s.seriesId,
+        baseEventId: s.baseEventId,
+        recurrenceRule: s.recurrenceRule,
+        overrides: lsJson<LsOverride>(LS_OVERRIDES_KEY)
+          .filter((o) => o.seriesId === s.seriesId)
+          .map((o) => ({
+            recurrenceId: o.recurrenceId,
+            cancelled: o.cancelled,
+            title: o.title ?? null,
+            startWall: o.start_wall ?? null,
+            endWall: o.end_wall ?? null,
+            tzId: o.tz_id ?? null,
+          })),
+      }));
+    }
     console.warn("[tide] listSeries unavailable, showing no indicators:", e);
     return [] as SeriesRow[];
   });
@@ -190,8 +289,7 @@ export function createEvent(input: EventInput): Promise<CalendarEvent> {
     return withFallback(
       () => Promise.resolve(bridge.createEvent(input)),
       () => {
-        const event: CalendarEvent = { id: newId(), ...input };
-        lsSave([...lsLoad(), event]);
+        const event = lsCreateEvent(input);
         return Promise.resolve(event);
       },
     );
@@ -199,38 +297,59 @@ export function createEvent(input: EventInput): Promise<CalendarEvent> {
   return withFallback(
     () => invoke<CalendarEvent>("create_event", { input }),
     () => {
-      const event: CalendarEvent = { id: newId(), ...input };
-      lsSave([...lsLoad(), event]);
+      const event = lsCreateEvent(input);
       return Promise.resolve(event);
     },
   );
+}
+
+/** LS fallback create: stores the event + a series row when a rule is set. */
+function lsCreateEvent(input: EventInput): CalendarEvent {
+  const event: CalendarEvent = { id: newId(), ...input };
+  lsSave([...lsLoad(), event]);
+  if (input.recurrenceRule) {
+    const series: LsSeries = {
+      seriesId: newId(),
+      baseEventId: event.id,
+      recurrenceRule: input.recurrenceRule,
+    };
+    localStorage.setItem(
+      LS_SERIES_KEY,
+      JSON.stringify([...lsJson<LsSeries>(LS_SERIES_KEY), series]),
+    );
+  }
+  return event;
 }
 
 export function updateEvent(
   id: string,
   input: EventInput,
 ): Promise<CalendarEvent> {
+  // DC-12: recurrenceRule is CREATE-only — never sent on update (rule edits
+  // go through updateSeriesRule; the sidecar rejects it otherwise).
+  const { recurrenceRule: _drop, ...base } = input;
+  void _drop;
   const bridge = injectedBridge();
   if (bridge) {
     return withFallback(
-      () => Promise.resolve(bridge.updateEvent(id, input)),
+      () => Promise.resolve(bridge.updateEvent(id, base)),
       () => {
         const events = lsLoad();
         const idx = events.findIndex((e) => e.id === id);
         if (idx === -1) return Promise.reject(new Error("event not found"));
-        events[idx] = { id, ...input };
+        events[idx] = { id, ...base };
         lsSave(events);
         return Promise.resolve(events[idx]);
       },
     );
   }
   return withFallback(
-    () => invoke<CalendarEvent>("update_event", { id, input }),
+    () => invoke<CalendarEvent>("update_event", { id, input: base }),
     () => {
       const events = lsLoad();
       const idx = events.findIndex((e) => e.id === id);
       if (idx === -1) return Promise.reject(new Error("event not found"));
-      events[idx] = { id, ...input };
+      events[idx] = { id, ...base };
       lsSave(events);
       return Promise.resolve(events[idx]);
     },
@@ -252,7 +371,116 @@ export function deleteEvent(id: string): Promise<void> {
     () => invoke<void>("delete_event", { id }),
     () => {
       lsSave(lsLoad().filter((e) => e.id !== id));
+      // D7 (DC-12 §4.2): removing a series' base event removes the series
+      // and its overrides in the fallback store too.
+      const series = lsJson<LsSeries>(LS_SERIES_KEY);
+      const dead = series.filter((s) => s.baseEventId === id).map((s) => s.seriesId);
+      if (dead.length > 0) {
+        localStorage.setItem(
+          LS_SERIES_KEY,
+          JSON.stringify(series.filter((s) => !dead.includes(s.seriesId))),
+        );
+        localStorage.setItem(
+          LS_OVERRIDES_KEY,
+          JSON.stringify(
+            lsJson<LsOverride>(LS_OVERRIDES_KEY).filter(
+              (o) => !dead.includes(o.seriesId),
+            ),
+          ),
+        );
+      }
       return Promise.resolve();
     },
   );
+}
+
+/**
+ * DC-12 §2.1/§3: edit a series' recurrence rule. Its own conflict entity
+ * (series_id, "recurrence_rule"); stored verbatim by the domain core.
+ */
+export function updateSeriesRule(
+  seriesId: string,
+  rule: string,
+): Promise<{ seriesId: string; recurrenceRule: string }> {
+  const bridge = injectedBridge();
+  const run = async () => {
+    if (bridge?.updateSeriesRule) return bridge.updateSeriesRule(seriesId, rule);
+    return invoke<{ seriesId: string; recurrenceRule: string }>(
+      "update_series_rule",
+      { series_id: seriesId, rule },
+    );
+  };
+  const fallback = () => {
+    const series = lsJson<LsSeries>(LS_SERIES_KEY);
+    const idx = series.findIndex((s) => s.seriesId === seriesId);
+    if (idx === -1) return Promise.reject(new Error("series not found"));
+    series[idx] = {
+      seriesId: series[idx]!.seriesId,
+      baseEventId: series[idx]!.baseEventId,
+      recurrenceRule: rule,
+    };
+    localStorage.setItem(LS_SERIES_KEY, JSON.stringify(series));
+    return Promise.resolve({ seriesId, recurrenceRule: rule });
+  };
+  if (bridge) {
+    return withFallback(() => Promise.resolve(run()), fallback);
+  }
+  return withFallback(() => run(), fallback);
+}
+
+export interface OccurrencePatch {
+  cancelled?: boolean;
+  title?: string;
+  start_wall?: string;
+  end_wall?: string;
+  tz_id?: string;
+}
+
+/**
+ * DC-12 §2.2/§2.3/§4.1: create/edit one occurrence override keyed
+ * (series_id, recurrence_id). recurrence_id is the canonical wall-clock id
+ * of the ORIGINAL occurrence (deriveRecurrenceId) and is never rewritten (R2).
+ */
+export function updateOccurrence(
+  seriesId: string,
+  recurrenceId: string,
+  patch: OccurrencePatch,
+): Promise<{ seriesId: string; recurrenceId: string; changed: string[] }> {
+  const bridge = injectedBridge();
+  const run = async () => {
+    if (bridge?.updateOccurrence) return bridge.updateOccurrence(seriesId, recurrenceId, patch);
+    return invoke<{ seriesId: string; recurrenceId: string; changed: string[] }>(
+      "update_occurrence",
+      { series_id: seriesId, recurrence_id: recurrenceId, patch },
+    );
+  };
+  const fallback = () => {
+    const overrides = lsJson<LsOverride>(LS_OVERRIDES_KEY);
+    const idx = overrides.findIndex(
+      (o) => o.seriesId === seriesId && o.recurrenceId === recurrenceId,
+    );
+    if (idx === -1) {
+      overrides.push({
+        seriesId,
+        recurrenceId,
+        cancelled: patch.cancelled ?? false,
+        title: patch.title ?? null,
+        start_wall: patch.start_wall ?? null,
+        end_wall: patch.end_wall ?? null,
+        tz_id: patch.tz_id ?? null,
+      });
+    } else {
+      overrides[idx] = { ...overrides[idx]!, ...patch };
+    }
+    localStorage.setItem(LS_OVERRIDES_KEY, JSON.stringify(overrides));
+    return Promise.resolve({
+      seriesId,
+      recurrenceId,
+      changed: Object.keys(patch),
+    });
+  };
+  if (bridge) {
+    return withFallback(() => Promise.resolve(run()), fallback);
+  }
+  return withFallback(() => run(), fallback);
 }

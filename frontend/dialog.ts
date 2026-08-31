@@ -9,12 +9,21 @@ import {
   createEvent,
   deleteEvent,
   updateEvent,
+  updateOccurrence,
+  updateSeriesRule,
   listSeries,
   type CalendarEvent,
   type EventInput,
+  type SeriesRow,
 } from "./store.ts";
 import { getSelectedDate } from "./calendar.ts";
-import { dialogRecurrenceLine } from "./recurrence.ts";
+import { dialogRecurrenceLine, describeRule } from "./recurrence.ts";
+import {
+  buildRRule,
+  draftFromRule,
+  deriveRecurrenceId,
+  wallStamp,
+} from "./recurrence_edit.ts";
 import { formatTimeLabel, getTimeFormat } from "./theme.ts";
 
 const dlg = () => document.getElementById("event-dialog") as HTMLDialogElement;
@@ -113,31 +122,150 @@ function wholeDay(): boolean {
 }
 
 /**
+ * The series the currently edited event belongs to (null: single event or
+ * new event). Populated by syncRecurrenceLine's listSeries lookup; drives
+ * the rule builder prefill and the occurrence-scope selector (DC-12).
+ */
+let currentSeries: SeriesRow | null = null;
+
+/** The event currently being edited (null: create flow). */
+let dialogEvent: CalendarEvent | undefined;
+
+/**
  * READ-ONLY recurrence info line (DC-12 §2 / deferred #12 surface): when the
  * edited event is a series' base event, state the rule in plain language and
- * make the THIS-occurrence-vs-SERIES distinction visible. v1 editing rewrites
- * the base event row only; the line says exactly that. Best-effort: failures
- * simply leave the line hidden.
+ * make the THIS-occurrence-vs-SERIES distinction visible. Also drives the
+ * rule-builder prefill + the Apply-to scope selector. Best-effort: failures
+ * simply leave the line hidden and the builder in its default state.
  */
 function syncRecurrenceLine(existing?: CalendarEvent): void {
+  currentSeries = null;
   const line = document.getElementById("ev-recurrence-info");
-  if (!line) return;
-  line.hidden = true;
-  line.textContent = "";
+  if (line) {
+    line.hidden = true;
+    line.textContent = "";
+  }
   if (!existing) return;
   listSeries()
     .then((rows) => {
       const info = rows.find((r) => r.baseEventId === existing.id);
       if (!info) return;
-      line.textContent = dialogRecurrenceLine({
-        seriesId: info.seriesId,
-        baseEventId: info.baseEventId,
-        rule: info.recurrenceRule,
-        overrides: info.overrides,
-      });
-      line.hidden = false;
+      currentSeries = info;
+      if (line) {
+        line.textContent = dialogRecurrenceLine({
+          seriesId: info.seriesId,
+          baseEventId: info.baseEventId,
+          rule: info.recurrenceRule,
+          overrides: info.overrides,
+        });
+        line.hidden = false;
+      }
+      syncRecurrenceControls(existing);
     })
     .catch((e) => console.warn("[tide] series lookup unavailable:", e));
+}
+
+// ---------------------------------------------------------------------------
+// DC-12: recurrence rule builder + occurrence-scope controls
+// ---------------------------------------------------------------------------
+
+/** Current builder draft as stored in the dialog controls. */
+function readDraft(): {
+  freq: "NONE" | "DAILY" | "WEEKLY" | "MONTHLY" | "YEARLY";
+  interval: number;
+  byDay: string[];
+} {
+  const freq = (field<HTMLSelectElement>("ev-repeat").value || "NONE") as
+    | "NONE"
+    | "DAILY"
+    | "WEEKLY"
+    | "MONTHLY"
+    | "YEARLY";
+  const n = Number(field<HTMLInputElement>("ev-every").value);
+  const interval = Number.isInteger(n) && n >= 1 ? Math.min(n, 999) : 1;
+  const byDay = Array.from(
+    dlg().querySelectorAll<HTMLButtonElement>(".byday-toggle.picked"),
+  ).map((b) => b.dataset.day!);
+  return { freq, interval, byDay };
+}
+
+/** RRULE built from the dialog controls; null = does not repeat. */
+function builderRule(): string | null {
+  const d = readDraft();
+  const dayStr = field<HTMLInputElement>("ev-date").value;
+  const base = dayStr ? new Date(`${dayStr}T00:00:00`) : new Date();
+  return buildRRule(d, base);
+}
+
+/** Show/hide interval + weekday pickers + preview for the current draft. */
+function syncRepeatVisibility(): void {
+  const freq = readDraft().freq;
+  field<HTMLDivElement>("ev-every-wrap").hidden = freq === "NONE";
+  field<HTMLDivElement>("ev-byday-row").hidden = freq !== "WEEKLY";
+  const preview = document.getElementById("ev-rule-preview");
+  if (!preview) return;
+  if (freq === "NONE") {
+    preview.hidden = true;
+    preview.textContent = "";
+    return;
+  }
+  const rule = builderRule();
+  preview.textContent = rule ? describeRule(rule) : "";
+  preview.hidden = !rule;
+}
+
+/**
+ * Prefill the builder from the edited event's series (draftFromRule null =
+ * rule outside the builder subset → builder is disabled and the raw rule is
+ * preserved verbatim on save; never misrepresented, never rewritten).
+ */
+function syncRecurrenceControls(existing: CalendarEvent): void {
+  const repeatSel = field<HTMLSelectElement>("ev-repeat");
+  const everyWrap = field<HTMLDivElement>("ev-every-wrap");
+  const bydayRow = field<HTMLDivElement>("ev-byday-row");
+  const scopeRow = field<HTMLDivElement>("ev-scope-row");
+  if (!currentSeries) {
+    // New / non-series event: builder active from "does not repeat".
+    repeatSel.value = "NONE";
+    repeatSel.disabled = false;
+    everyWrap.hidden = true;
+    bydayRow.hidden = true;
+    scopeRow.hidden = true;
+    syncRepeatVisibility();
+    return;
+  }
+  // Editing a series base event: prefill from the stored rule.
+  scopeRow.hidden = false;
+  field<HTMLSelectElement>("ev-scope").value = "series";
+  const draft = draftFromRule(currentSeries.recurrenceRule);
+  if (!draft) {
+    // Exotic rule: keep the builder out of the way; rule stays verbatim.
+    repeatSel.disabled = true;
+    repeatSel.value = "NONE";
+    everyWrap.hidden = true;
+    bydayRow.hidden = true;
+    syncRepeatVisibility();
+    return;
+  }
+  repeatSel.disabled = false;
+  // "Does not repeat" would mean deleting the series — not a rule edit;
+  // DC-12 §8 routes series ending through RRULE edits (e.g. UNTIL).
+  repeatSel.querySelector<HTMLOptionElement>('option[value="NONE"]')!.disabled = true;
+  repeatSel.value = draft.freq;
+  field<HTMLInputElement>("ev-every").value = String(draft.interval);
+  for (const btn of dlg().querySelectorAll<HTMLButtonElement>(".byday-toggle")) {
+    btn.classList.toggle("picked", draft.byDay.includes(btn.dataset.day!));
+  }
+  void existing;
+  syncRepeatVisibility();
+}
+
+/** True when the Save should write an occurrence override ("this occurrence"). */
+function occurrenceScope(): boolean {
+  return (
+    currentSeries !== null &&
+    field<HTMLSelectElement>("ev-scope").value === "occurrence"
+  );
 }
 
 function syncTimeVisibility(): void {
@@ -257,6 +385,8 @@ function closeTimeMenus(): void {
 function openFor(date: Date, existing?: CalendarEvent): void {
   const d = new Date(date);
   clearInlineError();
+  dialogEvent = existing;
+  currentSeries = null;
 
   field<HTMLInputElement>("ev-id").value = existing?.id ?? "";
   field<HTMLInputElement>("ev-title").value = existing?.title ?? "";
@@ -286,6 +416,19 @@ function openFor(date: Date, existing?: CalendarEvent): void {
   (dlg().querySelector("#dialog-title") as HTMLElement).textContent = existing
     ? "Edit event"
     : "New event";
+  // DC-12 controls: reset the builder + scope BEFORE the series lookup may
+  // re-prefill them (listSeries is async).
+  const repeatSel = field<HTMLSelectElement>("ev-repeat");
+  repeatSel.value = "NONE";
+  repeatSel.disabled = false;
+  const noneOpt = repeatSel.querySelector<HTMLOptionElement>('option[value="NONE"]');
+  if (noneOpt) noneOpt.disabled = false;
+  field<HTMLInputElement>("ev-every").value = "1";
+  for (const btn of dlg().querySelectorAll<HTMLButtonElement>(".byday-toggle")) {
+    btn.classList.remove("picked");
+  }
+  syncRepeatVisibility();
+  field<HTMLDivElement>("ev-scope-row").hidden = true;
   syncRecurrenceLine(existing);
   (dlg().querySelector("#ev-delete") as HTMLButtonElement).hidden =
     !existing;
@@ -355,6 +498,19 @@ export function initDialog(): void {
   });
 
   field("ev-allday").addEventListener("change", syncTimeVisibility);
+
+  // DC-12 rule builder: freq select, interval, weekday toggles.
+  field("ev-repeat").addEventListener("change", syncRepeatVisibility);
+  field("ev-every").addEventListener("input", syncRepeatVisibility);
+  for (const btn of Array.from(
+    dlg().querySelectorAll<HTMLButtonElement>(".byday-toggle"),
+  )) {
+    btn.addEventListener("click", () => {
+      btn.classList.toggle("picked");
+      syncRepeatVisibility();
+    });
+  }
+
   // Date picker: WebKit's popover only closes on blur, and Enter/ESC inside
   // it are swallowed by the popover itself. The "Done" escape hatch exists
   // ONLY while the Day field's picker is open (shown via .date-picking on
@@ -403,8 +559,46 @@ export function initDialog(): void {
       if (!input) return;
       const id = field<HTMLInputElement>("ev-id").value;
       try {
-        if (id) await updateEvent(id, input);
-        else await createEvent(input);
+        if (id) {
+          const existing = dialogEvent;
+          if (existing && occurrenceScope()) {
+            // DC-12 §2.2/§4.1: THIS-occurrence-only edit -> occurrence
+            // override keyed (series_id, recurrence_id). The recurrence_id
+            // is derived from the ORIGINAL stored occurrence start (R2:
+            // never rewritten), not from the dialog's possibly-moved date.
+            const series = currentSeries!;
+            const rid = deriveRecurrenceId(existing.startMs, existing.allDay);
+            const patch: Record<string, unknown> = {};
+            if (input.title !== existing.title) patch.title = input.title;
+            if (
+              input.startMs !== existing.startMs ||
+              input.endMs !== existing.endMs
+            ) {
+              patch.start_wall = wallStamp(input.startMs);
+              patch.end_wall = wallStamp(Math.max(input.endMs, input.startMs));
+            }
+            if (Object.keys(patch).length > 0) {
+              await updateOccurrence(series.seriesId, rid, patch);
+            }
+          } else {
+            // Whole-series edit: base event row (ordinary per-field entities).
+            await updateEvent(id, input);
+            // DC-12 §3: rule edits go to their OWN conflict entity
+            // (series_id, "recurrence_rule"); only when the builder produced
+            // a different rule. Unparsable rules (builder disabled) are kept
+            // verbatim — never rewritten.
+            const rule = builderRule();
+            if (currentSeries && rule && rule !== currentSeries.recurrenceRule) {
+              await updateSeriesRule(currentSeries.seriesId, rule);
+            }
+          }
+        } else {
+          // New event: optional create-time RRULE makes it a series (DC-12 §2.1).
+          const rule = builderRule();
+          await createEvent(
+            rule ? { ...input, recurrenceRule: rule } : input,
+          );
+        }
         dlg().close();
         document.dispatchEvent(new CustomEvent("tide:refresh"));
       } catch (err) {
@@ -423,7 +617,23 @@ export function initDialog(): void {
       armDeleteConfirm(btn, () => {
         void (async () => {
           try {
-            await deleteEvent(id);
+            if (dialogEvent && occurrenceScope()) {
+              // DC-12 §4.1: cancelling ONE occurrence writes the override
+              // (series_id, "overrides.<rid>.cancelled") — the series and its
+              // other occurrences are untouched. Whole-series delete (below)
+              // is D7.
+              const rid = deriveRecurrenceId(
+                dialogEvent.startMs,
+                dialogEvent.allDay,
+              );
+              await updateOccurrence(currentSeries!.seriesId, rid, {
+                cancelled: true,
+              });
+            } else {
+              // Whole-series delete (or single event): EventCore applies D7 —
+              // the series tombstone structurally removes all overrides.
+              await deleteEvent(id);
+            }
             dlg().close();
             document.dispatchEvent(new CustomEvent("tide:refresh"));
           } catch (err) {

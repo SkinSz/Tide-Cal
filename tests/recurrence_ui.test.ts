@@ -237,8 +237,22 @@ describe("EventCore.listSeries — read-only join of series + overrides", () => 
     // Verbatim rule (DC-12 §2.1: never rewritten by the display layer).
     expect(s1.recurrenceRule).toBe("FREQ=WEEKLY;BYDAY=WE");
     expect(s1.overrides).toEqual([
-      { recurrenceId: "20260902T090000", cancelled: false },
-      { recurrenceId: "20260909T090000", cancelled: true },
+      {
+        recurrenceId: "20260902T090000",
+        cancelled: false,
+        title: null,
+        startWall: null,
+        endWall: null,
+        tzId: null,
+      },
+      {
+        recurrenceId: "20260909T090000",
+        cancelled: true,
+        title: null,
+        startWall: null,
+        endWall: null,
+        tzId: null,
+      },
     ]);
     const s2 = rows.find((r) => r.seriesId === "s-2")!;
     expect(s2.overrides).toEqual([]);
@@ -324,7 +338,10 @@ describe("dialogRecurrenceLine — dialog distinction", () => {
     // Distinction visible: saving touches the SERIES base event, not a
     // single occurrence; no per-occurrence editing is claimed.
     expect(line).toContain("base event");
-    expect(line).toContain("occurrence overrides are separate records");
+    // DC-12 occurrence-override editing: the line names the scope choice and
+    // the R2 anchoring + R6 exclusion explicitly.
+    expect(line).toContain("This occurrence only");
+    expect(line).toContain("no “this and following”");
   });
 
   test("line mentions overrides when the series has them", () => {

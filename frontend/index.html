@@ -69,6 +69,40 @@
           </label>
         </div>
         <input type="hidden" id="ev-id" />
+        <div id="ev-repeat-row">
+          <label>Repeats
+            <select id="ev-repeat">
+              <option value="NONE">Does not repeat</option>
+              <option value="DAILY">Daily</option>
+              <option value="WEEKLY">Weekly</option>
+              <option value="MONTHLY">Monthly</option>
+              <option value="YEARLY">Yearly</option>
+            </select>
+          </label>
+          <label id="ev-every-wrap" hidden>Every
+            <input type="number" id="ev-every" min="1" max="999" step="1" value="1" />
+          </label>
+        </div>
+        <div id="ev-byday-row" hidden>
+          <span class="byday-buttons" id="ev-byday">
+            <button type="button" class="byday-toggle" data-day="MO">M</button>
+            <button type="button" class="byday-toggle" data-day="TU">T</button>
+            <button type="button" class="byday-toggle" data-day="WE">W</button>
+            <button type="button" class="byday-toggle" data-day="TH">T</button>
+            <button type="button" class="byday-toggle" data-day="FR">F</button>
+            <button type="button" class="byday-toggle" data-day="SA">S</button>
+            <button type="button" class="byday-toggle" data-day="SU">S</button>
+          </span>
+        </div>
+        <p id="ev-rule-preview" class="recurrence-info" hidden></p>
+        <div id="ev-scope-row" hidden>
+          <label>Apply to
+            <select id="ev-scope">
+              <option value="series">Whole series</option>
+              <option value="occurrence">This occurrence only</option>
+            </select>
+          </label>
+        </div>
         <menu>
           <button type="button" id="ev-delete" class="danger" hidden>Delete</button>
           <span class="spacer"></span>

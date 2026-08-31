@@ -190,8 +190,9 @@ export function dialogRecurrenceLine(info: SeriesInfo): string {
       : "";
   return (
     `Part of a recurring series — ${ruleText}. ` +
-    `Saving edits the series' base event (shown on every occurrence's series); ` +
-    `individual occurrence overrides are separate records.` +
+    `“Apply to: Whole series” edits the series' base event (every occurrence); ` +
+    `“This occurrence only” writes an override for just this occurrence ` +
+    `(DC-12: the override keeps its original identity; no “this and following”).` +
     overrideNote
   );
 }

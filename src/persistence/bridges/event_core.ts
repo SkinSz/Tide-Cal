@@ -29,6 +29,14 @@ export interface EventInput {
   startMs: number;
   endMs: number;
   allDay: boolean;
+  /**
+   * DC-12 §2.1: optional RFC 5545 RRULE (e.g. "FREQ=WEEKLY;BYDAY=MO").
+   * Honored on CREATE only — its presence turns the event into the base
+   * event of a recurring series (a `series` row + a verbatim stored rule).
+   * Rule edits on an existing series go through updateSeriesRule / the
+   * update_series_rule op (their own conflict entity per DC-12 §3).
+   */
+  recurrenceRule?: string;
 }
 
 const DEFAULT_CALENDAR_ID = "local";
@@ -175,6 +183,148 @@ export function validateEventValues(input: EventInput, op: string): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// DC-12 §2.1: RRULE validation. Tide defines NO custom recurrence DSL — the
+// RFC 5545 RRULE string is stored and exchanged VERBATIM. This validator is
+// the write-path gate (create_event / update_series_rule): it accepts the
+// common RFC 5545 subset the rule builder produces (FREQ required; optional
+// INTERVAL, BYDAY, COUNT, UNTIL), rejects everything else deterministically
+// BEFORE any change record / row write, and stores the string byte-identical.
+// ---------------------------------------------------------------------------
+
+const RRULE_FREQS = new Set(["DAILY", "WEEKLY", "MONTHLY", "YEARLY"]);
+const RRULE_KEYS = new Set(["FREQ", "INTERVAL", "BYDAY", "COUNT", "UNTIL"]);
+const RRULE_DAYS = new Set(["MO", "TU", "WE", "TH", "FR", "SA", "SU"]);
+
+/** Canonical recurrence_id form (DC-12 §2.3): "YYYYMMDDTHHMMSS". */
+const RECURRENCE_ID_RE = /^\d{8}T\d{6}$/;
+
+/**
+ * Validate an RRULE string (DC-12 §2.1). Returns the rule verbatim on
+ * success; throws a deterministic error otherwise. Never rewrites the rule.
+ */
+export function validateRRule(rule: unknown, op: string): string {
+  if (typeof rule !== "string" || rule.trim().length === 0) {
+    throw new Error(`${op}: recurrence_rule must be a non-empty RRULE string`);
+  }
+  const segments = rule.split(";");
+  let sawFreq = false;
+  for (const seg of segments) {
+    const eq = seg.indexOf("=");
+    if (eq <= 0) {
+      throw new Error(
+        `${op}: recurrence_rule segment "${seg}" is not KEY=VALUE — ` +
+          `the rule must be a semicolon-separated RFC 5545 RRULE`,
+      );
+    }
+    const key = seg.slice(0, eq).trim().toUpperCase();
+    const value = seg.slice(eq + 1).trim();
+    if (!RRULE_KEYS.has(key)) {
+      throw new Error(
+        `${op}: recurrence_rule key "${key}" is not supported — allowed: ` +
+          `FREQ, INTERVAL, BYDAY, COUNT, UNTIL`,
+      );
+    }
+    if (value.length === 0) {
+      throw new Error(`${op}: recurrence_rule key "${key}" has an empty value`);
+    }
+    switch (key) {
+      case "FREQ": {
+        const f = value.toUpperCase();
+        if (!RRULE_FREQS.has(f)) {
+          throw new Error(
+            `${op}: recurrence_rule FREQ "${value}" is not supported — ` +
+              `allowed: DAILY, WEEKLY, MONTHLY, YEARLY`,
+          );
+        }
+        sawFreq = true;
+        break;
+      }
+      case "INTERVAL": {
+        const n = Number(value);
+        if (!Number.isInteger(n) || n < 1) {
+          throw new Error(
+            `${op}: recurrence_rule INTERVAL "${value}" must be an integer >= 1`,
+          );
+        }
+        break;
+      }
+      case "COUNT": {
+        const n = Number(value);
+        if (!Number.isInteger(n) || n < 1) {
+          throw new Error(
+            `${op}: recurrence_rule COUNT "${value}" must be an integer >= 1`,
+          );
+        }
+        break;
+      }
+      case "UNTIL": {
+        if (!/^\d{8}$/.test(value)) {
+          throw new Error(
+            `${op}: recurrence_rule UNTIL "${value}" must be the form YYYYMMDD`,
+          );
+        }
+        break;
+      }
+      case "BYDAY": {
+        for (const d of value.split(",")) {
+          if (!RRULE_DAYS.has(d.trim().toUpperCase())) {
+            throw new Error(
+              `${op}: recurrence_rule BYDAY value "${d}" is not a weekday ` +
+                `(MO TU WE TH FR SA SU)`,
+            );
+          }
+        }
+        break;
+      }
+    }
+  }
+  if (!sawFreq) {
+    throw new Error(`${op}: recurrence_rule is missing required FREQ`);
+  }
+  return rule;
+}
+
+/** Validate a canonical recurrence_id (DC-12 §2.3 "YYYYMMDDTHHMMSS"). */
+export function validateRecurrenceId(rid: unknown, op: string): string {
+  if (typeof rid !== "string" || !RECURRENCE_ID_RE.test(rid)) {
+    throw new Error(
+      `${op}: recurrence_id must be the canonical wall-clock form ` +
+        `"YYYYMMDDTHHMMSS" (DC-12 §2.3), got: ${JSON.stringify(rid)}`,
+    );
+  }
+  return rid;
+}
+
+/** Override fields a client may set (DC-12 §2.2 / DC-07). */
+export const OVERRIDE_FIELDS = [
+  "cancelled",
+  "title",
+  "start_wall",
+  "end_wall",
+  "tz_id",
+] as const;
+
+export type OverridePatch = Partial<{
+  cancelled: boolean;
+  title: string;
+  start_wall: string;
+  end_wall: string;
+  tz_id: string;
+}>;
+
+/** occurrence_overrides row shape (the fields this bridge reads/writes). */
+interface OverrideRow {
+  series_id: string;
+  recurrence_id: string;
+  cancelled: number;
+  title: string | null;
+  start_wall: string | null;
+  end_wall: string | null;
+  tz_id: string | null;
+  updated_hlc?: number;
+}
+
 export class EventCore {
   readonly db: ReturnType<typeof openDatabase>;
   readonly dbPath: string;
@@ -266,6 +416,12 @@ export class EventCore {
     // `{id, ...input}` so a client-injected `input.id` can never override
     // the generated id even if the dispatcher guard were bypassed.
     assertNoInjectedId(input, "create");
+    // DC-12 §2.1: validate the RRULE BEFORE any write so an invalid rule
+    // leaves rows + change log byte-identical (no orphan series, no event).
+    const rule =
+      input.recurrenceRule !== undefined
+        ? validateRRule(input.recurrenceRule, "create_event")
+        : undefined;
     const event: CalendarEvent = {
       id: `evt-${randomUUID()}`,
       title: input.title,
@@ -294,6 +450,32 @@ export class EventCore {
         insertEventRow(db, event, hlc);
       },
     );
+    // DC-12 §2.1: a create-time RRULE makes this event a series base event.
+    // The series row + its change record land in a SECOND T1 (separate entity:
+    // the rule is its own conflict entity, DC-12 §3) only after the event
+    // write succeeded — a failed event create never leaves a dangling series.
+    if (rule !== undefined) {
+      const seriesId = `ser-${randomUUID()}`;
+      const seriesHlc = this.hlc.now();
+      createLocalChange(
+        this.db,
+        this.deviceId,
+        {
+          entity_id: seriesId,
+          entity_type: "series",
+          field_path: "recurrence_rule",
+          operation: "set",
+          payload: { value: rule },
+          hlc_now: () => seriesHlc,
+        },
+        (db) => {
+          db.prepare(
+            `INSERT INTO series (series_id, base_event_id, recurrence_rule, created_hlc, updated_hlc)
+             VALUES (?, ?, ?, ?, ?)`,
+          ).run(seriesId, event.id, rule, seriesHlc, seriesHlc);
+        },
+      );
+    }
     return event;
   }
 
@@ -374,6 +556,9 @@ export class EventCore {
   deleteEvent(id: string): void {
     const existing = this.getEventRow(id);
     if (!existing) return; // idempotent delete, matches shell-store behavior
+    // Resolve the series identity BEFORE any delete (it is needed both for
+    // the row cleanup below and for the D7 series tombstone record).
+    const series = this.seriesForBaseEvent(id);
     const hlc = this.hlc.now();
     createLocalChange(
       this.db,
@@ -387,9 +572,39 @@ export class EventCore {
         hlc_now: () => hlc,
       },
       (db) => {
+        // D7 delete order respects the FK graph (foreign_keys = ON):
+        // overrides -> series -> base event, all in the one T1 transaction.
+        // DC-12 §4.2 RULE D7: the series tombstone structurally dominates
+        // its overrides — deterministic, NOT a conflict, even vs concurrent
+        // override edits. One series-level remove record carries the
+        // structure; no per-override records, no resurrection path.
+        if (series) {
+          db.prepare("DELETE FROM occurrence_overrides WHERE series_id = ?").run(
+            series.series_id,
+          );
+          db.prepare("DELETE FROM series WHERE series_id = ?").run(
+            series.series_id,
+          );
+        }
         db.prepare("DELETE FROM events WHERE event_id = ?").run(id);
       },
     );
+    // D7 series-level tombstone (own entity per DC-01 §6 / DC-12 §4.2).
+    if (series) {
+      const seriesHlc = this.hlc.now();
+      createLocalChange(
+        this.db,
+        this.deviceId,
+        {
+          entity_id: series.series_id,
+          entity_type: "series",
+          field_path: "*",
+          operation: "remove",
+          payload: {},
+          hlc_now: () => seriesHlc,
+        },
+      );
+    }
   }
 
   private getEventRow(id: string): EventRow | undefined {
@@ -402,6 +617,192 @@ export class EventCore {
       .get(id);
   }
 
+  private seriesForBaseEvent(
+    baseEventId: string,
+  ): { series_id: string; recurrence_rule: string } | undefined {
+    return this.db
+      .prepare<[string], { series_id: string; recurrence_rule: string }>(
+        `SELECT series_id, recurrence_rule FROM series WHERE base_event_id = ?`,
+      )
+      .get(baseEventId);
+  }
+
+  /**
+   * DC-12 §2.1 / §3: edit the series' recurrence rule. Its own conflict
+   * entity (series_id, "recurrence_rule"); stored VERBATIM (validated first).
+   * No-op (no change record) when the rule is byte-identical.
+   */
+  updateSeriesRule(seriesId: string, rule: string): { seriesId: string; recurrenceRule: string } {
+    if (typeof seriesId !== "string" || seriesId.length === 0) {
+      throw new Error("update_series_rule: series_id must be a non-empty string");
+    }
+    const validated = validateRRule(rule, "update_series_rule");
+    const row = this.db
+      .prepare<[string], { series_id: string; recurrence_rule: string }>(
+        `SELECT series_id, recurrence_rule FROM series WHERE series_id = ?`,
+      )
+      .get(seriesId);
+    if (!row) throw new Error(`series not found: ${seriesId}`);
+    if (row.recurrence_rule === validated) {
+      return { seriesId, recurrenceRule: validated }; // idempotent no-op
+    }
+    const hlc = this.hlc.now();
+    createLocalChange(
+      this.db,
+      this.deviceId,
+      {
+        entity_id: seriesId,
+        entity_type: "series",
+        field_path: "recurrence_rule",
+        operation: "set",
+        payload: { value: validated },
+        hlc_now: () => hlc,
+      },
+      (db) => {
+        db.prepare(
+          `UPDATE series SET recurrence_rule = ?, updated_hlc = ? WHERE series_id = ?`,
+        ).run(validated, hlc, seriesId);
+      },
+    );
+    return { seriesId, recurrenceRule: validated };
+  }
+
+  /**
+   * DC-12 §2.2/§2.3/§4.1: create or edit ONE occurrence override, keyed
+   * (series_id, recurrence_id). recurrence_id is the canonical wall-clock
+   * form of the ORIGINAL occurrence start (never rewritten — R2). Each
+   * changed field is its own DC-03 conflict entity
+   * (series_id, "overrides.<rid>.<field>") — exactly one change record per
+   * field per DC-01 §3.1. Unchanged fields produce nothing (TR-8 idempotence).
+   */
+  updateOccurrence(
+    seriesId: string,
+    recurrenceId: string,
+    patch: OverridePatch,
+  ): { seriesId: string; recurrenceId: string; changed: string[] } {
+    if (typeof seriesId !== "string" || seriesId.length === 0) {
+      throw new Error("update_occurrence: series_id must be a non-empty string");
+    }
+    const rid = validateRecurrenceId(recurrenceId, "update_occurrence");
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new Error("update_occurrence: patch must be an object");
+    }
+    const unknown = Object.keys(patch).filter(
+      (k) => !(OVERRIDE_FIELDS as readonly string[]).includes(k),
+    );
+    if (unknown.length > 0) {
+      throw new Error(
+        `update_occurrence: unknown patch field(s): ${unknown.join(", ")} — ` +
+          `allowed: ${OVERRIDE_FIELDS.join(", ")}`,
+      );
+    }
+    if (Object.keys(patch).length === 0) {
+      throw new Error("update_occurrence: patch must set at least one field");
+    }
+    for (const k of ["title", "start_wall", "end_wall", "tz_id"] as const) {
+      const v = patch[k];
+      if (v !== undefined && typeof v !== "string") {
+        throw new Error(`update_occurrence: patch.${k} must be a string`);
+      }
+      if (typeof v === "string" && v.trim().length === 0) {
+        throw new Error(`update_occurrence: patch.${k} must be a non-empty string`);
+      }
+    }
+    if (
+      patch.cancelled !== undefined &&
+      typeof patch.cancelled !== "boolean"
+    ) {
+      throw new Error("update_occurrence: patch.cancelled must be a boolean");
+    }
+    const series = this.db
+      .prepare<[string], { series_id: string }>(
+        `SELECT series_id FROM series WHERE series_id = ?`,
+      )
+      .get(seriesId);
+    if (!series) throw new Error(`series not found: ${seriesId}`);
+
+    const existing = this.db
+      .prepare<[string, string], OverrideRow>(
+        `SELECT series_id, recurrence_id, cancelled, title, start_wall,
+                end_wall, tz_id, updated_hlc
+         FROM occurrence_overrides WHERE series_id = ? AND recurrence_id = ?`,
+      )
+      .get(seriesId, rid);
+
+    // Normalize to column values; skip fields whose stored value is identical
+    // (re-delivery of the same edit is a no-op beyond clock advancement).
+    const wanted: OverridePatch = {};
+    if (patch.cancelled !== undefined && (existing?.cancelled ?? 0) !== (patch.cancelled ? 1 : 0)) {
+      wanted.cancelled = patch.cancelled;
+    }
+    for (const k of ["title", "start_wall", "end_wall", "tz_id"] as const) {
+      if (patch[k] !== undefined && (existing?.[k] ?? null) !== patch[k]) {
+        wanted[k] = patch[k] as string;
+      }
+    }
+    if (Object.keys(wanted).length === 0) {
+      return { seriesId, recurrenceId: rid, changed: [] }; // idempotent
+    }
+
+    const merged: OverrideRow = {
+      series_id: seriesId,
+      recurrence_id: rid,
+      cancelled: wanted.cancelled !== undefined ? (wanted.cancelled ? 1 : 0) : (existing?.cancelled ?? 0),
+      title: wanted.title ?? existing?.title ?? null,
+      start_wall: wanted.start_wall ?? existing?.start_wall ?? null,
+      end_wall: wanted.end_wall ?? existing?.end_wall ?? null,
+      tz_id: wanted.tz_id ?? existing?.tz_id ?? null,
+    };
+    // One change record per changed field (DC-01 §3.1), each atomic with the
+    // merged row write. Field names in the entity paths use the DC-07 column
+    // names verbatim (cancelled/title/start_wall/end_wall/tz_id).
+    for (const field of OVERRIDE_FIELDS) {
+      if (!(field in wanted)) continue;
+      const fieldHlc = this.hlc.now();
+      const value = field === "cancelled" ? wanted.cancelled : wanted[field];
+      createLocalChange(
+        this.db,
+        this.deviceId,
+        {
+          entity_id: seriesId,
+          entity_type: "occurrence_override",
+          field_path: `overrides.${rid}.${field}`,
+          operation: "set",
+          payload: { value },
+          hlc_now: () => fieldHlc,
+        },
+        (db) => {
+          db.prepare(
+            `INSERT INTO occurrence_overrides (series_id, recurrence_id, cancelled,
+                title, start_wall, end_wall, tz_id, updated_hlc)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(series_id, recurrence_id) DO UPDATE SET
+                cancelled = excluded.cancelled,
+                title = excluded.title,
+                start_wall = excluded.start_wall,
+                end_wall = excluded.end_wall,
+                tz_id = excluded.tz_id,
+                updated_hlc = excluded.updated_hlc`,
+          ).run(
+            seriesId,
+            rid,
+            merged.cancelled,
+            merged.title,
+            merged.start_wall,
+            merged.end_wall,
+            merged.tz_id,
+            fieldHlc,
+          );
+        },
+      );
+    }
+    return {
+      seriesId,
+      recurrenceId: rid,
+      changed: Object.keys(wanted),
+    };
+  }
+
   /**
    * READ-ONLY series listing for recurrence surfacing (DC-12 §2): every
    * series row with its verbatim RRULE joined to its occurrence_overrides.
@@ -411,7 +812,14 @@ export class EventCore {
     seriesId: string;
     baseEventId: string;
     recurrenceRule: string;
-    overrides: Array<{ recurrenceId: string; cancelled: boolean }>;
+    overrides: Array<{
+      recurrenceId: string;
+      cancelled: boolean;
+      title: string | null;
+      startWall: string | null;
+      endWall: string | null;
+      tzId: string | null;
+    }>;
   }> {
     const rows = this.db
       .prepare<
@@ -422,20 +830,43 @@ export class EventCore {
     const overrides = this.db
       .prepare<
         [],
-        { series_id: string; recurrence_id: string; cancelled: number }
+        {
+          series_id: string;
+          recurrence_id: string;
+          cancelled: number;
+          title: string | null;
+          start_wall: string | null;
+          end_wall: string | null;
+          tz_id: string | null;
+        }
       >(
-        `SELECT series_id, recurrence_id, cancelled
+        `SELECT series_id, recurrence_id, cancelled, title, start_wall,
+                end_wall, tz_id
          FROM occurrence_overrides ORDER BY recurrence_id`,
       )
       .all();
     const bySeries = new Map<
       string,
-      Array<{ recurrenceId: string; cancelled: boolean }>
+      Array<{
+        recurrenceId: string;
+        cancelled: boolean;
+        title: string | null;
+        startWall: string | null;
+        endWall: string | null;
+        tzId: string | null;
+      }>
     >();
     for (const o of overrides) {
       let list = bySeries.get(o.series_id);
       if (!list) bySeries.set(o.series_id, (list = []));
-      list.push({ recurrenceId: o.recurrence_id, cancelled: o.cancelled !== 0 });
+      list.push({
+        recurrenceId: o.recurrence_id,
+        cancelled: o.cancelled !== 0,
+        title: o.title,
+        startWall: o.start_wall,
+        endWall: o.end_wall,
+        tzId: o.tz_id,
+      });
     }
     return rows.map((r) => ({
       seriesId: r.series_id,

@@ -16,12 +16,19 @@
 //   create_event {input: EventInput}          -> CalendarEvent
 //   update_event {id, input: EventInput}      -> CalendarEvent
 //   delete_event {id}                         -> null
+//   list_series {}                            -> SeriesRow[] (read-only)
+//   update_series_rule {series_id, rule}      -> {seriesId, recurrenceRule}
+//   update_occurrence {series_id, recurrence_id, patch} -> {seriesId, recurrenceId, changed}
 
 import { createInterface } from "node:readline";
 import {
   EventCore,
   validateEventValues,
+  validateRRule,
+  validateRecurrenceId,
+  OVERRIDE_FIELDS,
   type EventInput,
+  type OverridePatch,
 } from "./event_core.ts";
 import {
   loadOrCreateIdentity,
@@ -369,6 +376,9 @@ const EVENT_INPUT_KEYS: ReadonlySet<string> = new Set([
   "startMs",
   "endMs",
   "allDay",
+  // DC-12: optional RRULE on CREATE (makes the event a series base event).
+  // Rejected on update_event — series rule edits go through update_series_rule.
+  "recurrenceRule",
 ]);
 
 /** Same fields, in canonical contract order (error messages). */
@@ -451,6 +461,20 @@ function validateEventInput(raw: unknown, op: string): EventInput {
     endMs: input.endMs as number,
     allDay: input.allDay,
   };
+  // DC-12: optional RRULE on create; deterministic rejection on update.
+  if (input.recurrenceRule !== undefined) {
+    if (op === "update_event") {
+      fail(
+        "update_event: input.recurrenceRule is not accepted — series rule " +
+          "edits go through update_series_rule (the rule is its own DC-12 §3 " +
+          "conflict entity)",
+      );
+    }
+    if (typeof input.recurrenceRule !== "string") {
+      fail("create_event: input.recurrenceRule must be a string");
+    }
+    clean.recurrenceRule = validateRRule(input.recurrenceRule, op);
+  }
   // Shared canonical value rules (integral, bounded, endMs >= startMs).
   validateEventValues(clean, op);
   return clean;
@@ -504,6 +528,65 @@ export function makeDispatcher(core: EventCore, sync?: SyncManager): Dispatcher 
       // (DC-12 §2) — no change records, no mutation, no args.
       case "list_series":
         return core.listSeries();
+      // --- DC-12 §2.1/§3: series write paths. The rule is its own conflict
+      // entity (series_id, "recurrence_rule"); occurrence overrides are
+      // keyed (series_id, recurrence_id) with per-field DC-03 entities
+      // "overrides.<rid>.<field>" (§2.2). Deterministic ok:false on any
+      // validation failure; a rejected request never mutates state.
+      case "update_series_rule": {
+        if (
+          typeof args.series_id !== "string" ||
+          args.series_id.length === 0
+        ) {
+          fail("update_series_rule: args.series_id must be a non-empty string");
+        }
+        if (typeof args.rule !== "string") {
+          fail("update_series_rule: args.rule must be a string (RFC 5545 RRULE)");
+        }
+        return core.updateSeriesRule(args.series_id, args.rule);
+      }
+      case "update_occurrence": {
+        if (
+          typeof args.series_id !== "string" ||
+          args.series_id.length === 0
+        ) {
+          fail("update_occurrence: args.series_id must be a non-empty string");
+        }
+        const rid = validateRecurrenceId(args.recurrence_id, "update_occurrence");
+        const rawPatch = args.patch;
+        if (rawPatch === null || typeof rawPatch !== "object" || Array.isArray(rawPatch)) {
+          fail("update_occurrence: args.patch must be an object");
+        }
+        const patch = rawPatch as Record<string, unknown>;
+        const unknown = Object.keys(patch).filter(
+          (k) => !(OVERRIDE_FIELDS as readonly string[]).includes(k),
+        );
+        if (unknown.length > 0) {
+          fail(
+            `update_occurrence: unknown patch field(s): ${unknown.join(", ")} — ` +
+              `allowed: ${OVERRIDE_FIELDS.join(", ")}`,
+          );
+        }
+        if (Object.keys(patch).length === 0) {
+          fail("update_occurrence: args.patch must set at least one field");
+        }
+        const clean: OverridePatch = {};
+        if (patch.cancelled !== undefined) {
+          if (typeof patch.cancelled !== "boolean") {
+            fail("update_occurrence: patch.cancelled must be a boolean");
+          }
+          clean.cancelled = patch.cancelled;
+        }
+        for (const k of ["title", "start_wall", "end_wall", "tz_id"] as const) {
+          const v = patch[k];
+          if (v === undefined) continue;
+          if (typeof v !== "string" || v.trim().length === 0) {
+            fail(`update_occurrence: patch.${k} must be a non-empty string`);
+          }
+          clean[k] = v;
+        }
+        return core.updateOccurrence(args.series_id, rid, clean);
+      }
       // --- Pkg5 (QA M-2): read-only Conflicts surface (DC-14 §3.1/§3.2/§5).
       // Delegates to ConflictsViewModel so response shapes are the exact
       // ConflictListItem / ConflictDetailView the frontend bridge consumes.
