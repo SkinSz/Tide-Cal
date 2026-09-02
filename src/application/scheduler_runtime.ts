@@ -91,13 +91,20 @@ export function makeSessionOpener(deps: {
   privateKey: Uint8Array;
   runSession: (session: unknown) => Promise<unknown>;
 }): (args: SessionOpenerArgs) => Promise<boolean> {
-  return async ({ deviceId: _deviceId, endpoint }) => {
+  return async ({ deviceId, endpoint }) => {
     const session = await withTimeout(
       connectSync(deps.privateKey, endpoint.host, endpoint.port),
       SYNC_CONNECT_TIMEOUT_MS,
       `sync connect timed out waiting for peer ${endpoint.host}:${endpoint.port} ` +
         `(no TCP connect / Noise handshake within ${SYNC_CONNECT_TIMEOUT_MS}ms)`,
     );
+    // DC-21 D6: the session records WHICH endpoint it dialed, so a successful
+    // authenticated session can persist that endpoint as last-known. The
+    // deviceId rides along for the D3 post-handshake identity check.
+    (session as unknown as { dialEndpoint?: { host: string; port: number }; deviceId?: string }).dialEndpoint =
+      { host: endpoint.host, port: endpoint.port };
+    (session as unknown as { dialEndpoint?: { host: string; port: number }; deviceId?: string }).deviceId =
+      deviceId;
     await deps.runSession(session);
     return true;
   };

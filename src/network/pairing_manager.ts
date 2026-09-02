@@ -65,17 +65,47 @@ export function listTrustedPeers(db: Database): Array<{
   device_id: string;
   display_name: string;
   paired_at: number;
+  last_endpoint_host: string | null;
+  last_endpoint_port: number | null;
+  last_endpoint_seen: number | null;
 }> {
   return db
     .prepare(
-      `SELECT device_id, display_name, paired_at FROM peers
+      `SELECT device_id, display_name, paired_at,
+              last_endpoint_host, last_endpoint_port, last_endpoint_seen
+       FROM peers
        WHERE status = 'trusted' ORDER BY paired_at`,
     )
     .all() as Array<{
     device_id: string;
     display_name: string;
     paired_at: number;
+    last_endpoint_host: string | null;
+    last_endpoint_port: number | null;
+    last_endpoint_seen: number | null;
   }>;
+}
+
+// ---------------------------------------------------------------------------
+// DC-21 §4: last-known endpoints (D5/D6). NON-AUTHORITATIVE connectivity
+// conveniences: device-local, never replicated, never written from browse
+// results — ONLY after a successful authenticated sync session (D6). Never
+// cleared on browse removal (§4.2): a peer that said goodbye is merely gone
+// right now; the last-known endpoint is exactly the fallback for that case.
+// ---------------------------------------------------------------------------
+
+export function recordPeerEndpoint(
+  db: Database,
+  deviceId: string,
+  host: string,
+  port: number,
+  seenMs: number,
+): void {
+  db.prepare(
+    `UPDATE peers
+     SET last_endpoint_host = ?, last_endpoint_port = ?, last_endpoint_seen = ?
+     WHERE device_id = ?`,
+  ).run(host, port, seenMs, deviceId);
 }
 
 // ---------------------------------------------------------------------------

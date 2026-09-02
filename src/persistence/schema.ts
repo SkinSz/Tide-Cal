@@ -2,7 +2,7 @@
 // One source of truth for table creation. Encryption-at-rest is applied at
 // connection level (SQLCipher key pragma) by the caller, not here.
 
-export const SCHEMA_VERSION = 6; // v2: TD-001 skipped_seqs; v3: TD-005 quarantine lifecycle (resolved_at_hlc, resolved_reason); v4: TD-006/DC-16 hard_blocks + peer_invalid_tally; v5: TD-005 quarantine_prune_stats (retention-cap bookkeeping); v6: Pkg1 entity_versions (durable per-entity version vectors, compaction-proof snapshots)
+export const SCHEMA_VERSION = 7; // v2: TD-001 skipped_seqs; v3: TD-005 quarantine lifecycle (resolved_at_hlc, resolved_reason); v4: TD-006/DC-16 hard_blocks + peer_invalid_tally; v5: TD-005 quarantine_prune_stats (retention-cap bookkeeping); v6: Pkg1 entity_versions (durable per-entity version vectors, compaction-proof snapshots); v7: DC-21 peers.last_endpoint_host/port/seen (non-authoritative last-known endpoints)
 
 export const DDL = `
 CREATE TABLE calendars (
@@ -65,6 +65,13 @@ CREATE TABLE reminders (
     updated_hlc     INTEGER NOT NULL,
     UNIQUE (entity_id, collection_path, member_id)
 );
+-- DC-22 §2.4/D5: disabled reminders are STORED but INACTIVE (replicate,
+-- merge, show in UI; never scheduled). NULL/1 = active; 0 = disabled.
+ALTER TABLE reminders ADD COLUMN enabled INTEGER CHECK (enabled IN (0, 1));
+
+-- DC-22 §5.4/D2: per-event day-before reminder time for all-day events
+-- ("HH:MM"). NULL = reminder not configured (opt-in per event, no default).
+ALTER TABLE events ADD COLUMN all_day_reminder_time TEXT;
 
 CREATE TABLE attendees (
     member_id       TEXT PRIMARY KEY,
@@ -183,7 +190,10 @@ CREATE TABLE peers (
     display_name     TEXT NOT NULL,
     paired_at        INTEGER NOT NULL,
     status           TEXT NOT NULL CHECK (status IN ('trusted','revoked')),
-    last_known_clock TEXT NOT NULL DEFAULT '{}'
+    last_known_clock TEXT NOT NULL DEFAULT '{}',
+    last_endpoint_host TEXT,
+    last_endpoint_port INTEGER,
+    last_endpoint_seen INTEGER
 );
 
 CREATE TABLE revocation_records (

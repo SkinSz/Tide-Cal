@@ -31,6 +31,14 @@
 //         fail-open on malformed files (defaults), env vars win.
 
 mod sidecar;
+mod mdns_service;
+// DC-11 §7: mDNS platform adapter. Lives in the lib so mdns_service (DC-21)
+// can name its concrete adapter type via MdnsAdapterImpl; still NOT
+// registered as Tauri commands — browse events flow through mdns_service's
+// EventSink to the sidecar (DC-21 §3.1/D1).
+#[cfg_attr(not(feature = "mdns"), allow(dead_code))]
+#[path = "discovery.rs"]
+mod tide_discovery;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -657,6 +665,12 @@ pub fn run() {
             std::fs::create_dir_all(&data_dir)?;
             let db_path = data_dir.join("tide-domain.db");
 
+            // DC-21 (pkg10 review F1): manage the browse service BEFORE the
+            // sidecar-ready block below calls app.state::<BrowseService>() —
+            // Tauri state() panics on unmanaged types. Snapshot push and
+            // browse-loop start both run after this line.
+            app.manage(mdns_service::BrowseService::new());
+
             match resolve_sidecar_path(app.handle()) {
                 Some(path) => {
                     let mut cmd = std::process::Command::new("node");
@@ -674,7 +688,19 @@ pub fn run() {
                                      event CRUD will fall back client-side"
                                 ),
                             }
-                            app.manage(SidecarState(Mutex::new(Some(Arc::new(sc)))));
+                            // DC-21 §3.2(b)/§5.1: sidecar confirmed ready —
+                            // push the current browse snapshot so a restarted
+                            // sidecar seeds its endpoint cache without
+                            // waiting a full browse cycle (D8: idempotent,
+                            // order-independent). PingSink forwards each
+                            // recorded observation as an mdns_event push.
+                            // BrowseService is managed earlier in setup (F1).
+                            {
+                                let sc_arc = Arc::new(sc);
+                                let svc = app.state::<mdns_service::BrowseService>();
+                                svc.push_snapshot(Arc::new(mdns_service::PingSink { sc: Arc::clone(&sc_arc) }));
+                                app.manage(SidecarState(Mutex::new(Some(sc_arc))));
+                            }
                         }
                         Err(e) => {
                             log::error!("failed to spawn tide sidecar: {e}");
@@ -692,6 +718,80 @@ pub fn run() {
                 }
             }
             app.manage(SyncFlight(AtomicBool::new(false)));
+
+
+            // DC-21 §3.1/§3.2/§5.1: start continuous mDNS browsing in the
+            // shell; every browse transition is pushed to the sidecar as an
+            // mdns_event notification over the existing NDJSON channel. The
+            // sidecar owns the ONE endpoint cache (D2); this shell never
+            // stores peer state (D3: routing hints only). Feature-gated:
+            // without the `mdns` cargo feature this is an honest no-op
+            // (§6.1/D9) and the sidecar falls back to last-known endpoints.
+            #[cfg(feature = "mdns")]
+            {
+                struct SidecarEventSink {
+                    sc: Arc<sidecar::Sidecar>,
+                }
+                impl mdns_service::EventSink for SidecarEventSink {
+                    fn push_event(&self, event: mdns_service::MdnsEvent) {
+                        if let Err(e) = self.sc.notify_mdns_event(
+                            &event.kind,
+                            &event.instance_name,
+                            &event.host,
+                            event.port,
+                            event.observed_at,
+                            event.ttl_ms,
+                        ) {
+                            log::debug!("mdns_event push skipped: {e}");
+                        }
+                    }
+                    fn sidecar_alive(&self) -> bool {
+                        self.sc.is_alive()
+                    }
+                }
+                if let Ok(state) = app
+                    .try_state::<SidecarState>()
+                    .ok_or_else(|| "no sidecar".to_string())
+                    .and_then(|s| {
+                        s.0.lock()
+                            .map(|g| g.clone())
+                            .map_err(|_| "sidecar lock poisoned".to_string())
+                    })
+                {
+                    if let Some(sc) = state {
+                        let sink: Arc<dyn mdns_service::EventSink> =
+                            Arc::new(SidecarEventSink { sc });
+                        let svc = app.state::<mdns_service::BrowseService>();
+                        let mdns = match mdns_service::MdnsAdapterImpl::new() {
+                            Ok(m) => Some(m),
+                            Err(e) => {
+                                log::warn!(
+                                    "mdns daemon unavailable: {e} (sidecar falls back to last-known endpoints, DC-21 §6.1)"
+                                );
+                                None
+                            }
+                        };
+                        match mdns {
+                            Some(m) => {
+                                if let Err(e) = svc.start(sink, m) {
+                                    log::warn!("mdns browse service failed to start: {e}");
+                                }
+                            }
+                            None => {
+                                // Feature on but daemon unavailable: skip the
+                                // browse loop; sidecar uses last-known (D9).
+                            }
+                        }
+                    } else {
+                        log::warn!("mdns browse service not started: no sidecar");
+                    }
+                }
+            }
+            #[cfg(not(feature = "mdns"))]
+            {
+                log::info!("mdns browse service not started: feature disabled (DC-21 §6.1/D9)");
+            }
+
             Ok(())
         })
         .on_window_event(|window, event| {

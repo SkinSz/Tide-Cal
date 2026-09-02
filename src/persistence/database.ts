@@ -122,6 +122,26 @@ function initializeSchema(db: Database.Database): void {
           updated_hlc        INTEGER NOT NULL)`);
         backfillEntityVersions(db);
       }
+      if (row!.version < 7) {
+        // DC-21 §4.1/D5: last-known endpoints on peers (nullable, additive,
+        // non-authoritative, device-local, never replicated). Written ONLY
+        // after a successful authenticated session (D6). Column guards keep
+        // this safe if a sibling migration already applied them.
+        const cols = (
+          db.prepare("PRAGMA table_info(peers)").all() as Array<
+            { name: string }
+          >
+        ).map((c) => c.name);
+        if (!cols.includes("last_endpoint_host")) {
+          db.exec("ALTER TABLE peers ADD COLUMN last_endpoint_host TEXT");
+        }
+        if (!cols.includes("last_endpoint_port")) {
+          db.exec("ALTER TABLE peers ADD COLUMN last_endpoint_port INTEGER");
+        }
+        if (!cols.includes("last_endpoint_seen")) {
+          db.exec("ALTER TABLE peers ADD COLUMN last_endpoint_seen INTEGER");
+        }
+      }
       db.prepare("UPDATE schema_version SET version = ?").run(SCHEMA_VERSION);
     });
     tx();

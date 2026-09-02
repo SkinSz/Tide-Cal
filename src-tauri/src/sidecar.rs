@@ -111,6 +111,46 @@ impl Sidecar {
         self.call("ping", json!({}))
     }
 
+    /// DC-21 §3.2(a): fire-and-forget mdns_event notification. Notifications
+    /// carry NO id — they are one-way pushes the sidecar consumes without
+    /// replying (same stderr-logging discipline as always; nothing on stdout
+    /// but correlated responses).
+    pub fn notify_mdns_event(
+        &self,
+        kind: &str,
+        instance_name: &str,
+        host: &str,
+        port: u16,
+        observed_at: u64,
+        ttl_ms: u64,
+    ) -> Result<(), String> {
+        let mut inner = self.inner.lock().map_err(|_| "sidecar lock poisoned")?;
+        let stdin = match inner.stdin.as_mut() {
+            Some(s) => s,
+            None => return Err("sidecar is shutting down (stdin closed)".to_string()),
+        };
+        let line = json!({
+            "id": null,
+            "notification": "mdns_event",
+            "args": {
+                "kind": kind,
+                "instance_name": instance_name,
+                "host": host,
+                "port": port,
+                "interface": "",
+                "observed_at": observed_at,
+                "ttl_ms": ttl_ms,
+            }
+        })
+        .to_string();
+        writeln!(stdin, "{line}").and_then(|_| stdin.flush()).map_err(|e| format!("sidecar write: {e}"))
+    }
+
+    /// True while the child process is still running (no exit reported).
+    pub fn is_alive(&self) -> bool {
+        matches!(self.child.lock().unwrap().try_wait(), Ok(None))
+    }
+
     /// DC-20 §7.1 live-apply: push new scheduler settings to the sidecar.
     /// Fire-and-forget from the caller's perspective (errors logged there);
     /// the sidecar's update_settings op applies them to its scheduler runtime.

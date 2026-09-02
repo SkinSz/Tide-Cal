@@ -37,12 +37,21 @@ import {
   SYNC_DEFAULT_PORT,
   type InboundSession,
 } from "../../network/sync_runtime.ts";
+import { ed25519ToX25519PublicKey } from "../../network/noise_transport.ts";
+import {
+  EndpointCache,
+  matchInstanceToPeer,
+  resolveEndpoint,
+  type MdnsEvent,
+} from "../../network/endpoint_bridge.ts";
+import { instancePrefix } from "../../network/discovery.ts";
 import type { DeviceIdentity } from "../../security/identity.ts";
 import {
   createPairingOffer,
   acceptPairingPayload,
   sqlPeerStore,
   listTrustedPeers,
+  recordPeerEndpoint,
 } from "../../network/pairing_manager.ts";
 import {
   makeEntityMutator,
@@ -52,6 +61,12 @@ import {
   startSchedulerRuntime,
   makeSessionOpener,
 } from "../../application/scheduler_runtime.ts";
+import {
+  rebuildSchedule,
+  filterDelivered,
+  markDelivered,
+} from "../../application/reminder_engine.ts";
+import { deliverNotification } from "../../application/notification_delivery.ts";
 import {
   listQuarantine,
   countQuarantined,
@@ -216,39 +231,113 @@ export class SyncManager {
     if (this.pendingOffer === offer) this.pendingOffer = null;
   }
 
-  /** Run a sync engine session over an authenticated channel. */
-  async runEngineSession(session: InboundSession): Promise<{
+  /**
+   * Run a sync engine session over an authenticated channel.
+   *
+   * DC-21 D3 (owner amendment, binding): BEFORE any session result is
+   * trusted, the handshake's remote static key is verified against the trust
+   * store row for `expectedDeviceId` (when the caller attributes the dial to
+   * a paired peer — scheduler path). A mismatch throws BEFORE runSession, so
+   * nothing is exchanged and nothing is persisted (DC-11 §4.6 silent drop).
+   */
+  async runEngineSession(session: InboundSession, expectedDeviceId?: string): Promise<{
     sent: number;
     receivedApplied: number;
     receivedBuffered: number;
     receivedDuplicate: number;
     remote_device_id: string;
   }> {
-    const engine = createSyncEngine({
-      db: this.core.db,
-      selfDeviceId: this.identity.deviceId,
-      mutateEntity: makeEntityMutator(),
-      misbehavior: this.misbehavior,
-    });
-    let stats;
+    const remoteKeyBuf = Buffer.from(session.raw.remoteStaticKey());
     try {
-      stats = await engine.runSession(session.transport);
-    } finally {
-      // Pkg4 (QA M-3/BND-08): the socket must never dangle on a failed
-      // session — a timed-out/stalled peer previously left this side's
-      // connection open forever (session.done() was only reached on the
-      // success path). done() is idempotent-safe on a dead socket (end()
-      // on a destroyed socket is a no-op).
+      if (expectedDeviceId !== undefined) {
+        // D3: routing hints are NOT identity. Only the handshake result, checked
+        // against the trust store, proves who is on the other end. This throw
+        // is INSIDE the try below the finally scope guard (pkg10 F3): the
+        // socket closes even on identity mismatch — no FD exhaustion via
+        // repeated spoofed dials.
+        const row = this.core.db
+          .prepare(
+            "SELECT public_key FROM peers WHERE device_id = ? AND status = 'trusted'",
+          )
+          .get(expectedDeviceId) as { public_key: Buffer } | undefined;
+        const remoteX25519Hex = remoteKeyBuf.toString("hex");
+        const trustedX25519Hex = row
+          ? Buffer.from(
+              ed25519ToX25519PublicKey(new Uint8Array(row.public_key)),
+            ).toString("hex")
+          : null;
+        if (row === undefined || trustedX25519Hex !== remoteX25519Hex) {
+          throw new Error(
+            `DC-21 D3 identity mismatch: endpoint attributed to ${expectedDeviceId} ` +
+              `presented remote static key ${remoteX25519Hex.slice(0, 16)}… — ` +
+              `session aborted, endpoint NOT persisted (DC-11 §4.6 silent drop)`,
+          );
+        }
+      }
+      const engine = createSyncEngine({
+        db: this.core.db,
+        selfDeviceId: this.identity.deviceId,
+        mutateEntity: makeEntityMutator(),
+        misbehavior: this.misbehavior,
+      });
+      let stats;
+      try {
+        stats = await engine.runSession(session.transport);
+      } finally {
+        // Pkg4 (QA M-3/BND-08): the socket must never dangle on a failed
+        // session — a timed-out/stalled peer previously left this side's
+        // connection open forever (session.done() was only reached on the
+        // success path). done() is idempotent-safe on a dead socket (end()
+        // on a destroyed socket is a no-op).
+        session.done();
+      }
+      // DC-21 D6: record the endpoint only AFTER a successful authenticated
+      // session with a KNOWN expected peer (scheduler path). Inbound sessions
+      // (no expectedDeviceId) resolve identity from the trust store by key.
+      const remoteDeviceId =
+        expectedDeviceId ?? this.resolveDeviceIdByRemoteKey(remoteKeyBuf);
+      if (remoteDeviceId !== undefined && session.dialEndpoint !== undefined) {
+        recordPeerEndpoint(
+          this.core.db,
+          remoteDeviceId,
+          session.dialEndpoint.host,
+          session.dialEndpoint.port,
+          Date.now(),
+        );
+      }
+      return {
+        ...stats,
+        remote_device_id: remoteDeviceId ?? "unknown",
+      };
+    } catch (err) {
+      // pkg10 F3: session.done() is idempotent-safe — always run it when the
+      // pre-exchange identity check or anything else throws before the
+      // inner finally was reached. Re-throw to preserve the loud failure.
       session.done();
+      throw err;
     }
-    return {
-      ...stats,
-      remote_device_id: Buffer.from(session.raw.remoteStaticKey()).length
-        ? `x25519:${Buffer.from(session.raw.remoteStaticKey())
-            .toString("hex")
-            .slice(0, 16)}`
-        : "unknown",
-    };
+  }
+
+  /**
+   * DC-21 D3/D6: inbound sessions have no expectedDeviceId (the peer dialed
+   * us); resolve identity by matching the handshake's remote static key
+   * against the trust store. Unmatched keys return undefined — the session
+   * stats still return (the engine already ran; the data flow was
+   * authenticated by Noise against SOME paired key or rejected), but no
+   * endpoint is recorded.
+   */
+  private resolveDeviceIdByRemoteKey(remoteKeyBuf: Buffer): string | undefined {
+    const rows = this.core.db
+      .prepare("SELECT device_id, public_key FROM peers WHERE status = 'trusted'")
+      .all() as Array<{ device_id: string; public_key: Buffer }>;
+    const remoteHex = remoteKeyBuf.toString("hex");
+    for (const row of rows) {
+      const x25519 = Buffer.from(
+        ed25519ToX25519PublicKey(new Uint8Array(row.public_key)),
+      );
+      if (x25519.toString("hex") === remoteHex) return row.device_id;
+    }
+    return undefined;
   }
 
   private onInbound(session: InboundSession): void {
@@ -740,6 +829,8 @@ export function makeSyncDispatcher(
             display_name: p.display_name,
             paired_at: p.paired_at * 1000,
           })),
+          // DC-21 §3.4/D4: the shell registers mDNS on this port (and
+          // re-registers goodbye-first on change).
           listening_port: sync.ensureListener(),
         };
       }
@@ -915,7 +1006,25 @@ export async function handleLine(
 ): Promise<string> {
   let response: Json;
   try {
-    const req = JSON.parse(line) as { id?: unknown; op?: string; args?: Json };
+    const req = JSON.parse(line) as {
+      id?: unknown;
+      op?: string;
+      args?: Json;
+      notification?: string;
+    };
+    // DC-21 §3.2(a): one-way notifications from Rust (no usable id, no
+    // reply). Rust sends "id": null for notifications; anything null/absent
+    // that carries a "notification" field is treated as one-way (pkg10 F2).
+    // Currently only mdns_event; unknown notifications are logged and
+    // dropped (fail-open, §6.1 Tier-1).
+    if (req.id == null && typeof req.notification === "string") {
+      if (req.notification === "mdns_event") {
+        // The mdns dispatcher is registered by main() as a notification sink;
+        // route through the dispatcher with a synthetic op name.
+        void dispatcher("mdns_event", req.args ?? {});
+      }
+      return ""; // no reply line for notifications
+    }
     if (typeof req.op !== "string") throw new Error("missing op");
     try {
       // Await async op results BEFORE building the envelope: JSON.stringify
@@ -997,31 +1106,178 @@ function main(): void {
     op === "reset_peer_state" || op === "unblock_peer"
       ? syncDispatch(op, args)
       : dispatch(op, args);
+  // DC-21 §3.2/D2: the ONE endpoint cache (sidecar-side, in-memory, keyed by
+  // instance_name). Fed by `mdns_event` pushes from Rust; seeded once at
+  // startup by `mdns_snapshot`. Never persisted (§7 privacy).
+  const endpointCache = new EndpointCache();
+  // DC-21 §3.3/D3 prefilter source: paired, trusted peer device ids.
+  const pairedDeviceIds = (): string[] =>
+    listTrustedPeers(core.db).map((p) => p.device_id);
+  const expectedPrefixes = (): Map<string, string> => {
+    const map = new Map<string, string>();
+    for (const deviceId of pairedDeviceIds()) {
+      map.set(instancePrefix(deviceId), deviceId);
+    }
+    return map;
+  };
+  const combinedWithMdns: Dispatcher = (op, args) => {
+    if (op === "mdns_event") {
+      // DC-21 §3.2(a): push notification, one per browse transition.
+      // Prefilter by instance prefix (D3): non-paired instances are dropped
+      // here — sidecar-local, in-memory only, never logged above debug.
+      const e = args as unknown as MdnsEvent;
+      if (
+        (e.kind !== "added" && e.kind !== "removed") ||
+        typeof e.instance_name !== "string" ||
+        typeof e.host !== "string" ||
+        typeof e.port !== "number"
+      ) {
+        console.error("[tide] mdns_event: malformed event ignored");
+        return { applied: false };
+      }
+      const deviceId = matchInstanceToPeer(e.instance_name, pairedDeviceIds());
+      if (deviceId === undefined) {
+        // Non-paired discovery result: ignored silently (privacy §7).
+        return { applied: false };
+      }
+      endpointCache.applyEvent(e, deviceId);
+      return { applied: true };
+    }
+    if (op === "mdns_snapshot") {
+      // DC-21 §3.2(b): one-shot cache seed at sidecar start (§5.1/§6.3).
+      // Rust returns its current browse cache; entries are prefiltered here.
+      const entries = (args as { entries?: Array<Omit<MdnsEvent, "kind">> })
+        .entries;
+      if (!Array.isArray(entries)) {
+        // §6.1: mdns unavailable/failed — explicit empty result; the sidecar
+        // never guesses why (INVARIANT 12). Falls back to last-known only.
+        return { applied: 0, available: false };
+      }
+      const applied = endpointCache.applySnapshot(entries, expectedPrefixes());
+      return { applied, available: true };
+    }
+    return combined(op, args);
+  };
   const rl = createInterface({ input: process.stdin });
   rl.on("line", (line) => {
     const trimmed = line.trim();
     if (!trimmed) return;
-    void handleLine(combined, trimmed).then((out) =>
-      process.stdout.write(out + "\n"),
-    );
+    void handleLine(combinedWithMdns, trimmed).then((out) => {
+      // DC-21 §3.2(a): notifications return "" — write nothing (an empty
+      // stdout line would corrupt the request/response id correlation on
+      // the Rust reader side).
+      if (out !== "") process.stdout.write(out + "\n");
+    });
   });
   // DC-13 §5/§7 runtime: timers drive the pure Scheduler (debounced push,
-  // periodic sweep). Sweep actions are NO-OPed inside the runtime (standing
-  // constraint until the compaction feature ships). Endpoint note: the peers
-  // table has no host/port and mDNS browse is not yet plumbed into the
-  // sidecar, so every peer starts endpoint-less and is skipped with a log
-  // line — automatic sessions begin once DC-11 endpoints arrive. Manual
-  // sync_now (tray/toolbar) is unaffected: it takes its endpoint explicitly.
+  // periodic sweep). DC-21 §4.3/D7: listPeers resolves each peer's endpoint
+  // by precedence — live mDNS cache entry > last-known endpoint (peers
+  // table) > skip with log. D6: successful sessions write last-known via
+  // runEngineSession (dialEndpoint); failed dials write nothing (§6.2).
+  // DC-22 §3.1/§3.2/§8: reminder engine — pure rebuild from local DB state,
+  // evaluated on a 30s tick plus immediately at sidecar start (§3.2: nothing
+  // persisted; restart rebuilds). Idempotency via deterministic schedule
+  // keys + in-session delivered-once guard (D10); missed policy per D1;
+  // delivery via the OS desktop notification service (D7), Tier-1 degraded
+  // failures (§7.1/D11). Delivery is an EPHEMERAL LOCAL SIDE EFFECT (D9) —
+  // nothing here ever enters the changelog.
+  const deliveredReminderKeys = new Set<string>();
+  // pkg10 F5: bound the delivered set — prune keys older than 25h (no live
+  // reminder key can predate that: future keys aren't in the set until
+  // fired, and a fired key more than a day old can only re-derive if the
+  // clock jumps BACKWARD more than a day, which D12's rebuild policy treats
+  // as a fresh missed-surface anyway).
+  const deliveredPrune = (): void => {
+    const cutoff = Date.now() - 25 * 3_600_000;
+    for (const key of deliveredReminderKeys) {
+      const ms = Number(key.split("|")[2]);
+      if (Number.isFinite(ms) && ms < cutoff) deliveredReminderKeys.delete(key);
+    }
+  };
+  const reminderTick = (): void => {
+    try {
+      // Real events schema: timed events carry utc_start_ms/utc_end_ms (the
+      // authoritative INSTANT — respects tz_id per DC-22 §5.1) plus wall
+      // strings for labels; all-day events carry start_date/end_date
+      // (midnight wall convention, local by definition).
+      const events = core.db
+        .prepare(
+          `SELECT e.event_id AS entity_id, e.title,
+                  e.utc_start_ms, e.utc_end_ms,
+                  COALESCE(e.start_wall, e.start_date || 'T00:00') AS start_wall,
+                  COALESCE(e.end_wall, e.end_date || 'T23:59')      AS end_wall,
+                  e.all_day, e.all_day_reminder_time
+           FROM events e`
+        )
+        .all() as never[];
+      const reminders = core.db
+        .prepare(
+          // DC-22 D5: disabled reminders (enabled = 0) are stored but INACTIVE
+          // — the schedule engine never schedules them (NULL/1 = active).
+          "SELECT member_id, entity_id, minutes_before FROM reminders WHERE enabled IS NULL OR enabled = 1",
+        )
+        .all() as never[];
+      const schedule = rebuildSchedule(events, reminders, Date.now());
+      deliveredPrune();
+      const due = filterDelivered(schedule, deliveredReminderKeys);
+      for (const fire of due) {
+        // pkg10 F1: mark delivered ONLY on confirmed dispatch. A failed
+        // delivery stays unmarked → §7.1 retry on the next rebuild tick.
+        deliverNotification(fire, (ok) => {
+          if (ok) markDelivered(deliveredReminderKeys, [fire]);
+        });
+      }
+    } catch (err) {
+      // §7.4/D11: rebuild error logs, keeps previous state, retries next tick.
+      console.error(
+        "[tide] reminder rebuild failed (will retry):",
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  };
+  // §3.2: initial rebuild immediately at start (missed policy D1 applies).
+  reminderTick();
+  const reminderTimer = setInterval(reminderTick, 30_000);
+  void reminderTimer; // cleared implicitly at process exit
+
   const schedulerRuntime = startSchedulerRuntime({
     now: () => Date.now(),
-    listPeers: () =>
-      listTrustedPeers(core.db).map((p) => ({
+    listPeers: () => {
+      // pkg10 review F6: ONE query per decision pass, not N+1.
+      const peers = listTrustedPeers(core.db);
+      const byDevice = new Map(peers.map((p) => [p.device_id, p]));
+      return peers.map((p) => ({
         deviceId: p.device_id,
-        endpoint: null,
-      })),
+        endpoint:
+          resolveEndpoint(
+            endpointCache,
+            {
+              deviceIds: () => peers.map((x) => x.device_id),
+              lastKnown: (deviceId: string) => {
+                const row = byDevice.get(deviceId);
+                return row?.last_endpoint_host != null &&
+                  row.last_endpoint_port != null &&
+                  row.last_endpoint_seen != null
+                  ? {
+                      host: row.last_endpoint_host,
+                      port: row.last_endpoint_port,
+                      seen: row.last_endpoint_seen,
+                    }
+                  : null;
+              },
+            },
+            p.device_id,
+          )?.endpoint ?? null,
+      }));
+    },
     openSession: makeSessionOpener({
       privateKey: sync.identity.privateKey,
-      runSession: (session) => sync.runEngineSession(session as never),
+      runSession: (rawSession) => {
+        // makeSessionOpener passes the InboundSession plus the deviceId the
+        // scheduler attributed to the endpoint (SessionOpenerArgs.deviceId).
+        const session = rawSession as InboundSession & { deviceId?: string };
+        return sync.runEngineSession(session, session.deviceId);
+      },
     }),
     log: (m: string) => console.error(`[tide] ${m}`),
   });

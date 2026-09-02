@@ -173,6 +173,12 @@ export interface InboundSession {
   json: JsonChannel;
   /** Ends the underlying connection (call after use finishes). */
   done(): void;
+  /**
+   * DC-21 D6: the endpoint this session DIALED (scheduler/connectSync path
+   * only; undefined for inbound sessions). Recorded into the peers table as
+   * the last-known endpoint ONLY after a successful authenticated session.
+   */
+  dialEndpoint?: { host: string; port: number };
 }
 
 /**
