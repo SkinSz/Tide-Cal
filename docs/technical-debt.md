@@ -15,7 +15,8 @@ stable, blind final verification PASS WITH CONCERNS with zero new issues).
 - **ID:** TD-001
 - **Title:** Quarantined producer sequence can permanently block later records from the same producer
 - **Priority:** 7/10 — HIGH
-- **Status:** OPEN
+- **Status:** RESOLVED (implemented 2026-08-27, commits 271e86c + 96a257a; RATIFIED by owner 2026-09-02) — registry closure 2026-09-02.
+- **Ratification note (owner, 2026-09-02):** Option 3 (quarantine-and-skip with retained records + defined recovery path) is confirmed as the binding semantics. The registry entry is now closed to match the already-shipped implementation; no code change was required or made by this closure.
 - **Why it matters:** Potential synchronization liveness/convergence failure. If producer P's seq N is quarantined, dense-sequence expectation means all of P's later records buffer in `pending_changes` waiting for a record that will never apply — unbounded durable growth, stream never converges.
 - **Current behavior:** `applyBatch` in `src/sync/sync_engine.ts` quarantines records failing `validateChangeRecord` (DC-04 §4.3 durable quarantine) but does not advance any frontier for them. Later seqs of the same producer stay buffered (confirmed by blind verifier probe3: d-M seq 1 quarantined, seq 2 left as durable pending zombie).
 - **Trigger for addressing it:** Next sync work session; must precede release of multi-device sync.
@@ -183,7 +184,7 @@ stable, blind final verification PASS WITH CONCERNS with zero new issues).
 - **ID:** TD-012
 - **Title:** Post sync-stall-fix full suite re-run (npm test + tsc + cargo build) not yet executed
 - **Priority:** 5/10 — MEDIUM
-- **Status:** OPEN (created 2026-09-01)
+- **Status:** RESOLVED (2026-09-02). Superseded-in-part by TD-020: the run HAPPENED and found 4 real deterministic failures (the barrier regression) — that was the finding, not a flake. The failures were fixed by the TD-020 package (commit bc1a3de, pkg7 blind review). Post-fix gate: `npx vitest run` → 705/705 PASS (74 files) + `npx tsc --noEmit` → 0 + `node tests/probes/three_device_harness.mjs` → 7/7 PASS, all recorded in the TD-020 commit.
 - **Why it matters:** The c088023 sync-stall fix is verified by scoped suites (transport 17/17, sync suites 8/8, recurrence 24/24) and the full three-device harness (7/7 scenarios, 50 sessions, 0 session errors) — but the FULL vitest suite has not been re-run since the fix. The one-suite-at-a-time rule (postmortem c13e457) deliberately deferred it while the two blind adversarial reviewers hold the repo.
 - **Resolving action:** One clean full `npm test` + `npx tsc --noEmit` + `cargo build` pass, recorded here with COMMAND + EXIT STATUS. Expected: all green (no other production code changed in c088023 beyond sync_engine/noise_transport). Any failure here is a finding, not a flake — investigate, never ratchet.
 - **Trigger:** Immediately after both blind reviewers deliver.
@@ -201,7 +202,7 @@ stable, blind final verification PASS WITH CONCERNS with zero new issues).
 - **ID:** TD-014
 - **Title:** expandOccurrences: DAILY/MONTHLY INTERVAL>1 hangs or collapses; WEEKLY without BYDAY expands daily; WEEKLY INTERVAL>1 picks wrong weeks
 - **Priority:** 9/10 — CRITICAL (UI freeze reachable from the dialog builder)
-- **Status:** OPEN (created 2026-09-01, blind adversarial review F1/F2/F3)
+- **Status:** RESOLVED (2026-09-02, commit bc1a3de, pkg8 blind review). Expansion rewritten as direct per-FREQ RFC 5545 stepping; all reviewer probe cases + 11 regression tests in tests/td014_expansion.test.ts; hangs empirically reproduced pre-fix (RED probe) and eliminated.
 - **Findings (file:line, empirical probes in reviewer report):**
   - F1 CRITICAL: `src/domain/recurrence_conflicts.ts:198-212` — skip loop never recomputes `daysSinceBase`, so `DAILY;INTERVAL=2` HANGS the renderer (probe: COUNT=5 never returns); with UNTIL it collapses to 1 occurrence; `MONTHLY;INTERVAL=2` hangs; `periodDays = 28*interval` is not a month.
   - F2 MAJOR: `:175-176` — `FREQ=WEEKLY` without BYDAY matches every day (comment claims base-weekday restriction; code doesn't do it). Probe: base Wed, 1-week window → 14 daily chips.
@@ -215,7 +216,7 @@ stable, blind final verification PASS WITH CONCERNS with zero new issues).
 - **ID:** TD-015
 - **Title:** dialog.ts derives recurrenceId from the override's moved startMs → second edit of a moved occurrence writes an orphan override + duplicate chip
 - **Priority:** 8/10 — HIGH (data integrity, DC-12 R1/R2 violation)
-- **Status:** OPEN (created 2026-09-01, blind adversarial review F4)
+- **Status:** RESOLVED (2026-09-02, commit bc1a3de, pkg8 blind review). dialogOccurrenceId captured at open from occurrenceOf chip meta; used in override save AND occurrence-cancel; fallback to deriveRecurrenceId only for base events. Regression: tests/td015_override_identity.test.ts (2 tests, RED on old code).
 - **Finding:** `frontend/dialog.ts:661,716-719` calls `deriveRecurrenceId(existing.startMs, …)` where `existing` is the rendered chip whose startMs is the override's moved start. calendar.ts:278 already exports `occurrenceOf(ev)` carrying the correct original recurrenceId — dialog.ts never imports it. Second edit/delete of a moved occurrence keys a NEW override under the moved wall-time; the original is orphaned, uneditable from the UI, and the grid renders duplicate chips.
 - **Fix direction:** thread the chip's original `recurrenceId` (via `occurrenceOf`) into the dialog open path and derive from THAT; regression test: move an occurrence, edit it again, assert ONE override row and one chip.
 - **Trigger:** same wave as TD-014 (recurrence follow-up package).
@@ -224,7 +225,7 @@ stable, blind final verification PASS WITH CONCERNS with zero new issues).
 - **ID:** TD-016
 - **Title:** dialog Save with Repeat unchecked runs deleteEvent(id) on the series — no confirmation, no warning
 - **Priority:** 7/10 — HIGH (destructive action behind an innocuous Save)
-- **Status:** OPEN (created 2026-09-01, blind adversarial review F5); SEMANTICS DECIDED by owner 2026-09-02
+- **Status:** RESOLVED (2026-09-02, commit bc1a3de, pkg8 blind review; SEMANTICS DECIDED by owner 2026-09-02)
 - **Owner decision (2026-09-02, binding):** KEEP THE EVENT CHAIN when the tickbox is unset. Unchecking "Repeat" must NOT delete anything. It means "end recurrence here": all past occurrences remain on the calendar untouched, the series terminates at the edited occurrence (UNTIL = edit point / recurrence ends), and the edited occurrence survives as a standalone single event with the user's latest edits. Whole-series deletion remains available ONLY as the explicit delete-series action (series root / dialog's whole-series choice) behind the two-step destructive confirm. Unchecking a checkbox is never a delete.
 - **Finding:** `frontend/dialog.ts:644-653`. Violates the destructive-confirm contract (two-step confirm with warning; `confirm:true` at RPC level) and the UI-interaction-is-owner's-call rule.
 - **Fix direction:** implement the owner semantics above: Save with Repeat unchecked converts the series to (past occurrences + terminating standalone occurrence) via UNTIL/chain preservation — never deleteEvent on the series. Regression tests: past occurrences intact after uncheck; no tombstones created for prior occurrences; series deleted only via explicit delete path (still confirmed).
@@ -261,7 +262,7 @@ stable, blind final verification PASS WITH CONCERNS with zero new issues).
 - **ID:** TD-020
 - **Title:** DC-08 barrier change causes revocation-queue non-drain (TRP-1/TRP-4b) and serve/barrier hangs under in-memory transports (Pkg5b, DC-09 gap rounds)
 - **Priority:** 9/10 — CRITICAL/BLOCKING (master suite is red: 681 passed / 4 failed of 685)
-- **Status:** OPEN (created 2026-09-01; owner instruction: substantial → debt, no improvisation)
+- **Status:** RESOLVED (2026-09-02, commit bc1a3de, pkg7 blind review SOUND WITH CONCERNS — all 4 actionable findings applied)
 - **Evidence (full-suite run 2026-09-01, /tmp/full-suite3.log):**
   - `tests/revocation_propagation.test.ts` TRP-1 + TRP-4b (DETERMINISTIC, also fails file-alone):
     `expect(a.queue.queue(b.id)).toHaveLength(0)` got 1 — B's REVOCATIONS_ACK arrives while A has
