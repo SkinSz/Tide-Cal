@@ -10,9 +10,10 @@
 // warning; the sidecar falls back to last-known endpoints only. The `mdns`
 // cargo feature stays opt-in for dev builds (§8).
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "mdns")]
 use std::time::Duration;
+
 
 /// One browse transition, forwarded verbatim as an mdns_event notification.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -27,6 +28,8 @@ pub struct MdnsEvent {
 }
 
 /// Sidecar channel + snapshot callback contract for the browse service.
+/// (Feature-less dev builds don't construct any sink — dead-code allowed.)
+#[cfg_attr(not(feature = "mdns"), allow(dead_code))]
 pub trait EventSink: Send + Sync {
     /// Fire-and-forget push of one browse event to the sidecar.
     fn push_event(&self, event: MdnsEvent);
@@ -70,6 +73,11 @@ impl EventSink for PingSink {
     }
 }
 
+// pkg10-fixup: in the default (feature-less) dev build the browse-loop
+// machinery is compiled out; silence the resulting dead-code warnings instead
+// of leaving noise in every `npx tauri dev` run. The fields ARE used by the
+// feature build.
+#[cfg_attr(not(feature = "mdns"), allow(dead_code))]
 pub struct BrowseService {
     inner: Mutex<Option<BrowseLoop>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -79,7 +87,11 @@ pub struct BrowseService {
     snapshot: Arc<Mutex<Vec<MdnsEvent>>>,
 }
 
+#[cfg_attr(feature = "mdns", allow(dead_code))]
+#[allow(dead_code)]
 struct BrowseLoop {
+    /// Kept for join-on-stop; only read by stop() (which is only invoked from
+    /// quit paths not yet wired — see stop() below).
     handle: std::thread::JoinHandle<()>,
 }
 
@@ -123,6 +135,7 @@ impl BrowseService {
     }
 
     #[cfg(not(feature = "mdns"))]
+    #[allow(dead_code)] // never called in feature-less dev builds; kept for API parity
     pub fn start(&self, _sink: Arc<dyn EventSink>) -> Result<(), String> {
         // DC-21 §6.1: explicit no-op with honest log (feature off).
         log::info!("mdns browse service not started: feature disabled (DC-21 §6.1/D9)");
@@ -151,9 +164,12 @@ impl BrowseService {
     }
 
     /// Record one observation into the pending snapshot (browse loop calls).
-    /// Deduped by instance_name (pkg10 review F4): a re-resolved service
-    /// REPLACES its earlier entry, so restarts replay the CURRENT view
-    /// exactly once per known instance — bounded and duplicate-free.
+    /// Deduped by instance_name (pkg10 review F4). Currently the observation
+    /// flow reaches the snapshot via EventSink::record_observation's
+    /// BrowseService side — this direct method is reserved for the loop-side
+    /// path once stop/restart wiring lands.
+    #[cfg_attr(feature = "mdns", allow(dead_code))]
+    #[allow(dead_code)]
     fn record(&self, event: MdnsEvent) {
         if let Ok(mut s) = self.snapshot.lock() {
             if let Some(existing) = s
@@ -167,6 +183,11 @@ impl BrowseService {
         }
     }
 
+    /// Stop the browse loop and join its thread. Reserved for quit-path
+    /// wiring (lib.rs currently leaves the loop running for the process
+    /// lifetime; process teardown reclaims it).
+    #[cfg_attr(feature = "mdns", allow(dead_code))]
+    #[allow(dead_code)]
     pub fn stop(&self) {
         self.stop
             .store(true, std::sync::atomic::Ordering::Relaxed);

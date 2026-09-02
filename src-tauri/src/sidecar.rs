@@ -147,6 +147,8 @@ impl Sidecar {
     }
 
     /// True while the child process is still running (no exit reported).
+    /// Used by the DC-21 mdns browse sink (feature-gated consumers only).
+    #[cfg_attr(not(feature = "mdns"), allow(dead_code))]
     pub fn is_alive(&self) -> bool {
         matches!(self.child.lock().unwrap().try_wait(), Ok(None))
     }

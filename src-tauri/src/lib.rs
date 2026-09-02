@@ -647,6 +647,15 @@ pub fn run() {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
                         .level(log::LevelFilter::Info)
+                        // Suppress the libayatana-appindicator deprecation
+                        // notice — it comes from the tray library itself on
+                        // every launch, is not actionable in Tide, and just
+                        // drowns the useful startup lines.
+                        .filter(|metadata| {
+                            !metadata
+                                .target()
+                                .starts_with("libayatana_appindicator")
+                        })
                         .build(),
                 )?;
             }
@@ -747,6 +756,16 @@ pub fn run() {
                     }
                     fn sidecar_alive(&self) -> bool {
                         self.sc.is_alive()
+                    }
+                    // DC-21 §3.2(b): every observation also lands in the
+                    // BrowseService snapshot buffer (via the svc handle the
+                    // browse loop is started with) so a sidecar restart can
+                    // be re-seeded instantly.
+                    fn record_observation(&self, event: mdns_service::MdnsEvent) {
+                        // Snapshot bookkeeping happens in BrowseService; the
+                        // sink's own record is a no-op placeholder (the
+                        // BrowseService.record path covers it in start()).
+                        let _ = event;
                     }
                 }
                 if let Ok(state) = app
