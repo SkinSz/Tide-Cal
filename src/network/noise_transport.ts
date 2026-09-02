@@ -598,8 +598,16 @@ export async function handshakeOverTransport(
       await inner.send(frame);
     }
   })();
-  void pump.catch(() => {
-    /* carrier closed; session calls fail closed on their own */
+  // TD-018: pump failure is NO LONGER silently swallowed. A carrier send
+  // failure (RST, exception) is logged here; the session still fails closed
+  // on its own cipher states (the in-flight send threw), so the engine sees
+  // the SessionError from ITS side. The inbound sentinel path covers the
+  // receive-side cause visibility. (DC-05 §6.3)
+  pump.catch((err) => {
+    console.warn(
+      "[tide] sync outbound pump failed (carrier error, session fails closed):",
+      err instanceof Error ? err.message : String(err),
+    );
   });
 
   // Carrier -> inbound feed for the lifetime of the connection.
@@ -609,11 +617,29 @@ export async function handshakeOverTransport(
   // as clean EOF (null). Previously the loop just broke, leaving waiters
   // pending forever — the engine's clean-EOF handling was unreachable and the
   // session hung until the idle bound fired.
+  //
+  // TD-018 (pkg9 review F1/F2): the framing adapter now REJECTS receive()
+  // with FramingError when the carrier FAILED (RST/socket error/oversize) and
+  // resolves null only on a CLEAN FIN. The feed loop catches the rejection
+  // and pushes the sentinel frame: the session transport's AEAD check fails
+  // on it by construction, so receive() throws the loud SessionError
+  // (DC-05 §6.3 terminal) instead of the session masquerading as a converged
+  // clean close. The sentinel never reaches quarantine/pending — it never
+  // decrypts into a message at all.
   void (async () => {
     try {
       for (;;) {
-        const frame = await inner.receive();
-        if (frame === null) break; // peer FIN
+        let frame: Uint8Array | null;
+        try {
+          frame = await inner.receive();
+        } catch (err) {
+          if (err instanceof FramingError) {
+            inbound.push(SESSION_KILL_FRAME);
+            break; // carrier failed — stop feeding; sentinel goes first
+          }
+          throw err; // unknown carrier error: still loud via inbound.close()
+        }
+        if (frame === null) break; // clean FIN
         inbound.push(frame);
       }
     } finally {
@@ -681,6 +707,37 @@ export interface FramedByteTransport {
   send(frame: Uint8Array): Promise<void>;
   receive(): Promise<Uint8Array | null>;
 }
+
+/**
+ * TD-018: terminal framing failure. Distinguishes a CARRIER ERROR (RST,
+ * socket exception, over-long frame) from a clean peer close (FIN → null).
+ * The framing adapter sets `failed` on its receive() rejection path so the
+ * Noise feed loop can convert the null it observes into a SessionError
+ * instead of clean EOF (DC-05 §6.3: transport failure is terminal, never a
+ * silent "session ended").
+ */
+export class FramingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "FramingError";
+  }
+}
+
+/**
+ * TD-018: sentinel ciphertext frame pushed into the inbound queue when the
+ * CARRIER failed (RST/exception/oversize) — as opposed to a clean peer FIN.
+ * On receive, the AEAD verification of this arbitrary bytes blob fails by
+ * construction, so NoiseSessionTransport raises its normal decrypt-failure
+ * SessionError path: the session ends loudly (DC-05 §6.3 terminal) instead of
+ * silently masquerading as a converged clean close. Length prefix of a legal
+ * ChaChaPoly frame is irrelevant; content is a recognizable diagnostic. It
+ * never decrypts into a message, so it can never reach quarantine or the
+ * pending buffer.
+ */
+const SESSION_KILL_FRAME = new TextEncoder().encode(
+  "__TIDE_CARRIER_FAILED__",
+);
+
 
 /**
  * Wire-in point (DC-05 §6.2): take an already-established pair of directional

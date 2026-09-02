@@ -17,6 +17,7 @@ import {
   type DeviceIdentity,
 } from "../security/identity.ts";
 import {
+  FramingError,
   handshakeOverTransport,
   type FramedByteTransport,
   type NoiseTransportHandle,
@@ -70,8 +71,19 @@ function socketFraming(
       n();
     }
   };
-  const fail = (): void => {
+  // TD-018 (pkg9 review F1/F2): distinguish ERROR from CLEAN CLOSE. `closed`
+  // alone resolves receive() as null (FIN = clean EOF). When the carrier
+  // FAILED (RST / socket exception / oversized frame — 'error' event or
+  // over-MAX_FRAME), receive() REJECTS with FramingError instead. The Noise
+  // feed loop catches that rejection and pushes its sentinel frame, making
+  // the session end LOUD (SessionError) rather than masquerading as a clean
+  // converged close (DC-05 §6.3). The failure state lives on the framing
+  // OBJECT itself — never on the raw socket (pkg9 F1: accessor on `sock`
+  // was unreachable dead code).
+  let failed = false;
+  const fail = (err?: boolean): void => {
     closed = true;
+    if (err) failed = true;
     wake();
   };
 
@@ -80,6 +92,7 @@ function socketFraming(
     while (buffer.length >= 4 && !closed) {
       const len = buffer.readUInt32BE(0);
       if (len > MAX_FRAME) {
+        failed = true; // protocol-level framing violation: carrier failure
         sock.destroy();
         return;
       }
@@ -89,9 +102,9 @@ function socketFraming(
     }
     wake();
   });
-  sock.on("close", fail);
-  sock.on("error", fail);
-  sock.on("end", fail);
+  sock.on("close", () => fail()); // FIN-path: clean close, NOT failed
+  sock.on("error", () => fail(true)); // carrier failure
+  sock.on("end", () => fail()); // peer half-close: clean, NOT failed
 
   let pendingWrites = 0;
   return {
@@ -132,12 +145,17 @@ function socketFraming(
     },
     async receive(): Promise<Uint8Array | null> {
       if (queue.length > 0) return new Uint8Array(queue.shift()!);
+      // TD-018 (pkg9 F1/F2): a FAILED carrier REJECTS (FramingError) — the
+      // Noise feed loop converts this into the loud SessionError sentinel.
+      // A cleanly-closed carrier still resolves null (FIN = clean EOF).
+      if (closed && failed) throw new FramingError("sync carrier failed (RST/socket error/oversize frame)");
       if (closed) return null;
       await new Promise<void>((resolve) => {
         notify = resolve;
       });
       if (queue.length > 0) return new Uint8Array(queue.shift()!);
-      return null; // closed while waiting
+      if (failed) throw new FramingError("sync carrier failed (RST/socket error/oversize frame)");
+      return null; // closed while waiting (clean)
     },
   };
 }

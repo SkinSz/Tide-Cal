@@ -1,6 +1,9 @@
 # TIDE DESIGN CONTRACT DC-08
 # Synchronization Message Protocol
-Status: APPROVED by project owner (2026-08-25)
+Status: APPROVED by project owner (2026-08-25); AMENDED v2 by project
+        owner (2026-09-02) — see Appendix A (session-end barrier,
+        CHANGES_ACK semantics). Amendment supersedes §3.4 rule 3 and
+        §5.4 where they conflict.
 Depends on: Architecture Spec v0.3 §20, §21, §22, §23, §24, §30, §31;
             DC-01; DC-02; DC-03; DC-04; DC-05; DC-06; DC-07
 Unblocks: sync engine implementation, revocation propagation (#8),
@@ -681,3 +684,97 @@ TR-13 SNAPSHOT CLOCK EXCHANGE: after FULL_STATE_SNAPSHOT application,
 - Quarantine review UX                                -> future UI work
 - Rekey cadence inside long-lived sessions            -> implementation,
   constrained by snow standard mechanisms (DC-05 §6.2)
+
+==================================================
+APPENDIX A — AMENDMENT v2: SESSION-END BARRIER
+==================================================
+Status: APPROVED by project owner (2026-09-02). Authored per
+TD-017 (blind adversarial review F2): the c088023 implementation
+repurposed CHANGES_ACK as a one-shot bidirectional session
+terminator without amending this contract. This appendix
+formalizes that behavior as normative. Where this appendix
+conflicts with §3.4 rule 3 or §5.4, THIS APPENDIX WINS.
+
+A.1  MOTIVATION
+
+Per-batch ACKs (§3.4 rule 3 as originally written) interact badly
+with the DC-08 root-cause fix of 2026-08-31: a responder that
+finishes its own pull and tears down the shared session inside
+the initiator's HELLO/pull setup window strands the initiator
+mid-protocol. The session-end barrier joins the two engine runs'
+lifetimes so neither side can dismantle the session while the
+other still owes it traffic. Real-network experience (stall
+root-cause doc 2026-08-31) showed the barrier is REQUIRED for
+liveness; per-batch ACKs are not required for correctness (the
+applied_upto frontier in ONE ACK carries the same information a
+sequence of per-batch ACKs would, and max-merge is order-free
+per INVARIANT 14).
+
+A.2  CHANGES_ACK — AMENDED SEMANTICS (supersedes §3.4 rule 3)
+
+  1. ONE ACK PER SESSION, JOINT TERMINATOR. Each side sends
+     exactly ONE CHANGES_ACK per session, immediately after its
+     own pull completes (before serving the peer's pull). The
+     message content is UNCHANGED from §3.4: per-producer
+     contiguous applied_upto frontiers.
+
+  2. BARRIER MODE. After sending its own ACK, a side enters the
+     barrier serve phase: it keeps serving the peer's pull
+     (CHANGES_REQUEST / CHANGES_BATCH / FULL_STATE_OFFER /
+     FULL_STATE_SNAPSHOT / CONFLICT_RECORDS / REVOCATION_RECORDS)
+     until it receives the peer's CHANGES_ACK — the JOINT
+     TERMINATOR — or a clean EOF.
+
+  3. BOUNDED POST-ACK DRAIN (TD-020). On receiving the peer's
+     CHANGES_ACK the side does NOT exit immediately: it drains
+     remaining in-flight sibling messages (REVOCATIONS_ACK, late
+     batches) behind the terminator using a bounded poll loop
+     (poll-count bound, NOT a time value; no timeout semantics
+     changed). This prevents sibling-ack stranding (TRP-1/TRP-4b
+     regression class). The drain's poll count is a tunable
+     implementation constant (same class as §9 batching constants).
+
+  4. BARRIER-MODE APPLICATIONS ARE ACKED. Records the barrier
+     serves to the PEER (batches the peer applies during the
+     barrier phase) are covered by the PEER's own ACK — which the
+     peer sends after its pull completes, i.e. potentially BEFORE
+     this side's barrier applications reach it. Therefore: the
+     peer's compaction knowledge for barrier-phase applications
+     advances at the NEXT session's ACK, not this session's. This
+     is accepted as the amendment's deliberate trade (bounded
+     compaction unlock delay ≤ one session interval) in exchange
+     for the liveness guarantee of A.2.2.
+
+  5. TERMINATOR IDEMPOTENCE (INVARIANT 14). Receiving more than
+     one CHANGES_ACK in a session is legal: the first in barrier
+     mode triggers the drain; later ones are max-merged into
+     lastKnownClock and otherwise ignored. Duplicated/reordered
+     ACKs cannot double-apply or corrupt state.
+
+A.3  STASH INTERACTION (normative clarification)
+
+The engine's session-level message stash (traffic parked by the
+DC-09 offer-exchange helpers) MUST be consulted by the barrier
+serve loop and MUST be cleared at session start (TD-019 F3 root;
+Pkg7 finding 1). A stashed CHANGES_ACK is a valid terminator.
+
+A.4  WHAT DOES NOT CHANGE
+
+  - ACK payload semantics (per-producer contiguous frontier) —
+    §3.4 rules 1-2 unchanged.
+  - lastKnownClock max-merge — §3.4 unchanged.
+  - INVARIANT 14 (duplicated/reordered comms safe) — holds per
+    A.2.5.
+  - The §5.4 canonical flow diagram gains the barrier phase, but
+    the message sequence within each direction is unchanged:
+    HELLO → (push pull serve) → ACK → serve-until-peer-ACK.
+
+A.5  AMENDMENT RATIONALE (process record)
+
+Deviation discovered by blind adversarial review (TD-017,
+2026-09-01). Owner decision 2026-09-02: AMEND THE CONTRACT, do
+NOT rework the code to per-batch ACKs — rework would re-introduce
+the responder-teardown race the barrier exists to prevent, for
+zero functional gain in the homogeneous fleet. Barrier semantics
+verified by: pkg5b/pkg7 test waves, three-device real-TCP harness
+(7/7), full suite 705/705 (commit bc1a3de).
