@@ -224,10 +224,11 @@ stable, blind final verification PASS WITH CONCERNS with zero new issues).
 - **ID:** TD-016
 - **Title:** dialog Save with Repeat unchecked runs deleteEvent(id) on the series — no confirmation, no warning
 - **Priority:** 7/10 — HIGH (destructive action behind an innocuous Save)
-- **Status:** OPEN (created 2026-09-01, blind adversarial review F5)
+- **Status:** OPEN (created 2026-09-01, blind adversarial review F5); SEMANTICS DECIDED by owner 2026-09-02
+- **Owner decision (2026-09-02, binding):** KEEP THE EVENT CHAIN when the tickbox is unset. Unchecking "Repeat" must NOT delete anything. It means "end recurrence here": all past occurrences remain on the calendar untouched, the series terminates at the edited occurrence (UNTIL = edit point / recurrence ends), and the edited occurrence survives as a standalone single event with the user's latest edits. Whole-series deletion remains available ONLY as the explicit delete-series action (series root / dialog's whole-series choice) behind the two-step destructive confirm. Unchecking a checkbox is never a delete.
 - **Finding:** `frontend/dialog.ts:644-653`. Violates the destructive-confirm contract (two-step confirm with warning; `confirm:true` at RPC level) and the UI-interaction-is-owner's-call rule.
-- **Fix direction:** owner decision needed on semantics: (a) unchecking Repeat = "end recurrence here" (convert to single event / set UNTIL), or (b) keep delete-series but route through the two-step destructive confirm. Recommendation: (a) — unchecking a checkbox should never equal deleting data.
-- **Trigger:** owner decision, then same wave as TD-014/015.
+- **Fix direction:** implement the owner semantics above: Save with Repeat unchecked converts the series to (past occurrences + terminating standalone occurrence) via UNTIL/chain preservation — never deleteEvent on the series. Regression tests: past occurrences intact after uncheck; no tombstones created for prior occurrences; series deleted only via explicit delete path (still confirmed).
+- **Trigger:** same wave as TD-014/015.
 
 ## TD-017 — CHANGES_ACK semantics deviate from frozen DC-08 §3.4 (blind review)
 - **ID:** TD-017

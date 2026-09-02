@@ -12,6 +12,7 @@ import {
   updateOccurrence,
   updateSeriesRule,
   listSeries,
+  listEvents,
   type CalendarEvent,
   type EventInput,
   type SeriesRow,
@@ -22,9 +23,11 @@ import {
   buildRRule,
   draftFromRule,
   deriveRecurrenceId,
+  terminateRuleAt,
   wallStamp,
 } from "./recurrence_edit.ts";
 import { formatTimeLabel, getTimeFormat } from "./theme.ts";
+import { occurrenceOf } from "./calendar.ts";
 
 const dlg = () => document.getElementById("event-dialog") as HTMLDialogElement;
 
@@ -130,6 +133,15 @@ let currentSeries: SeriesRow | null = null;
 
 /** The event currently being edited (null: create flow). */
 let dialogEvent: CalendarEvent | undefined;
+
+/**
+ * TD-015 (DC-12 R2): the ORIGINAL recurrence_id of the occurrence the dialog
+ * was opened on, when that event is a rendered series chip. expandSeriesEvents
+ * attaches the authoritative id (occurrenceOf) — keyed at the occurrence's
+ * ORIGINAL start, never the override's moved start. Null for plain events and
+ * series bases; callers fall back to deriveRecurrenceId(dialogEvent.startMs).
+ */
+let dialogOccurrenceId: string | null = null;
 
 /**
  * READ-ONLY recurrence info line (DC-12 §2 / deferred #12 surface): when the
@@ -273,9 +285,10 @@ function syncRecurrenceControls(existing: CalendarEvent): void {
     return;
   }
   repeatSel.disabled = false;
-  // "Does not repeat" inside a checked builder would mean deleting the
-  // series — not a rule edit (DC-12 §8 routes series ending through RRULE
-  // UNTIL edits). Unchecking the Repeat checkbox is the removal path.
+  // "Does not repeat" inside a checked builder would be a rule edit — the
+  // series ENDING is handled by the TD-016 owner semantics on Save: Repeat
+  // unchecked + Save terminates the rule at the edited occurrence (UNTIL),
+  // keeping past occurrences and the edited occurrence (never a delete).
   repeatSel.querySelector<HTMLOptionElement>('option[value="NONE"]')!.disabled = true;
   repeatSel.value = draft.freq;
   field<HTMLInputElement>("ev-every").value = String(draft.interval);
@@ -425,6 +438,10 @@ function openFor(date: Date, existing?: CalendarEvent): void {
   clearInlineError();
   dialogEvent = existing;
   currentSeries = null;
+  // TD-015: capture the chip's ORIGINAL occurrence id (see variable doc).
+  // The chip object is replaced on every re-render, so this must be captured
+  // at open time — the Save handler can no longer reach the WeakMap.
+  dialogOccurrenceId = existing ? (occurrenceOf(existing)?.recurrenceId ?? null) : null;
 
   field<HTMLInputElement>("ev-id").value = existing?.id ?? "";
   field<HTMLInputElement>("ev-title").value = existing?.title ?? "";
@@ -539,8 +556,9 @@ export function initDialog(): void {
   field("ev-every").addEventListener("input", syncRepeatVisibility);
   // OPT-IN builder (owner feedback, 2026-08-31): the "Repeat" checkbox next
   // to "Whole day" reveals the rule builder. Unchecking hides it and CLEARS
-  // the draft rule so Save writes a plain event (on a series event, the
-  // whole-series removal path applies — see the Save handler).
+  // the draft rule; on Save with Repeat unchecked, a series event ENDS its
+  // recurrence at the edited occurrence (TD-016 owner semantics, 2026-09-02)
+  // — the rule is terminated via UNTIL, nothing is deleted.
   field("ev-repeat-on").addEventListener("change", () => {
     if (!repeatOn()) clearRuleDraft();
     syncRepeatVisibility();
@@ -642,23 +660,81 @@ export function initDialog(): void {
         if (id) {
           const existing = dialogEvent;
           if (existing && currentSeries && !repeatOn() && !occurrenceScope()) {
-            // OPT-IN removal path: unchecking "Repeat" on a series event
-            // removes the whole series' rule — which in DC-12 IS the
-            // whole-series delete (§4.2 D7: deleteEvent on the base event
-            // structurally removes the series + all overrides), the same
-            // existing path the Delete button uses below. No new semantics.
-            await deleteEvent(id);
+            // TD-016 (owner decision, 2026-09-02, binding): unchecking
+            // "Repeat" is NOT a delete. It means "END RECURRENCE AT THIS
+            // POINT": the series rule is terminated (UNTIL = the edited
+            // occurrence's ORIGINAL start date, inclusive — past occurrences
+            // stay, nothing after the edit point is generated, no tombstones
+            // are written) and the edited occurrence survives as a standalone
+            // single event carrying the user's edits (updateEvent on the base
+            // row). Whole-series deletion remains ONLY the explicit Delete
+            // path below, behind the two-step confirm.
+            //
+            // Pkg8 review F1 (sev 9, BLOCKING): `input.startMs` is built from
+            // ev-date, which openFor seeds with the CHIP's start. On any chip
+            // that isn't the series' first occurrence, a naive updateEvent
+            // would MOVE THE BASE ANCHOR to the edit point — every earlier
+            // occurrence would silently vanish (violating the owner decision)
+            // and remaining future occurrences would re-anchor from the wrong
+            // day. dialogEvent IS the chip, so its startMs is NOT the base's.
+            // Fix: re-read the authoritative BASE row from the store (chips
+            // share the base id) and keep its original start/end — the chain
+            // anchor is untouchable. ONLY non-anchoring fields (title,
+            // description, allDay) carry the user's edits. The edited
+            // occurrence's own date/time is preserved via the terminating
+            // UNTIL + an override on the ORIGINAL occurrence id.
+            const baseRow = (await listEvents({ fromMs: 0, toMs: Date.now() + 3_155_760_000_000 }))
+              .find((e) => e.id === id);
+            const baseStartMs = baseRow?.startMs ?? existing.startMs;
+            const baseEndMs = baseRow?.endMs ?? existing.endMs;
+            const baseKeepsSchedule: EventInput = {
+              title: input.title,
+              description: input.description,
+              startMs: baseStartMs,
+              endMs: baseEndMs,
+              allDay: input.allDay,
+            };
+            await updateEvent(id, baseKeepsSchedule);
+            // Pkg8 review F1 (secondary): derive the edit point from the
+            // ORIGINAL occurrence id (dialogOccurrenceId, TD-015), never from
+            // the chip's possibly-moved startMs.
+            const editPointId =
+              dialogOccurrenceId ??
+              deriveRecurrenceId(baseStartMs, existing.allDay);
+            const until = editPointId.slice(0, 8);
+            // The terminating occurrence survives with the user's date/time
+            // edits as an override on its ORIGINAL identity (R2: identity is
+            // never rewritten). Written only when the user actually changed
+            // the schedule relative to the rendered chip.
+            if (
+              input.startMs !== existing.startMs ||
+              input.endMs !== existing.endMs
+            ) {
+              await updateOccurrence(currentSeries.seriesId, editPointId, {
+                start_wall: wallStamp(input.startMs),
+                end_wall: wallStamp(Math.max(input.endMs, input.startMs)),
+              });
+            }
+            const terminated = terminateRuleAt(currentSeries.recurrenceRule, until);
+            if (terminated !== currentSeries.recurrenceRule) {
+              await updateSeriesRule(currentSeries.seriesId, terminated);
+            }
             dlg().close();
             document.dispatchEvent(new CustomEvent("tide:refresh"));
             return;
           }
           if (existing && occurrenceScope()) {
             // DC-12 §2.2/§4.1: THIS-occurrence-only edit -> occurrence
-            // override keyed (series_id, recurrence_id). The recurrence_id
-            // is derived from the ORIGINAL stored occurrence start (R2:
-            // never rewritten), not from the dialog's possibly-moved date.
+            // override keyed (series_id, recurrence_id). TD-015: the id comes
+            // from the chip's ORIGINAL occurrence (captured at open via
+            // occurrenceOf) — NEVER from the chip's possibly-moved startMs,
+            // which would key a phantom override and orphan the real one
+            // (R2: identity derived once, never rewritten). For a series
+            // BASE event (no chip meta) the start-derived id is correct.
             const series = currentSeries!;
-            const rid = deriveRecurrenceId(existing.startMs, existing.allDay);
+            const rid =
+              dialogOccurrenceId ??
+              deriveRecurrenceId(existing.startMs, existing.allDay);
             const patch: Record<string, unknown> = {};
             if (input.title !== existing.title) patch.title = input.title;
             if (
@@ -712,11 +788,11 @@ export function initDialog(): void {
               // DC-12 §4.1: cancelling ONE occurrence writes the override
               // (series_id, "overrides.<rid>.cancelled") — the series and its
               // other occurrences are untouched. Whole-series delete (below)
-              // is D7.
-              const rid = deriveRecurrenceId(
-                dialogEvent.startMs,
-                dialogEvent.allDay,
-              );
+              // is D7. TD-015: rid from the ORIGINAL occurrence (chip meta),
+              // not the moved start — same identity rule as the Save path.
+              const rid =
+                dialogOccurrenceId ??
+                deriveRecurrenceId(dialogEvent.startMs, dialogEvent.allDay);
               await updateOccurrence(currentSeries!.seriesId, rid, {
                 cancelled: true,
               });

@@ -93,6 +93,27 @@ function dateOnlyId(d: Date): string {
  * Expand occurrences of the series within [windowStartId, windowEndId]
  * (both 'YYYYMMDDTHHMMSS' or 'YYYYMMDD'; compared lexically on the date part).
  * Deterministic; COUNT/UNTIL bound total generation regardless of window.
+ *
+ * TD-014 (blind review 2026-09-01 F1/F2/F3): rewritten as DIRECT PER-FREQ
+ * stepping. The old implementation walked day-by-day with three separate
+ * interval "hacks" that hung the renderer (DAILY/MONTHLY INTERVAL>1 never
+ * re-derived their anchor), expanded WEEKLY-without-BYDAY to every day, and
+ * misaligned WEEKLY INTERVAL>1 weeks. The new structure:
+ *   - DAILY:  step `interval` days per occurrence (calendar-day stepping;
+ *             wall-clock time-of-day preserved, INVARIANT 9).
+ *   - WEEKLY: iterate weeks anchored to the base day (multiples of `interval`
+ *             weeks); within an anchor week emit every BYDAY day (or the base
+ *             weekday when BYDAY is absent — RFC 5545: the base weekday is
+ *             implicitly in the BYDAY set); week boundaries are MO-first
+ *             (RFC 5545 WKST default), computed from the base's own week.
+ *   - MONTHLY: calendar-month stepping (multiples of `interval` months via
+ *             UTC month arithmetic); emit the base day-of-month when the
+ *             month HAS that day (RFC 5545: shorter months skip, they do not
+ *             fold into the next month).
+ * COUNT counts EMITTED occurrences (RFC 5545); UNTIL is an inclusive
+ * date-only bound. A hardCap bounds open-ended rules identically to before.
+ * All arithmetic is naive wall-clock on UTC calendar fields — no timezone
+ * conversion anywhere (DC-12 §2.3/§R5, INVARIANT 9).
  */
 export function expandOccurrences(
   series: SeriesState,
@@ -126,92 +147,94 @@ export function expandOccurrences(
   const winHi = `${winHiDate}T235959`;
 
   const out: string[] = [];
-  const occurrenceDate = new Date(base.getTime());
-  let generated = 0;
-  let weekCursor = new Date(base.getTime()); // interval anchor for WEEKLY
   const hardCap = 10000; // safety bound for open-ended rules
   const maxOccurrences = rule.count ?? hardCap;
+  /** A candidate counts toward COUNT only when it is a real occurrence. */
+  let generated = 0;
 
-  const inWindow = (id: string): boolean => {
-    const datePart = id.slice(0, 8);
-    return (
-      datePart >= winLo.slice(0, 8) &&
-      datePart <= winHi.slice(0, 8)
-    );
+  /** Emit one candidate occurrence if it fits window + bounds. True = stop. */
+  const emit = (d: Date): boolean => {
+    const id = formatId(d);
+    generated++;
+    if (id >= winLo && id <= winHi) out.push(id);
+    return generated >= maxOccurrences;
   };
 
-  while (generated < maxOccurrences && generated < hardCap) {
-    if (rule.until !== null && dateOnlyId(occurrenceDate) > rule.until) break;
+  /**
+   * MO-first week index. Epoch day 0 (1970-01-01) is a THURSDAY, so the
+   * first Monday is epoch day 4: week k spans epoch days [4+7k .. 10+7k].
+   */
+  const weekIndex = (d: Date): number =>
+    Math.floor((d.getTime() / 86_400_000 - 4) / 7);
+  const baseWeek = weekIndex(base);
+  const baseDayName = JS_DAY_TO_NAME[base.getUTCDay()]!;
+  // Time-of-day within the base day — week anchors carry it so every
+  // occurrence id preserves the base wall-clock time (INVARIANT 9).
+  const baseMidnight = Date.UTC(
+    base.getUTCFullYear(), base.getUTCMonth(), base.getUTCDate(),
+  );
+  const baseTOD = base.getTime() - baseMidnight;
 
-    // WEEKLY INTERVAL>1: if we've stepped past the current interval-week,
-    // jump the anchor forward by (interval-1) extra weeks.
-    if (rule.freq === "WEEKLY" && rule.interval > 1) {
-      const weeksFromBase = Math.floor(
-        (weekCursor.getTime() - base.getTime()) / (86400000 * 7),
-      );
-      const currentWeek = Math.floor(
-        (occurrenceDate.getTime() - base.getTime()) / (86400000 * 7),
-      );
-      void weeksFromBase;
-      // weekCursor advances in multiples of `interval` weeks from base.
-      while (
-        Math.floor((occurrenceDate.getTime() - weekCursor.getTime()) / (86400000 * 7)) >=
-        rule.interval
-      ) {
-        weekCursor = new Date(weekCursor.getTime() + 7 * rule.interval * 86400000);
-      }
-      // Days beyond the anchor week (before next cursor) don't match.
-      if (occurrenceDate.getTime() > weekCursor.getTime() + 6 * 86400000) {
-        occurrenceDate.setUTCDate(occurrenceDate.getUTCDate() + 1);
-        continue;
-      }
-      void currentWeek;
+  if (rule.freq === "DAILY") {
+    // Step `interval` calendar days per occurrence from the base.
+    for (let step = 0; ; step += rule.interval) {
+      const d = new Date(base.getTime() + step * 86_400_000);
+      if (rule.until !== null && dateOnlyId(d) > rule.until) break;
+      if (step > 0 && d.getTime() - base.getTime() > hardCap * 86_400_000) break;
+      if (emit(d)) break;
     }
+    return out;
+  }
 
-    let matches = false;
-    if (rule.freq === "DAILY") {
-      matches = true;
-    } else if (rule.freq === "WEEKLY") {
-      if (rule.byDay.length === 0) {
-        matches = true; // same weekday as base
-      } else {
-        const dayName = JS_DAY_TO_NAME[occurrenceDate.getUTCDay()]!;
-        matches = rule.byDay.includes(dayName);
+  if (rule.freq === "WEEKLY") {
+    // RFC 5545: an empty BYDAY defaults to the base event's weekday.
+    const days = rule.byDay.length > 0 ? rule.byDay : [baseDayName];
+    // Map day names to offsets within the MO-first week (0=MO..6=SU).
+    const nameToOffset: Record<string, number> = {
+      MO: 0, TU: 1, WE: 2, TH: 3, FR: 4, SA: 5, SU: 6,
+    };
+    const offsets = days
+      .map((n) => nameToOffset[n]!)
+      .filter((o) => o !== undefined)
+      .sort((a, b) => a - b);
+    // Iterate anchor weeks in multiples of `interval` from the base's week.
+    for (let w = 0; ; w += rule.interval) {
+      // Monday of the anchor week (epoch day 4 + 7k), at base wall-time.
+      const weekStart = new Date((4 + (baseWeek + w) * 7) * 86_400_000 + baseTOD);
+      if (rule.until !== null) {
+        // If the week STARTS beyond UNTIL, every candidate in it is too.
+        if (dateOnlyId(weekStart) > rule.until) break;
       }
-    } else {
-      // MONTHLY: same day-of-month as base
-      matches = occurrenceDate.getUTCDate() === base.getUTCDate();
-    }
-
-    if (matches) {
-      const id = formatId(occurrenceDate);
-      if (id >= winLo && id <= winHi) {
-        out.push(id);
+      if (weekStart.getTime() - base.getTime() > hardCap * 86_400_000) break;
+      for (const off of offsets) {
+        const d = new Date(weekStart.getTime() + off * 86_400_000);
+        // Candidates before the base itself are not occurrences.
+        if (d.getTime() < base.getTime()) continue;
+        if (rule.until !== null && dateOnlyId(d) > rule.until) break;
+        if (emit(d)) return out;
       }
-      generated++;
-      if (generated >= maxOccurrences) break;
     }
+    return out;
+  }
 
-    // Advance one day at a time; apply INTERVAL stepping per completed period.
-    occurrenceDate.setUTCDate(occurrenceDate.getUTCDate() + 1);
-
-    if (rule.interval > 1) {
-      // Skip days not aligned to the interval period.
-      const daysSinceBase = Math.floor(
-        (occurrenceDate.getTime() - base.getTime()) / 86400000,
-      );
-      if (rule.freq === "DAILY" || rule.freq === "MONTHLY") {
-        const periodDays = rule.freq === "DAILY" ? rule.interval : 28 * rule.interval;
-        while (
-          daysSinceBase % periodDays !== 0 &&
-          generated < maxOccurrences &&
-          !(rule.until !== null && dateOnlyId(occurrenceDate) > rule.until)
-        ) {
-          occurrenceDate.setUTCDate(occurrenceDate.getUTCDate() + 1);
-        }
-      }
-      // WEEKLY with BYDAY handles interval via week-boundary checks below.
-    }
+  // MONTHLY: calendar-month stepping; day-of-month from the base.
+  const dayOfMonth = base.getUTCDate();
+  for (let mi = 0; ; mi += rule.interval) {
+    // UTC month arithmetic: month overflow rolls over automatically
+    // (e.g. month 13 -> Jan of next year). Day clamping is manual — a
+    // month without the base day-of-month SKIPS (RFC 5545), it never folds.
+    const d = new Date(
+      Date.UTC(base.getUTCFullYear(), base.getUTCMonth() + mi, 1,
+        base.getUTCHours(), base.getUTCMinutes(), base.getUTCSeconds()),
+    );
+    d.setUTCDate(dayOfMonth); // only valid if this month has that day
+    if (d.getUTCDate() !== dayOfMonth) continue; // short month: skip
+    if (rule.until !== null && dateOnlyId(d) > rule.until) break;
+    // Pkg8 review F3: the cap for MONTHLY must be in MONTH units, not day
+    // units — hardCap days ≈ 329 months would silently truncate long COUNT
+    // rules. hardCap occurrences × interval months bounds the walk exactly.
+    if (mi > hardCap * rule.interval) break;
+    if (emit(d)) break;
   }
   return out;
 }

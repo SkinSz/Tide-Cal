@@ -86,6 +86,15 @@ function sigToHex(sig: Uint8Array): string {
  */
 export const SYNC_IDLE_TIMEOUT_MS = 15_000;
 
+/**
+ * TD-020: bounded post-ACK drain length, in receiveWithTimeout polls.
+ * Sibling messages (REVOCATIONS_ACK, late CHANGES_BATCH) sitting behind the
+ * peer's CHANGES_ACK terminator are processed before the barrier exits; this
+ * many consecutive quiet polls ends the drain. A poll-count bound (not a
+ * time value): the idle/idle-bound semantics are untouched.
+ */
+const DRAIN_POST_ACK_POLLS = 10;
+
 /** Sentinel for "the idle window elapsed" — distinct from null (peer closed). */
 const IDLE_TICK = Symbol("pkg4-idle-timeout");
 
@@ -191,6 +200,15 @@ export interface SyncTransport {
   send(msg: SyncMessage): Promise<void>;
   /** Resolve the next inbound message (or null when peer closes). */
   receive(): Promise<SyncMessage | null>;
+  /**
+   * TD-020: optional deterministic end-of-session signal. runSession invokes
+   * this in a finally once the session is over so the PEER side's pending
+   * receive resolves as clean EOF (null) instead of parking on an idle
+   * bound. Implementations close the LOCAL inbound path and propagate EOF to
+   * the peer per the carrier's semantics (FIN on TCP, waiter release on
+   * in-memory pipes). Optional: test doubles without it are unaffected.
+   */
+  close?(): void;
 }
 
 export interface SyncEngineDeps {
@@ -517,6 +535,12 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     // DC-09 §3.5: offers_made_this_session is in-memory only; a new session
     // gets fresh dedup state.
     sessionDedup = new OfferDedup();
+    // Pkg7 review (finding 1, sev 4): the stash is engine-scoped and must be
+    // per-session too. A stale stashed CHANGES_ACK from session N-1 would be
+    // consumed by the new stash-first barrier consult and satisfy the
+    // session-end terminator before the real peer ACK arrives (closing the
+    // transport on a phantom ACK). Same root as TD-019 F3; fixed here.
+    stashed.length = 0;
     // Pkg5b: truthful self-frontier seeding BEFORE the pull loop (see doc).
     seedSelfAppliedFrontier();
     // Pkg6 (QA-1 F-6): same GC for long-lived engine instances — a frontier
@@ -619,7 +643,22 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     stats.sent++;
 
     // --- serve the peer's pull until the peer's session-end ACK / EOF ---
-    await serveRequests(nextMessage(transport), transport, peerHello.device_clock, stats, 2, true);
+    try {
+      await serveRequests(nextMessage(transport), transport, peerHello.device_clock, stats, 2, true);
+    } finally {
+      // TD-020: deterministic end-of-session EOF. runSession never closed
+      // the transport, so a side that finishes its barrier (peer ACK seen,
+      // or EOF) left its PEER parked in receiveIdleBounded for the full
+      // idle bound on transports without FIN propagation (in-memory pipes).
+      // Signalling close here makes session end deterministic on every
+      // transport shape. Never throws over session results; close() on an
+      // already-dead session is a no-op by contract.
+      try {
+        transport.close?.();
+      } catch {
+        /* close must never mask the session's own outcome */
+      }
+    }
 
     return stats;
   }
@@ -639,11 +678,36 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
      * that neither ACKs nor closes still terminates deterministically
      * (SyncIdleTimeoutError) instead of hanging. No timeout value is
      * changed: the barrier reuses SYNC_IDLE_TIMEOUT_MS as designed.
+     *
+     * TD-020 (TRP-1/TRP-4b regression): on CHANGES_ACK the barrier no longer
+     * returns immediately. A REVOCATIONS_ACK or a late CHANGES_BATCH may sit
+     * in the same pipe behind the terminator; exiting at first sight of the
+     * ACK stranded those siblings (A's revocation queue never drained — got
+     * 1, want 0). Instead the barrier performs a BOUNDED post-ACK drain
+     * using the pre-existing receiveWithTimeout poll helper (no timeout
+     * value changes, agent rule 2). Deterministic: after `drainPolls` quiet
+     * polls the drain returns regardless. INVARIANT 14 holds — duplicated
+     * or reordered siblings are idempotent (recordAck / duplicate-apply are
+     * byte-level no-ops), so draining a little or a lot is safe.
      */
     untilPeerAck = false,
   ): Promise<void> {
     let quiet = 0;
     while (quiet < quietTicks) {
+      // TD-020: consult the session stash FIRST — traffic stashed by the
+      // offer-exchange helpers (receiveAndApplySnapshots, driveFullStateOffer)
+      // is invisible to transport.receive() but must still be processed here;
+      // a stashed CHANGES_ACK used to be missed and the barrier hung on the
+      // idle bound waiting for a terminator that had already arrived.
+      const stashedMsg = drainStashed();
+      if (stashedMsg !== null) {
+        const ended = await handleBarrierMessage(
+          stashedMsg, transport, stats, nextMessage, untilPeerAck,
+        );
+        if (ended) return;
+        quiet = 0;
+        continue;
+      }
       const msg = untilPeerAck
         ? await receiveIdleBounded(() => nextMessage(transport), "serve/barrier")
         : await receiveWithTimeout(() => nextMessage(transport), 5);
@@ -653,7 +717,27 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
         continue;
       }
       quiet = 0;
-      if (msg.type === "CHANGES_REQUEST") {
+      const ended = await handleBarrierMessage(
+        msg, transport, stats, nextMessage, untilPeerAck,
+      );
+      if (ended) return;
+    }
+  }
+
+  /**
+   * TD-020: dispatch one message inside the barrier serve loop. Returns true
+   * when the barrier has satisfied its terminator condition AND its bounded
+   * post-ACK drain completed (barrier mode only).
+   */
+  async function handleBarrierMessage(
+    msg: SyncMessage,
+    transport: SyncTransport,
+    stats: SessionStats,
+    nextMessage: (t: SyncTransport) => Promise<SyncMessage | null>,
+    barrierMode: boolean,
+  ): Promise<boolean> {
+    switch (msg.type) {
+      case "CHANGES_REQUEST": {
         const changes = fetchRanges(msg.ranges);
         for (let i = 0; i < changes.length; i += maxBatch) {
           const slice = changes.slice(i, i + maxBatch);
@@ -668,21 +752,84 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
           await transport.send({ v: 1, type: "CHANGES_BATCH", changes: [] });
           stats.sent++;
         }
+        return false;
+      }
+      case "CHANGES_BATCH":
+        applyBatch(msg.changes, stats);
+        return false;
+      case "FULL_STATE_OFFER":
+        await handleIncomingOffer(msg, () => nextMessage(transport), transport, stats);
+        return false;
+      case "FULL_STATE_SNAPSHOT":
+        applyIncomingSnapshot(msg, stats);
+        return false;
+      case "CHANGES_ACK":
+        mergeAckIntoLastKnownClock(msg.applied_upto);
+        if (barrierMode) {
+          // TD-020: joint terminator seen — drain what remains (bounded)
+          // so siblings (REVOCATIONS_ACK, late batches) are not stranded.
+          await drainPostAck(nextMessage, transport, stats);
+          return true;
+        }
+        return false;
+      case "HELLO":
+        advancePeerKnowledge(msg.device_clock);
+        return false;
+      case "REVOCATION_RECORDS":
+        await handleRevocationRecords(msg, transport, stats);
+        return false;
+      case "REVOCATIONS_ACK":
+        handleRevocationsAck(msg);
+        return false;
+      default:
+        return false;
+    }
+  }
+
+  /**
+   * TD-020: bounded post-ACK drain. Processes whatever the peer sent behind
+   * its terminator — sibling acks, late batches — until `drainPolls` quiet
+   * polls elapse. Uses receiveWithTimeout's poll shape (the same helper the
+   * GAP_ROUNDS exchange already uses); NO timeout value is changed and
+   * nothing here can hang: the loop always terminates.
+   */
+  async function drainPostAck(
+    nextMessage: (t: SyncTransport) => Promise<SyncMessage | null>,
+    transport: SyncTransport,
+    stats: SessionStats,
+  ): Promise<void> {
+    for (let poll = 0; poll < DRAIN_POST_ACK_POLLS; poll++) {
+      const msg = await receiveWithTimeout(() => nextMessage(transport), 5);
+      if (msg === null) return; // EOF: nothing further can arrive
+      if (msg.type === "CHANGES_REQUEST") {
+        const changes = fetchRanges(msg.ranges);
+        for (let i = 0; i < changes.length; i += maxBatch) {
+          await transport.send({ v: 1, type: "CHANGES_BATCH", changes: changes.slice(i, i + maxBatch) });
+          stats.sent++; // Pkg7 review (finding 5): per-batch, like serveRequests
+        }
+        if (changes.length === 0) {
+          await transport.send({ v: 1, type: "CHANGES_BATCH", changes: [] });
+          stats.sent++;
+        }
       } else if (msg.type === "CHANGES_BATCH") {
         applyBatch(msg.changes, stats);
-      } else if (msg.type === "FULL_STATE_OFFER") {
-        await handleIncomingOffer(msg, () => nextMessage(transport), transport, stats);
-      } else if (msg.type === "FULL_STATE_SNAPSHOT") {
-        applyIncomingSnapshot(msg, stats);
       } else if (msg.type === "CHANGES_ACK") {
-        mergeAckIntoLastKnownClock(msg.applied_upto);
-        if (untilPeerAck) return; // joint session-end barrier satisfied
+        mergeAckIntoLastKnownClock(msg.applied_upto); // duplicate terminator: no-op
       } else if (msg.type === "HELLO") {
         advancePeerKnowledge(msg.device_clock);
       } else if (msg.type === "REVOCATION_RECORDS") {
         await handleRevocationRecords(msg, transport, stats);
       } else if (msg.type === "REVOCATIONS_ACK") {
-        handleRevocationsAck(msg);
+        handleRevocationsAck(msg); // THE stranded-sibling case TRP-1/4b caught
+      } else if (msg.type === "FULL_STATE_SNAPSHOT") {
+        applyIncomingSnapshot(msg, stats);
+      } else if (msg.type === "FULL_STATE_OFFER") {
+        // Pkg7 review (finding 4): the barrier exits immediately after the
+        // drain, so stashing here would strand the offer until a LATER
+        // session (the earlier comment overstated safety). Ignoring it is
+        // safe by design: a dropped offer is re-triggered next session by
+        // the same persistent-gap detection (DC-09 Trigger A), and INVARIANT
+        // 14 makes the redelivery harmless.
       }
     }
   }

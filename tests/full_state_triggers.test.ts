@@ -246,12 +246,30 @@ type Log = { transport: SyncTransport; outbound: SyncMessage[] };
 function pairedTransports(): [Log, Log] {
   const qToA: SyncMessage[] = [];
   const qToB: SyncMessage[] = [];
+  // TD-020: ONE shared pipe state. close() on either end is a FIN to the
+  // PEER: the peer's pending receive must resolve null (clean EOF), exactly
+  // like pkg1_helpers' MsgPipe wakes the peer's waiter. (A per-end flag here
+  // was the bug: the closer flagged its own inbound, so the peer never saw
+  // the EOF and parked on the idle bound.) First session to finish releases
+  // the other; a second close is a no-op.
+  const pipe = { closed: false };
   const poll = (q: SyncMessage[]): Promise<SyncMessage | null> =>
     new Promise((resolve) => {
       const check = (): void => {
+        // Pkg7 review (finding 3): DRAIN before EOF, matching pkg1_helpers'
+        // msgPipePair — messages queued at close time are still delivered
+        // (a FIN never erases data already in the pipe); only an EMPTY pipe
+        // resolves null.
         const v = q.shift();
-        if (v !== undefined) resolve(v);
-        else setTimeout(check, 1);
+        if (v !== undefined) {
+          resolve(v);
+          return;
+        }
+        if (pipe.closed) {
+          resolve(null);
+          return;
+        }
+        setTimeout(check, 1);
       };
       check();
     });
@@ -265,6 +283,10 @@ function pairedTransports(): [Log, Log] {
       outQ.push(msg);
     },
     receive: () => poll(inbound),
+    // TD-020: session-end signal — EOF the peer's pending receive.
+    close() {
+      pipe.closed = true;
+    },
   });
   const logA: SyncMessage[] = [];
   const logB: SyncMessage[] = [];
