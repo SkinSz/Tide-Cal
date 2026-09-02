@@ -60,6 +60,12 @@ struct EventInput {
     start_ms: i64,
     end_ms: i64,
     all_day: bool,
+    /// DC-12 §2.1: optional RFC 5545 RRULE — CREATE only. NOTE (smoke-test
+    /// bug, 2026-09-02): this field was missing here, so serde silently
+    /// dropped the frontend's recurrenceRule and repeating events were
+    /// created as singles — the rule never reached the sidecar.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recurrence_rule: Option<String>,
 }
 
 impl EventInput {
