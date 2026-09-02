@@ -13,6 +13,9 @@ import {
   updateSeriesRule,
   listSeries,
   listEvents,
+  getReminder,
+  setReminder,
+  clearReminder,
   type CalendarEvent,
   type EventInput,
   type SeriesRow,
@@ -485,6 +488,21 @@ function openFor(date: Date, existing?: CalendarEvent): void {
   (dlg().querySelector("#ev-delete") as HTMLButtonElement).hidden =
     !existing;
   syncTimeVisibility();
+  // DC-22: prefill the "Remind me" checkbox from the event's reminder member
+  // (async — the checkbox shows the no-reminder state until the lookup lands;
+  // Save writes whatever the checkbox shows at click time).
+  field<HTMLInputElement>("ev-remind-on").checked = false;
+  field<HTMLSelectElement>("ev-remind-minutes").value = "15";
+  if (existing) {
+    void getReminder(existing.id)
+      .then((rem) => {
+        if (rem && rem.enabled) {
+          field<HTMLInputElement>("ev-remind-on").checked = true;
+          field<HTMLSelectElement>("ev-remind-minutes").value = String(rem.minutesBefore);
+        }
+      })
+      .catch((e) => console.warn("[tide] reminder lookup unavailable:", e));
+  }
   dlg().showModal();
 }
 
@@ -759,12 +777,28 @@ export function initDialog(): void {
               await updateSeriesRule(currentSeries.seriesId, rule);
             }
           }
+          // DC-22: reminder member follows the checkbox (update path).
+          if (field<HTMLInputElement>("ev-remind-on").checked) {
+            await setReminder(
+              id,
+              Number(field<HTMLSelectElement>("ev-remind-minutes").value),
+            );
+          } else {
+            await clearReminder(id);
+          }
         } else {
           // New event: optional create-time RRULE makes it a series (DC-12 §2.1).
           const rule = builderRule();
-          await createEvent(
+          const saved = await createEvent(
             rule ? { ...input, recurrenceRule: rule } : input,
           );
+          // DC-22: reminder member follows the checkbox (create path).
+          if (field<HTMLInputElement>("ev-remind-on").checked) {
+            await setReminder(
+              saved.id,
+              Number(field<HTMLSelectElement>("ev-remind-minutes").value),
+            );
+          }
         }
         dlg().close();
         document.dispatchEvent(new CustomEvent("tide:refresh"));

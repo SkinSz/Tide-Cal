@@ -317,7 +317,7 @@ async fn sync_op(
     op: String,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    const ALLOWED: [&str; 21] = [
+    const ALLOWED: [&str; 24] = [
         "device_info",
         "pairing_offer",
         "pairing_accept",
@@ -334,6 +334,10 @@ async fn sync_op(
         "reset_peer_state",
         "unblock_peer",
         "list_series",
+        // DC-22: reminder member write path (event dialog "Remind me").
+        "get_reminder",
+        "set_reminder",
+        "clear_reminder",
         // DC-12: recurrence write paths (series rule + occurrence overrides).
         "update_series_rule",
         "update_occurrence",

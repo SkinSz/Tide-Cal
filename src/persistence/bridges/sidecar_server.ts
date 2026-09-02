@@ -617,6 +617,29 @@ export function makeDispatcher(core: EventCore, sync?: SyncManager): Dispatcher 
       // (DC-12 §2) — no change records, no mutation, no args.
       case "list_series":
         return core.listSeries();
+      // DC-22: reminder member write path (dialog "Remind me" checkbox).
+      // Replicates as reminder member_add/update/remove (D5).
+      case "get_reminder": {
+        if (typeof args.event_id !== "string") fail("get_reminder: args.event_id required");
+        return core.reminderFor(args.event_id as string);
+      }
+      case "set_reminder": {
+        if (typeof args.event_id !== "string") fail("set_reminder: args.event_id required");
+        if (typeof args.minutes_before !== "number" || !Number.isInteger(args.minutes_before) || args.minutes_before < 0) {
+          fail("set_reminder: args.minutes_before must be a non-negative integer");
+        }
+        if (typeof args.enabled !== "boolean") fail("set_reminder: args.enabled must be a boolean");
+        core.setReminder(args.event_id as string, {
+          minutesBefore: args.minutes_before as number,
+          enabled: args.enabled as boolean,
+        });
+        return { set: true };
+      }
+      case "clear_reminder": {
+        if (typeof args.event_id !== "string") fail("clear_reminder: args.event_id required");
+        core.clearReminder(args.event_id as string);
+        return { cleared: true };
+      }
       // --- DC-12 §2.1/§3: series write paths. The rule is its own conflict
       // entity (series_id, "recurrence_rule"); occurrence overrides are
       // keyed (series_id, recurrence_id) with per-field DC-03 entities

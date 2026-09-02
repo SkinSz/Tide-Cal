@@ -259,6 +259,27 @@ export function listSeries(): Promise<SeriesRow[]> {
   });
 }
 
+// --- DC-22: reminder member surface (event dialog "Remind me") ------------
+
+/** Read one event's reminder, or null (no reminder configured). */
+export function getReminder(
+  eventId: string,
+): Promise<{ minutesBefore: number; enabled: boolean } | null> {
+  return invoke<{ minutesBefore: number; enabled: boolean } | null>("get_reminder", {
+    event_id: eventId,
+  });
+}
+
+/** Create-or-update the event's reminder member (DC-22 D5). */
+export function setReminder(eventId: string, minutesBefore: number): Promise<void> {
+  return invoke("set_reminder", { event_id: eventId, minutes_before: minutesBefore, enabled: true });
+}
+
+/** Remove the event's reminder member. */
+export function clearReminder(eventId: string): Promise<void> {
+  return invoke("clear_reminder", { event_id: eventId });
+}
+
 export function listEvents(range?: {
   fromMs: number;
   toMs: number;

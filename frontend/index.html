@@ -53,6 +53,16 @@
         </label>
         <label class="check"><input type="checkbox" id="ev-allday" /> Whole day</label>
         <label class="check"><input type="checkbox" id="ev-repeat-on" /> Repeat</label>
+        <label class="check"><input type="checkbox" id="ev-remind-on" /> Remind me
+          <select id="ev-remind-minutes">
+            <option value="5">5 minutes before</option>
+            <option value="10">10 minutes before</option>
+            <option value="15" selected>15 minutes before</option>
+            <option value="30">30 minutes before</option>
+            <option value="60">1 hour before</option>
+            <option value="1440">1 day before</option>
+          </select>
+        </label>
         <div id="ev-time-row">
           <label>Start
             <span class="time-wrap">

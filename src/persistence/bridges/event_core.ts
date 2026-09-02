@@ -344,6 +344,111 @@ export class EventCore {
     return this.deviceId;
   }
 
+  // -------------------------------------------------------------------------
+  // DC-22: reminder members (collection members; replicate per D5).
+  // -------------------------------------------------------------------------
+
+  /** Read one event's reminder member, or null. */
+  reminderFor(eventId: string): { minutesBefore: number; enabled: boolean } | null {
+    const row = this.db
+      .prepare<[string], { minutes_before: number; enabled: number | null }>(
+        "SELECT minutes_before, enabled FROM reminders WHERE entity_id = ?",
+      )
+      .get(eventId);
+    if (row === undefined) return null;
+    return { minutesBefore: row.minutes_before, enabled: row.enabled !== 0 };
+  }
+
+  /**
+   * Create-or-update this event's reminder member (v1 UI: one member per
+   * event). Replicates as member_add / member_update (D5: disabled members
+   * are stored-but-inactive AND still replicate).
+   */
+  setReminder(eventId: string, reminder: { minutesBefore: number; enabled: boolean }): void {
+    if (!Number.isInteger(reminder.minutesBefore) || reminder.minutesBefore < 0) {
+      throw new Error("setReminder: minutes_before must be a non-negative integer");
+    }
+    // The event must exist — a reminder for a non-entity is an orphan.
+    if (this.getEventRow(eventId) === undefined) {
+      throw new Error(`setReminder: event not found: ${eventId}`);
+    }
+    const existing = this.db
+      .prepare<[string], { member_id: string }>(
+        "SELECT member_id FROM reminders WHERE entity_id = ?",
+      )
+      .get(eventId);
+    const hlc = this.hlc.now();
+    if (existing !== undefined) {
+      createLocalChange(
+        this.db,
+        this.deviceId,
+        {
+          entity_id: eventId,
+          entity_type: "reminder",
+          field_path: `reminders.${existing.member_id}`,
+          operation: "member_update",
+          payload: {
+            value: { minutes_before: reminder.minutesBefore, enabled: reminder.enabled ? 1 : 0 },
+          },
+          hlc_now: () => hlc,
+        },
+        (db) => {
+          db.prepare(
+            "UPDATE reminders SET minutes_before = ?, enabled = ?, updated_hlc = ? WHERE member_id = ?",
+          ).run(reminder.minutesBefore, reminder.enabled ? 1 : 0, hlc, existing.member_id);
+        },
+      );
+      return;
+    }
+    const memberId = `rem-${randomUUID()}`;
+    createLocalChange(
+      this.db,
+      this.deviceId,
+      {
+        entity_id: eventId,
+        entity_type: "reminder",
+        field_path: `reminders.${memberId}`,
+        operation: "member_add",
+        payload: {
+          value: { minutes_before: reminder.minutesBefore, enabled: reminder.enabled ? 1 : 0 },
+        },
+        hlc_now: () => hlc,
+      },
+      (db) => {
+        db.prepare(
+          `INSERT INTO reminders (member_id, entity_id, collection_path, minutes_before, enabled, updated_hlc)
+           VALUES (?, ?, 'reminders', ?, ?, ?)`,
+        ).run(memberId, eventId, reminder.minutesBefore, reminder.enabled ? 1 : 0, hlc);
+      },
+    );
+  }
+
+  /** Remove the event's reminder member (member_remove). Idempotent. */
+  clearReminder(eventId: string): void {
+    const existing = this.db
+      .prepare<[string], { member_id: string }>(
+        "SELECT member_id FROM reminders WHERE entity_id = ?",
+      )
+      .get(eventId);
+    if (existing === undefined) return;
+    const hlc = this.hlc.now();
+    createLocalChange(
+      this.db,
+      this.deviceId,
+      {
+        entity_id: eventId,
+        entity_type: "reminder",
+        field_path: `reminders.${existing.member_id}`,
+        operation: "member_remove",
+        payload: { value: null },
+        hlc_now: () => hlc,
+      },
+      (db) => {
+        db.prepare("DELETE FROM reminders WHERE member_id = ?").run(existing.member_id);
+      },
+    );
+  }
+
   /**
    * Bootstrap the shell-local calendar through the same T1 path so even
    * this bootstrap produces an auditable change record.
