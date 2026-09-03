@@ -27,7 +27,7 @@ const DAY_NAMES = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"] as const;
 const JS_DAY_TO_NAME = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"];
 
 interface ParsedRule {
-  freq: "DAILY" | "WEEKLY" | "MONTHLY";
+  freq: "DAILY" | "WEEKLY" | "MONTHLY" | "YEARLY";
   interval: number;
   byDay: string[]; // ['MO','FR'] normalized uppercase
   count: number | null;
@@ -49,7 +49,9 @@ export function parseRule(rule: string): ParsedRule {
     switch (key) {
       case "FREQ": {
         const f = value.toUpperCase();
-        if (f === "DAILY" || f === "WEEKLY" || f === "MONTHLY") freq = f;
+        if (
+          f === "DAILY" || f === "WEEKLY" || f === "MONTHLY" || f === "YEARLY"
+        ) freq = f;
         break;
       }
       case "INTERVAL":
@@ -235,6 +237,28 @@ export function expandOccurrences(
     // rules. hardCap occurrences × interval months bounds the walk exactly.
     if (mi > hardCap * rule.interval) break;
     if (emit(d)) break;
+  }
+  // Smoke-test fix (2026-09-03): FREQ=YEARLY previously fell through the
+  // if-chain into the MONTHLY branch (default freq was also DAILY), so a
+  // yearly series expanded to monthly occurrences — every override became an
+  // orphan and the chain rendered wrong. YEARLY = MONTHLY stepping with the
+  // month FIXED to the base's month: step `interval` years, keep the base
+  // day-of-month (short-month skip per RFC 5545, same as MONTHLY).
+  if (rule.freq === "YEARLY") {
+    for (let yi = 0; ; yi += rule.interval) {
+      const d = new Date(
+        Date.UTC(
+          base.getUTCFullYear() + yi, base.getUTCMonth(), 1,
+          base.getUTCHours(), base.getUTCMinutes(), base.getUTCSeconds(),
+        ),
+      );
+      d.setUTCDate(base.getUTCDate());
+      if (d.getUTCDate() !== base.getUTCDate()) continue; // Feb 29 on non-leap years: skip
+      if (rule.until !== null && dateOnlyId(d) > rule.until) break;
+      if (yi > hardCap * rule.interval) break;
+      if (emit(d)) break;
+    }
+    return out;
   }
   return out;
 }
