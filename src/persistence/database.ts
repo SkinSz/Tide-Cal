@@ -55,6 +55,33 @@ function initializeSchema(db: Database.Database): void {
     throw new Error(
       `database schema_version ${row.version} newer than supported ${SCHEMA_VERSION}`,
     );
+  } else if (row.version === SCHEMA_VERSION) {
+    // Repair path (smoke round 5): the v7 migration shipped BEFORE the
+    // reminder/all-day columns were added to it, so some DBs are stamped v7
+    // but lack the columns. Re-run the v7 column-adds (guarded, idempotent)
+    // when they are missing. A v8 stamp would not fix DBs already at 7.
+    const remCols = db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='reminders'")
+      .get() !== undefined
+      ? (db.prepare("PRAGMA table_info(reminders)").all() as Array<{ name: string }>).map((c) => c.name)
+      : [];
+    if (remCols.length > 0 && !remCols.includes("enabled")) {
+      const tx = db.transaction(() => {
+        db.exec("ALTER TABLE reminders ADD COLUMN enabled INTEGER CHECK (enabled IN (0, 1))");
+      });
+      tx();
+    }
+    const evCols = db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'")
+      .get() !== undefined
+      ? (db.prepare("PRAGMA table_info(events)").all() as Array<{ name: string }>).map((c) => c.name)
+      : [];
+    if (evCols.length > 0 && !evCols.includes("all_day_reminder_time")) {
+      const tx = db.transaction(() => {
+        db.exec("ALTER TABLE events ADD COLUMN all_day_reminder_time TEXT");
+      });
+      tx();
+    }
   } else if (row.version < SCHEMA_VERSION) {
     // Forward migrations (run oldest-first, inside one transaction).
     const tx = db.transaction(() => {
@@ -140,6 +167,36 @@ function initializeSchema(db: Database.Database): void {
         }
         if (!cols.includes("last_endpoint_seen")) {
           db.exec("ALTER TABLE peers ADD COLUMN last_endpoint_seen INTEGER");
+        }
+        // DC-22 §2.4/D5: reminder enable/disable state (stored-but-inactive,
+        // NULL/1 = active, 0 = disabled). Smoke-test round 5 runtime evidence:
+        // these columns were added to the fresh-install DDL (schema.ts) but
+        // NOT to this migration path, so existing DBs hit
+        // "table reminders has no column named enabled" on the first
+        // set_reminder. Guards keep re-runs safe.
+        const remCols = db
+          .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='reminders'")
+          .get() !== undefined
+          ? (
+              db.prepare("PRAGMA table_info(reminders)").all() as Array<
+                { name: string }
+              >
+            ).map((c) => c.name)
+          : [];
+        if (remCols.length > 0 && !remCols.includes("enabled")) {
+          db.exec("ALTER TABLE reminders ADD COLUMN enabled INTEGER CHECK (enabled IN (0, 1))");
+        }
+        const evCols = db
+          .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'")
+          .get() !== undefined
+          ? (
+              db.prepare("PRAGMA table_info(events)").all() as Array<
+                { name: string }
+              >
+            ).map((c) => c.name)
+          : [];
+        if (evCols.length > 0 && !evCols.includes("all_day_reminder_time")) {
+          db.exec("ALTER TABLE events ADD COLUMN all_day_reminder_time TEXT");
         }
       }
       db.prepare("UPDATE schema_version SET version = ?").run(SCHEMA_VERSION);
