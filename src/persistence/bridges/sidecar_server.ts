@@ -67,6 +67,26 @@ import {
   markDelivered,
 } from "../../application/reminder_engine.ts";
 import { deliverNotification } from "../../application/notification_delivery.ts";
+// Smoke-test fix (2026-09-03): reminders on series events fired against the
+// BASE row's stored instant only — a reminder set on any occurrence chip
+// fired for the series' first occurrence (or, worse, for a re-anchored base
+// instant), never for the occurrence the user set it on. The tick now feeds
+// the engine one synthetic event row PER OCCURRENCE in the reminder window
+// (id `<base>#<recurrence_id>`), so per-occurrence reminders work without
+// touching the replicated reminder member (still one per event, DC-22 D5).
+import { expandOccurrences } from "../../domain/recurrence_conflicts.ts";
+
+/** Local wall "YYYYMMDDTHHMMSS" -> epoch ms (same math as calendar.ts). */
+function msFromWallId(id: string): number {
+  const digits = id.replace(/\D/g, "");
+  const y = +digits.slice(0, 4);
+  const mo = +digits.slice(4, 6);
+  const dd = +digits.slice(6, 8);
+  const hh = +digits.slice(8, 10) || 0;
+  const mi = +digits.slice(10, 12) || 0;
+  const ss = +digits.slice(12, 14) || 0;
+  return new Date(y, mo - 1, dd, hh, mi, ss, 0).getTime();
+}
 import {
   listQuarantine,
   countQuarantined,
@@ -1223,7 +1243,7 @@ function main(): void {
       // authoritative INSTANT — respects tz_id per DC-22 §5.1) plus wall
       // strings for labels; all-day events carry start_date/end_date
       // (midnight wall convention, local by definition).
-      const events = core.db
+      const baseEvents = core.db
         .prepare(
           `SELECT e.event_id AS entity_id, e.title,
                   e.utc_start_ms, e.utc_end_ms,
@@ -1233,6 +1253,69 @@ function main(): void {
            FROM events e`
         )
         .all() as never[];
+      // Smoke-test fix (2026-09-03): expand each timed series into per-
+      // occurrence synthetic rows so reminders fire for the OCCURRENCE the
+      // reminder is due on — not just the base's first instant. All-day
+      // series keep single-row semantics (D2: day-before fire, day-granular).
+      // Window: 25h back (missed horizon, D1) to 1y forward — deterministic
+      // and comfortably wider than any notify horizon. Overrides (moved/
+      // retitled occurrences) apply via the same chip math the calendar uses.
+      const events: never[] = [];
+      const seriesRows = core.db
+        .prepare(
+          `SELECT s.series_id, s.base_event_id, s.recurrence_rule
+           FROM series s`,
+        )
+        .all() as Array<{
+        series_id: string;
+        base_event_id: string;
+        recurrence_rule: string;
+      }>;
+      const seriesByBase = new Map(seriesRows.map((s) => [s.base_event_id, s]));
+      const now = Date.now();
+      const WIN_LO = `${new Date(now - 25 * 3_600_000).getFullYear()}0101T000000`;
+      for (const ev of baseEvents) {
+        const row = seriesByBase.get((ev as { entity_id: string }).entity_id);
+        const timed =
+          (ev as { all_day: number }).all_day !== 1 &&
+          (ev as { utc_start_ms: number | null }).utc_start_ms != null;
+        if (!row || !timed) {
+          events.push(ev);
+          continue;
+        }
+        let occIds: string[] = [];
+        try {
+          occIds = expandOccurrences(
+            {
+              series_id: row.series_id,
+              base_start_wall: (ev as { start_wall: string }).start_wall,
+              tz_id: "local",
+              recurrence_rule: row.recurrence_rule,
+            },
+            WIN_LO,
+            `${new Date(now).getFullYear() + 1}1231T235959`,
+          );
+        } catch {
+          events.push(ev); // expansion failure → base-row behavior (degraded)
+          continue;
+        }
+        if (occIds.length === 0) {
+          events.push(ev);
+          continue;
+        }
+        const durMs =
+          ((ev as { utc_end_ms: number }).utc_end_ms ?? 0) -
+          (ev as { utc_start_ms: number }).utc_start_ms;
+        for (const occId of occIds) {
+          const startMs = msFromWallId(occId);
+          events.push({
+            ...(ev as Record<string, unknown>),
+            entity_id: `${(ev as { entity_id: string }).entity_id}#${occId}`,
+            utc_start_ms: startMs,
+            utc_end_ms: startMs + Math.max(durMs, 0),
+          } as never);
+        }
+      }
       const reminders = core.db
         .prepare(
           // DC-22 D5: disabled reminders (enabled = 0) are stored but INACTIVE

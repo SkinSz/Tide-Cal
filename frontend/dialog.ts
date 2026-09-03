@@ -696,6 +696,7 @@ export function initDialog(): void {
       const input = readInput();
       if (!input) return;
       const id = field<HTMLInputElement>("ev-id").value;
+      const existing = dialogEvent;
       // Mandatory end date (owner decision, 2026-08-31): every built rule
       // carries UNTIL. Friendly inline validation before any write; the
       // picked date is INCLUSIVE (last occurrence) and must be on or after
@@ -716,7 +717,6 @@ export function initDialog(): void {
       }
       try {
         if (id) {
-          const existing = dialogEvent;
           if (existing && currentSeries && !repeatOn() && !occurrenceScope()) {
             // TD-016 (owner decision, 2026-09-02, binding): unchecking
             // "Repeat" is NOT a delete. It means "END RECURRENCE AT THIS
@@ -807,7 +807,31 @@ export function initDialog(): void {
             }
           } else {
             // Whole-series edit: base event row (ordinary per-field entities).
-            await updateEvent(id, input);
+            // Smoke-test bug (2026-09-03, DB-evidenced): this path passed the
+            // CHIP's startMs/endMs straight to updateEvent, so editing a chip
+            // that isn't the series' first occurrence RE-ANCHORED the base to
+            // that chip — every earlier occurrence silently vanished and any
+            // occurrence overrides became orphans (their recurrence_ids no
+            // longer generated → the "custom occurrence gets dropped" report;
+            // the same mechanism dropped the chain when a reminder save rode
+            // along on a whole-series edit). Same bug class as Pkg8 F1 (the
+            // uncheck path), which already re-reads the authoritative base
+            // row. Fix: schedule changes apply as a DELTA relative to the
+            // chip the dialog rendered — user didn't touch the times → zero
+            // delta → the base anchor and all overrides stay untouched.
+            const baseRow = (await listEvents({ fromMs: 0, toMs: Date.now() + 3_155_760_000_000 }))
+              .find((e) => e.id === id);
+            const chip = existing!; // guarded: this branch requires existing && currentSeries
+            const baseStartMs = baseRow?.startMs ?? chip.startMs;
+            const baseEndMs = baseRow?.endMs ?? chip.endMs;
+            const seriesInput: EventInput = {
+              title: input.title,
+              description: input.description,
+              startMs: baseStartMs + (input.startMs - chip.startMs),
+              endMs: baseEndMs + (input.endMs - chip.endMs),
+              allDay: input.allDay,
+            };
+            await updateEvent(id, seriesInput);
             // DC-12 §3: rule edits go to their OWN conflict entity
             // (series_id, "recurrence_rule"); only when the builder produced
             // a different rule. Unparsable rules (builder disabled) are kept
