@@ -311,6 +311,64 @@ async fn delete_event(sc: State<'_, SidecarState>, id: String) -> Result<(), Str
 /// Generic passthrough for the sync surface (device_info, pairing_offer,
 /// pairing_accept, sync_now). Keeping it generic avoids one Rust command per
 /// op while payload shapes settle; typed commands can be added later.
+///
+/// Smoke-test fix (2026-09-03): the reminder ops are invoked from the
+/// frontend as DIRECT Tauri commands (frontend/store.ts getReminder/
+/// setReminder/clearReminder call invoke("set_reminder") etc.) — NOT through
+/// this passthrough. They must be registered in invoke_handler below.
+
+/// Typed Tauri commands for the DC-22 reminder member surface. These proxy
+/// to the sidecar's authoritative ops (registered in sync_op ALLOWED as
+/// well, so both boundaries accept them). Frontend invokes these directly.
+#[tauri::command]
+async fn get_reminder(
+    sc: State<'_, SidecarState>,
+    event_id: String,
+) -> Result<serde_json::Value, String> {
+    let handle = sidecar_handle(&sc)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        proxy(&handle, "get_reminder", json!({ "event_id": event_id }))
+    })
+    .await
+    .map_err(|e| format!("join sidecar task: {e}"))?
+}
+
+#[tauri::command]
+async fn set_reminder(
+    sc: State<'_, SidecarState>,
+    event_id: String,
+    minutes_before: i64,
+    enabled: bool,
+) -> Result<serde_json::Value, String> {
+    let handle = sidecar_handle(&sc)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        proxy(
+            &handle,
+            "set_reminder",
+            json!({
+                "event_id": event_id,
+                "minutes_before": minutes_before,
+                "enabled": enabled,
+            }),
+        )
+    })
+    .await
+    .map_err(|e| format!("join sidecar task: {e}"))?
+}
+
+#[tauri::command]
+async fn clear_reminder(
+    sc: State<'_, SidecarState>,
+    event_id: String,
+) -> Result<serde_json::Value, String> {
+    let handle = sidecar_handle(&sc)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        proxy(&handle, "clear_reminder", json!({ "event_id": event_id }))
+    })
+    .await
+    .map_err(|e| format!("join sidecar task: {e}"))?
+}
+
 #[tauri::command]
 async fn sync_op(
     sc: State<'_, SidecarState>,
@@ -843,7 +901,10 @@ pub fn run() {
             manual_sync_now,
             quit_tide,
             get_settings,
-            set_settings
+            set_settings,
+            get_reminder,
+            set_reminder,
+            clear_reminder
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
