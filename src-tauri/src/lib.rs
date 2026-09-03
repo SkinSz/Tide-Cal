@@ -320,7 +320,15 @@ async fn delete_event(sc: State<'_, SidecarState>, id: String) -> Result<(), Str
 /// Typed Tauri commands for the DC-22 reminder member surface. These proxy
 /// to the sidecar's authoritative ops (registered in sync_op ALLOWED as
 /// well, so both boundaries accept them). Frontend invokes these directly.
-#[tauri::command]
+///
+/// Causal-gate note: Tauri v2 derives IPC argument keys from the Rust
+/// parameter names — snake_case Rust params expect snake_case JS keys ONLY
+/// if the command is annotated; the default is camelCase. The frontend sends
+/// snake_case ({event_id, minutes_before}), so each command is explicitly
+/// annotated `#[tauri::command(rename_all = "snake_case")]` to make the
+/// expectation match the wire format — verified against the generated
+/// command-map string in the binary.
+#[tauri::command(rename_all = "snake_case")]
 async fn get_reminder(
     sc: State<'_, SidecarState>,
     event_id: String,
@@ -333,7 +341,7 @@ async fn get_reminder(
     .map_err(|e| format!("join sidecar task: {e}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn set_reminder(
     sc: State<'_, SidecarState>,
     event_id: String,
@@ -356,7 +364,7 @@ async fn set_reminder(
     .map_err(|e| format!("join sidecar task: {e}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn clear_reminder(
     sc: State<'_, SidecarState>,
     event_id: String,
