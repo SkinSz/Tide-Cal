@@ -1320,7 +1320,8 @@ function main(): void {
         .prepare(
           // DC-22 D5: disabled reminders (enabled = 0) are stored but INACTIVE
           // — the schedule engine never schedules them (NULL/1 = active).
-          "SELECT member_id, entity_id, minutes_before FROM reminders WHERE enabled IS NULL OR enabled = 1",
+          // updated_hlc feeds the late-configuration discard (reminder_engine).
+          "SELECT member_id, entity_id, minutes_before, updated_hlc AS updated_hlc_ms FROM reminders WHERE enabled IS NULL OR enabled = 1",
         )
         .all() as never[];
       const schedule = rebuildSchedule(events, reminders, Date.now());

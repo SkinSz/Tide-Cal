@@ -27,6 +27,16 @@ export interface ReminderRow {
   member_id: string;
   entity_id: string;
   minutes_before: number;
+  /**
+   * Smoke-test fix (2026-09-03): the reminder member's last-write HLC (epoch
+   * ms). Drives the late-configuration rule: a reminder CREATED after its
+   * fire moment already passed must NOT surface as "missed" — the user just
+   * configured it and knows the event hasn't started; an immediate fire is
+   * noise, not a missed-while-not-running surface (D1 applies to reminders
+   * that existed before their fire moment). Optional: null/undefined keeps
+   * the legacy always-show behavior (older rows, tests).
+   */
+  updated_hlc_ms?: number | null;
 }
 
 export interface EventRow {
@@ -125,6 +135,11 @@ export function rebuildSchedule(
     }
     // Missed path (D1): fire_at passed while not running. Show-on-launch
     // UNLESS the event itself has already ended (discard = noise).
+    // Smoke-test refinement (2026-09-03): a reminder CONFIGURED after its
+    // fire moment (updated_hlc_ms > fireAt) is a late configuration, not a
+    // missed-while-not-running surface — the user set it up knowingly, an
+    // instant fire is pure noise. The event-ends discard below still applies.
+    if (rem.updated_hlc_ms != null && rem.updated_hlc_ms > fireAt) continue;
     const endMs = endMsFor(startMs + 3_600_000);
     if (endMs > nowMs) out.push(makeFire(rem, ev, fireAt, true));
   }
