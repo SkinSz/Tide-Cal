@@ -109,13 +109,14 @@ struct TideSettings {
     general_time_format: String,
     /// General category: date/number rendering locale for WebKitGTK. The
     /// webview formats native <input type="date"> and toLocaleDateString
-    /// from the process locale (LANG), NOT LC_TIME — on mixed-locale
-    /// systems (e.g. LANG=en_US + LC_TIME=de_DE) dates render MM/DD/YYYY
-    /// even though the desktop shows DD.MM.YYYY. "system" (default) leaves
-    /// the environment untouched; "de", "en-GB", "en-US" force the matching
-    /// LC_TIME/LC_NUMERIC at startup. NEXT-START (DC-20 §7.2): WebKitGTK
-    /// reads the locale once at webview creation, live-apply is impossible.
-    #[serde(default, rename = "general.locale")]
+    /// from the process locale (GLib reads LC_MESSAGES/LC_ALL, NOT LC_TIME)
+    /// — on mixed-locale systems (e.g. LANG=en_US + LC_TIME=de_DE) dates
+    /// render MM/DD/YYYY even though the desktop shows DD.MM.YYYY.
+    /// "system" (default) leaves the environment untouched; the other values
+    /// force LC_ALL to the matching locale at startup. NEXT-START
+    /// (DC-20 §7.2): WebKitGTK reads the locale once at webview creation,
+    /// live-apply is impossible.
+    #[serde(default = "default_general_locale", rename = "general.locale")]
     general_locale: String,
 }
 
@@ -814,12 +815,10 @@ pub fn run() {
                     "en-GB" => "en_GB.UTF-8",
                     _ => "en_US.UTF-8",
                 };
-                // Only the categories the webview consults for formatting;
-                // LANG itself is left alone so the rest of the UI language
-                // (if any) is unaffected.
-                for cat in ["LC_TIME", "LC_NUMERIC", "LC_MONETARY"] {
-                    std::env::set_var(cat, code);
-                }
+                // LC_ALL is the lever GLib/WebKitGTK actually consults for
+                // date rendering (LC_TIME alone is ignored by the webview's
+                // locale negotiation). Set it before any GTK/webview init.
+                std::env::set_var("LC_ALL", code);
                 log::info!("locale override applied: {code} (next-start setting)");
             }
             _ => {}
