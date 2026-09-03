@@ -17,6 +17,7 @@ interface TideSettings {
   max_incremental_backlog: number;
   general_theme: string;
   general_time_format: string;
+  general_locale: string;
 }
 
 const DEFAULTS: TideSettings = {
@@ -26,6 +27,7 @@ const DEFAULTS: TideSettings = {
   max_incremental_backlog: 1000,
   general_theme: "dark",
   general_time_format: "24h",
+  general_locale: "system",
 };
 
 /**
@@ -44,6 +46,7 @@ export type ShellSettings = Record<string, unknown>;
 const FLAT_TO_SHELL: Record<string, string> = {
   general_theme: "general.theme",
   general_time_format: "general.time_format",
+  general_locale: "general.locale",
 };
 
 /** Shell -> frontend: accept the dotted IPC keys (fall back to flat keys). */
@@ -166,6 +169,16 @@ async function loadSettings(): Promise<void> {
   )) {
     radio.checked = radio.value === fmt;
   }
+  // Locale radios: whitelist matches the Rust clamp (system/de/en-GB/en-US).
+  const savedLocale = current.general_locale;
+  const locale = ["system", "de", "en-GB", "en-US"].includes(savedLocale)
+    ? savedLocale
+    : "system";
+  for (const radio of document.querySelectorAll<HTMLInputElement>(
+    'input[name="opt-locale"]',
+  )) {
+    radio.checked = radio.value === locale;
+  }
 }
 
 /** Read the General radios into the pending settings (defaults if unset). */
@@ -178,6 +191,12 @@ function readGeneral(pending: TideSettings): void {
   );
   pending.general_theme = theme?.value === "light" ? "light" : "dark";
   pending.general_time_format = fmt?.value === "12h" ? "12h" : "24h";
+  const locale = document.querySelector<HTMLInputElement>(
+    'input[name="opt-locale"]:checked',
+  );
+  pending.general_locale = ["de", "en-GB", "en-US"].includes(locale?.value ?? "")
+    ? locale!.value
+    : "system";
 }
 
 /**

@@ -72,6 +72,26 @@
             </label>
             <span class="opt-hint">How times appear when you add or edit events. Calendar data is stored the same way either way.</span>
           </fieldset>
+          <fieldset class="opt-field opt-choice" id="opt-locale-group">
+            <legend class="opt-label">Date format</legend>
+            <label class="opt-radio">
+              <input type="radio" name="opt-locale" value="system" />
+              <span>System</span>
+            </label>
+            <label class="opt-radio">
+              <input type="radio" name="opt-locale" value="de" />
+              <span>German — TT.MM.JJJJ</span>
+            </label>
+            <label class="opt-radio">
+              <input type="radio" name="opt-locale" value="en-GB" />
+              <span>English (UK) — DD/MM/YYYY</span>
+            </label>
+            <label class="opt-radio">
+              <input type="radio" name="opt-locale" value="en-US" />
+              <span>English (US) — MM/DD/YYYY</span>
+            </label>
+            <span class="opt-hint">How dates appear in the event dialog and calendar headings. Fixes mixed-locale systems where the desktop is German but dates show US style. Takes effect the next time Tide starts.</span>
+          </fieldset>
         </section>
         <div class="options-footer">
           <span class="dialog-error" id="options-error" role="alert" hidden></span>

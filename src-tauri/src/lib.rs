@@ -107,6 +107,20 @@ struct TideSettings {
         rename = "general.time_format"
     )]
     general_time_format: String,
+    /// General category: date/number rendering locale for WebKitGTK. The
+    /// webview formats native <input type="date"> and toLocaleDateString
+    /// from the process locale (LANG), NOT LC_TIME — on mixed-locale
+    /// systems (e.g. LANG=en_US + LC_TIME=de_DE) dates render MM/DD/YYYY
+    /// even though the desktop shows DD.MM.YYYY. "system" (default) leaves
+    /// the environment untouched; "de", "en-GB", "en-US" force the matching
+    /// LC_TIME/LC_NUMERIC at startup. NEXT-START (DC-20 §7.2): WebKitGTK
+    /// reads the locale once at webview creation, live-apply is impossible.
+    #[serde(default, rename = "general.locale")]
+    general_locale: String,
+}
+
+fn default_general_locale() -> String {
+    "system".to_string()
 }
 
 fn default_general_theme() -> String {
@@ -127,6 +141,7 @@ impl Default for TideSettings {
             max_incremental_backlog: 1000.0,
             general_theme: "dark".to_string(),
             general_time_format: "24h".to_string(),
+            general_locale: "system".to_string(),
         }
     }
 }
@@ -147,6 +162,10 @@ impl TideSettings {
         }
         if self.general_time_format != "12h" && self.general_time_format != "24h" {
             self.general_time_format = "24h".to_string();
+        }
+        match self.general_locale.as_str() {
+            "system" | "de" | "en-GB" | "en-US" => {}
+            _ => self.general_locale = "system".to_string(),
         }
         self
     }
@@ -191,6 +210,29 @@ fn load_settings(app: &tauri::AppHandle) -> TideSettings {
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|text| toml::from_str::<TideSettings>(&text).ok()); // fail-open (§6.2)
     apply_env_overrides(from_file.unwrap_or_default())
+}
+
+/// run()-time settings read without an AppHandle: config file only (no env
+/// overrides — those are scheduler numbers, not the startup locale), NO
+/// clamping side effects beyond the locale whitelist. Used by run() to apply
+/// the saved locale before GTK/webview init.
+fn load_settings_pub() -> TideSettings {
+    // The config dir depends on the app identity; before Tauri init we read
+    // the XDG path directly (~/.config/tide/config.toml), matching
+    // config_dir()'s documented layout (DC-15 §3.2).
+    let mut path = std::env::var("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            std::path::PathBuf::from(home).join(".config")
+        });
+    path.push("tide");
+    path.push("config.toml");
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| toml::from_str::<TideSettings>(&text).ok())
+        .unwrap_or_default()
+        .clamped()
 }
 
 fn persist_settings(app: &tauri::AppHandle, s: &TideSettings) -> Result<(), String> {
@@ -755,6 +797,34 @@ fn open_options_window(app: &tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // General.locale (DC-20, owner request 2026-09-03): WebKitGTK formats
+    // native <input type="date"> and toLocaleDateString from the PROCESS
+    // locale (LANG), not LC_TIME — on mixed-locale systems the event dialog
+    // showed MM/DD/YYYY while the desktop is DD.MM.YYYY. Apply the saved
+    // choice via setlocale BEFORE any webview/GTK init; "system" (default)
+    // leaves the environment untouched. NEXT-START setting (DC-20 §7.2):
+    // WebKitGTK reads the locale once at webview creation — live-apply is
+    // not possible, the choice takes effect on the next launch.
+    {
+        let settings = load_settings_pub();
+        match settings.general_locale.as_str() {
+            "de" | "en-GB" | "en-US" => {
+                let code = match settings.general_locale.as_str() {
+                    "de" => "de_DE.UTF-8",
+                    "en-GB" => "en_GB.UTF-8",
+                    _ => "en_US.UTF-8",
+                };
+                // Only the categories the webview consults for formatting;
+                // LANG itself is left alone so the rest of the UI language
+                // (if any) is unaffected.
+                for cat in ["LC_TIME", "LC_NUMERIC", "LC_MONETARY"] {
+                    std::env::set_var(cat, code);
+                }
+                log::info!("locale override applied: {code} (next-start setting)");
+            }
+            _ => {}
+        }
+    }
     // TD-011 bug 4 (window X / titlebar buttons hard to click on Wayland):
     // verified upstream, not ours — tao's client-side decorations on Wayland
     // stop the titlebar buttons from receiving hover/click events
