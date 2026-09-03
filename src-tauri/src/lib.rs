@@ -219,15 +219,19 @@ fn load_settings(app: &tauri::AppHandle) -> TideSettings {
 /// the saved locale before GTK/webview init.
 fn load_settings_pub() -> TideSettings {
     // The config dir depends on the app identity; before Tauri init we read
-    // the XDG path directly (~/.config/tide/config.toml), matching
-    // config_dir()'s documented layout (DC-15 §3.2).
+    // the XDG path directly. CRITICAL (owner bug 2026-09-03): Tauri resolves
+    // app_config_dir to $XDG_CONFIG_HOME/<bundle-identifier>/ — that is
+    // com.tide.app (see tauri.conf.json), NOT the literal "tide" the DC-15
+    // §3.2 comment says. persist_settings (with an AppHandle) writes to
+    // com.tide.app/, so this pre-init reader must match or the saved locale
+    // silently falls back to "system" on every launch.
     let mut path = std::env::var("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_default();
             std::path::PathBuf::from(home).join(".config")
         });
-    path.push("tide");
+    path.push("com.tide.app");
     path.push("config.toml");
     std::fs::read_to_string(path)
         .ok()

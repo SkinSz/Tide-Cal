@@ -633,33 +633,26 @@ export function initDialog(): void {
     });
   }
 
-  // Date picker: WebKit's popover only closes on blur, and Enter/ESC inside
-  // it are swallowed by the popover itself. The "Done" escape hatch exists
-  // ONLY while the Day field's picker is open (shown via .date-picking on
-  // the dialog); auto-blur on change closes the popover in the normal case.
-  const dateOk = document.getElementById("ev-date-ok");
+  // Date picker: WebKit's popover only closes on blur; Enter/ESC inside it
+  // are swallowed by the popover itself. Auto-blur on change closes the
+  // popover in the normal case (owner 2026-09-03 removed the old "Done"
+  // escape hatch — it appeared uselessly whenever the picker was open).
   field("ev-date").addEventListener("focus", () => dlg().classList.add("date-picking"));
   field("ev-date").addEventListener("blur", () => dlg().classList.remove("date-picking"));
   field("ev-date").addEventListener("change", () => {
     commitDateField();
     dlg().classList.remove("date-picking");
   });
-  dateOk?.addEventListener("click", commitDateField);
 
   // Until picker: same WebKitGTK treatment as the Day picker (owner bug —
   // the popover stayed open after picking an end date). Auto-blur on change
-  // closes it; the Done escape hatch shows while EITHER picker is open
-  // (.date-picking / .until-picking on the dialog, see style.css).
+  // closes it.
   field("ev-until").addEventListener("focus", () => dlg().classList.add("until-picking"));
   field("ev-until").addEventListener("blur", () => dlg().classList.remove("until-picking"));
   field("ev-until").addEventListener("change", () => {
     syncRepeatVisibility();
     commitUntilField();
     dlg().classList.remove("until-picking");
-  });
-  dateOk?.addEventListener("click", () => {
-    if (dlg().classList.contains("until-picking")) commitUntilField();
-    else commitDateField();
   });
 
   // Time fields: free typing in the native input OR the ▾ 15-min dropdown.
