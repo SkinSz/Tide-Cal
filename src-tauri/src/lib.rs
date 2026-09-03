@@ -377,6 +377,67 @@ async fn clear_reminder(
     .map_err(|e| format!("join sidecar task: {e}"))?
 }
 
+// ---------------------------------------------------------------------------
+// Smoke-test fix (2026-09-03): recurrence surface commands. The frontend
+// (frontend/store.ts) invokes list_series / update_series_rule /
+// update_occurrence as DIRECT Tauri commands — but they were only present in
+// sync_op's ALLOWED allow-list, never registered in invoke_handler. Every
+// listSeries() call failed, so (a) series never expanded into occurrence
+// chips (repeating events rendered as a single event) and (b) the edit dialog
+// could never look up the event's series — the "Repeat" checkbox showed
+// unchecked even for series events. Same bug class as the reminder commands
+// fixed earlier the same day. Each command proxies to the sidecar op of the
+// same name (all three are in sync_op's ALLOWED list too, so both boundaries
+// accept them).
+#[tauri::command(rename_all = "snake_case")]
+async fn list_series(sc: State<'_, SidecarState>) -> Result<serde_json::Value, String> {
+    let handle = sidecar_handle(&sc)?;
+    tauri::async_runtime::spawn_blocking(move || proxy(&handle, "list_series", json!({})))
+        .await
+        .map_err(|e| format!("join sidecar task: {e}"))?
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn update_series_rule(
+    sc: State<'_, SidecarState>,
+    series_id: String,
+    rule: String,
+) -> Result<serde_json::Value, String> {
+    let handle = sidecar_handle(&sc)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        proxy(
+            &handle,
+            "update_series_rule",
+            json!({ "series_id": series_id, "rule": rule }),
+        )
+    })
+    .await
+    .map_err(|e| format!("join sidecar task: {e}"))?
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn update_occurrence(
+    sc: State<'_, SidecarState>,
+    series_id: String,
+    recurrence_id: String,
+    patch: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let handle = sidecar_handle(&sc)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        proxy(
+            &handle,
+            "update_occurrence",
+            json!({
+                "series_id": series_id,
+                "recurrence_id": recurrence_id,
+                "patch": patch,
+            }),
+        )
+    })
+    .await
+    .map_err(|e| format!("join sidecar task: {e}"))?
+}
+
 #[tauri::command]
 async fn sync_op(
     sc: State<'_, SidecarState>,
@@ -912,7 +973,10 @@ pub fn run() {
             set_settings,
             get_reminder,
             set_reminder,
-            clear_reminder
+            clear_reminder,
+            list_series,
+            update_series_rule,
+            update_occurrence
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

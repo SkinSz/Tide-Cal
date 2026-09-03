@@ -66,14 +66,21 @@
         <div id="ev-time-row">
           <label>Start
             <span class="time-wrap">
-              <input type="time" id="ev-start-t" step="900" />
+              <!-- Smoke-test bug (2026-09-03): WebKitGTK formats native
+                   <input type="time"> from the SYSTEM locale (ignores both
+                   the document lang and the Blink-only ::-webkit CSS
+                   suppression), so 24h mode rendered an AM/PM suffix. Plain
+                   text inputs carry the internal 24h "HH:MM" value instead —
+                   read/save/dropdown logic is untouched; validity is
+                   enforced in dialog.ts readInput/normalizeTime. -->
+              <input type="text" id="ev-start-t" inputmode="numeric" maxlength="5" placeholder="09:00" autocomplete="off" />
               <button type="button" class="time-arrow" data-for="ev-start-t" title="Choose time">▾</button>
               <button type="button" class="ampm-toggle" data-for="ev-start-t" title="Switch AM/PM" hidden>AM</button>
             </span>
           </label>
           <label>End
             <span class="time-wrap">
-              <input type="time" id="ev-end-t" step="900" />
+              <input type="text" id="ev-end-t" inputmode="numeric" maxlength="5" placeholder="10:00" autocomplete="off" />
               <button type="button" class="time-arrow" data-for="ev-end-t" title="Choose time">▾</button>
               <button type="button" class="ampm-toggle" data-for="ev-end-t" title="Switch AM/PM" hidden>PM</button>
             </span>

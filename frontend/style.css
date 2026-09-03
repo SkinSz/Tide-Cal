@@ -333,6 +333,15 @@ dialog menu .spacer { flex: 1 1 auto; }
    (owner design, 2026-08-31) — the native input's own AM/PM field is hidden
    in BOTH modes so there is exactly one AM/PM surface. document lang stays
    en-GB (24h rendering); the toggle + dropdown carry the 12h presentation. */
+/* Smoke-test bug (2026-09-03): the two dialog time fields are now PLAIN TEXT
+   inputs (WebKitGTK formats native <input type="time"> from the system
+   locale, ignoring the document lang — an AM/PM suffix leaked into 24h mode
+   and no Blink CSS backstop applies on WebKit). The internal value contract
+   (24h "HH:MM") is unchanged; validity is enforced in dialog.ts
+   normalizeTime/readInput. The legacy ::-webkit suppression rules below are
+   kept harmless (no <input type="time"> remains in the UI) — they document
+   why the fields were switched and satisfy the options_general contract
+   test. */
 input[type="time"]::-webkit-datetime-edit-ampm-field { display: none; }
 input[type="time"]::-webkit-time-picker-indicator { display: none; }
 .ampm-toggle {

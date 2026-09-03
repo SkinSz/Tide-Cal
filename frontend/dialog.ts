@@ -118,6 +118,28 @@ function toTimeInput(ms: number): string {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
+/**
+ * Normalize free-typed time text to strict "HH:MM" (24h). Accepts the forms
+ * users actually type: "9", "9:5" (-> 09:05), "0930", "9.30", "9h30",
+ * "9:30pm" (12h suffix). Returns null when unparsable or out of range —
+ * readInput surfaces a friendly inline error instead of a broken date parse.
+ */
+export function normalizeTime(raw: string): string | null {
+  const s = String(raw).trim().toLowerCase().replace(/\s+/g, "");
+  if (!s) return null;
+  const pm = /(?:pm|p\.m\.?)$/.test(s);
+  const am = /(?:am|a\.m\.?)$/.test(s);
+  const body = s.replace(/^(?:at)?/, "").replace(/(?:am|pm|a\.m\.?|p\.m\.?)$/, "");
+  const m = body.match(/^(\d{1,2})(?:[:.h]?(\d{1,2}))?$/);
+  if (!m) return null;
+  let h = Number(m[1]);
+  const min = m[2] !== undefined ? Number(m[2]) : 0;
+  if (pm && h < 12) h += 12;
+  if (am && h === 12) h = 0;
+  if (h > 23 || min > 59) return null;
+  return `${pad(h)}:${pad(min)}`;
+}
+
 /** Epoch ms from a local YYYY-MM-DD date and optional HH:MM time. */
 function localMs(date: string, time: string): number {
   return new Date(`${date}T${time || "00:00"}:00`).getTime();
@@ -530,10 +552,28 @@ function readInput(): EventInput | null {
     startMs = localMs(day, "00:00");
     endMs = startMs + 86_400_000;
   } else {
-    const s = field<HTMLInputElement>("ev-start-t").value;
-    let e = field<HTMLInputElement>("ev-end-t").value;
+    // Text time inputs (free-typed): normalize + validate BEFORE parsing.
+    // An unparsable entry shows the friendly inline error and focuses the
+    // field — never a NaN instant (the old native input guaranteed form, the
+    // text replacement re-introduces typing, so the guarantee moves here).
+    const sRaw = field<HTMLInputElement>("ev-start-t").value;
+    const eRaw = field<HTMLInputElement>("ev-end-t").value;
+    const s = normalizeTime(sRaw);
+    if (s === null) {
+      field<HTMLInputElement>("ev-start-t").focus();
+      showInlineError("Start time must be a valid 24h time (HH:MM, e.g. 09:15).");
+      return null;
+    }
+    field<HTMLInputElement>("ev-start-t").value = s;
+    let e = eRaw.trim() ? normalizeTime(eRaw) : null;
+    if (eRaw.trim() && e === null) {
+      field<HTMLInputElement>("ev-end-t").focus();
+      showInlineError("End time must be a valid 24h time (HH:MM, e.g. 10:00).");
+      return null;
+    }
     startMs = localMs(day, s);
     if (!e || e <= s) e = "10:00";
+    field<HTMLInputElement>("ev-end-t").value = e;
     endMs = localMs(day, e);
     if (endMs <= startMs) endMs = startMs + 3_600_000;
   }
