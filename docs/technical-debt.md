@@ -305,15 +305,12 @@ stable, blind final verification PASS WITH CONCERNS with zero new issues).
 - **Next step:** capture the crash signature on recurrence (`journalctl --user -b | grep -iA5 webkit` around the timestamp), match against known WebKitGTK 2.4x bugs, consider webview content mitigations (CSS filters? <input type=date> popover?) before the RPM/DEB release.
 - **Files:** n/a (upstream + possibly frontend rendering features).
 
-## TD-022 — Notification delivery portability: notify-send dependency (delegate findings, 2026-09-04)
+## TD-022 — Notification delivery portability: multi-strategy (2026-09-04)
 - **ID:** TD-022
-- **Title:** Reminder delivery shells out to notify-send; works here but is fragile across distros/launch contexts
-- **Priority:** 4/10 — LOW-MEDIUM (no live bug on Nobara/Plasma; release-hardening)
-- **Status:** DEFERRED (delegate investigation deleg_25c67eca)
-- **Current mechanism:** sidecar spawns `notify-send` (libnotify) per fire; success-only marking, session bus inherited from GUI env. Verified healthy on Nobara/KDE Wayland: DBUS_SESSION_BUS_ADDRESS present, notify-send in PATH, plasmashell owns org.freedesktop.Notifications.
-- **Fragility:** (a) libnotify missing on minimal/WM-only installs → silent Tier-1 degrade (only logged once per session); (b) env fragility under systemd-unit or Flatpak launches (no session bus in child env); (c) no per-app notification settings/history keying without a .desktop file + icon in the release package.
-- **Fix direction (release phase):** move delivery to Rust-side `notify-rust` (direct D-Bus, no binary dependency), keep notify-send as fallback; log every delivery outcome (dispatch/delivered/FAILED — added 2026-09-04 in the reminder tick); ship `com.tide.app.desktop` + icons in RPM/DEB; consider org.freedesktop.portal.Notification as sandboxed fallback.
-- **Files:** `src/application/notification_delivery.ts`, `src/persistence/bridges/sidecar_server.ts` (reminderTick), `src-tauri/` (future notify-rust), packaging specs.
+- **Title:** Reminder delivery should not hard-depend on notify-send (libnotify absent on minimal installs)
+- **Priority:** 4/10 — LOW-MEDIUM → CLOSED
+- **Status:** RESOLVED (commit c2fe3e8, 2026-09-04). Delivery now tries notify-send → gdbus → dbus-send in order; failed strategies are dead for the session and the chain converges to one delivery or a documented all-failed retry. pkg10 F1 (confirm-before-mark) preserved. Verified by PATH-isolated live probes (notify-send-only / gdbus-only / no-binary envs) + tests/td022_notify_strategies.test.ts (6 tests). Telemetry: one log line per attempt + outcome.
+- **Residual (deferred, optional):** Rust-side notify-rust would remove even the child-process dependency; not needed while a GLib system is a release prerequisite (Tauri requires it anyway — gdbus is always present). .desktop file + icon still ship in the RPM/DEB (TD-023 adjacent).
 
 ## TD-023 — Dev-launch taskbar icon depends on binary-stem app_id ("app")
 - **ID:** TD-023
@@ -325,8 +322,5 @@ stable, blind final verification PASS WITH CONCERNS with zero new issues).
 ## TD-024 — Damaged series data from the pre-fix re-anchoring bug (owner DB)
 - **ID:** TD-024
 - **Title:** "Test repeat daily" series base re-anchored to 2026-09-10; two occurrence overrides orphaned in owner DB
-- **Priority:** 3/10 — LOW (cosmetic/user-data, not replicated-state corruption; the BUG that caused it is fixed in 5b51f78)
-- **Status:** OPEN (repair pending owner go-ahead)
-- **State:** events row evt-d0af2335… anchored 09-10 16:15 (should be 09-03 19:15); series FREQ=DAILY;UNTIL=20260910; overrides 20260903T191500→20:15 and 20260904T211500→14:45 exist but never render (recurrence_ids no longer generated → R1 orphans).
-- **Repair plan:** domain write path only (updateEvent with corrected anchor + HLC change records); both overrides resume rendering. Never hand-edit the DB.
-- **Files:** owner live DB (~/.local/share/com.tide.app/tide-domain.db), via EventCore ops.
+- **Priority:** 3/10 — LOW
+- **Status:** RESOLVED (verified 2026-09-04, no repair needed) — owner deleted the test series themselves after the underlying bug was fixed in 5b51f78. DB re-inspection: series row, base event, and overrides all gone; remaining data (weekly series + cancelled override, whole-day event, single event) consistent; no tombstone anomalies. The orphaned-override repair became moot.
