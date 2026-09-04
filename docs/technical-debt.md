@@ -293,3 +293,40 @@ stable, blind final verification PASS WITH CONCERNS with zero new issues).
   duplicated/reordered comms) must hold for the amended barrier.
 - **Trigger:** IMMEDIATELY — blocks TD-012 closure and any further sync-layer work.
 
+
+---
+
+## TD-021 — WebKitWebProcess renderer crash (owner smoke, 2026-09-04)
+- **ID:** TD-021
+- **Title:** WebKitGTK renderer crashes fatally during normal use; swallows any reminder due while down
+- **Priority:** 6/10 — MEDIUM-HIGH (blocks release quality; user-facing stability)
+- **Status:** OPEN
+- **Reported:** `/usr/libexec/webkit2gtk-4.1/WebKitWebProcess has encountered a fatal error and was closed` — owner saw a random crash during use. No Tide logic involved (renderer-level), but a crash kills the webview and can take the sidecar down with it → reminders due in that window surface as "missed" on next launch (D1), or are silently absent if the whole app dies.
+- **Next step:** capture the crash signature on recurrence (`journalctl --user -b | grep -iA5 webkit` around the timestamp), match against known WebKitGTK 2.4x bugs, consider webview content mitigations (CSS filters? <input type=date> popover?) before the RPM/DEB release.
+- **Files:** n/a (upstream + possibly frontend rendering features).
+
+## TD-022 — Notification delivery portability: notify-send dependency (delegate findings, 2026-09-04)
+- **ID:** TD-022
+- **Title:** Reminder delivery shells out to notify-send; works here but is fragile across distros/launch contexts
+- **Priority:** 4/10 — LOW-MEDIUM (no live bug on Nobara/Plasma; release-hardening)
+- **Status:** DEFERRED (delegate investigation deleg_25c67eca)
+- **Current mechanism:** sidecar spawns `notify-send` (libnotify) per fire; success-only marking, session bus inherited from GUI env. Verified healthy on Nobara/KDE Wayland: DBUS_SESSION_BUS_ADDRESS present, notify-send in PATH, plasmashell owns org.freedesktop.Notifications.
+- **Fragility:** (a) libnotify missing on minimal/WM-only installs → silent Tier-1 degrade (only logged once per session); (b) env fragility under systemd-unit or Flatpak launches (no session bus in child env); (c) no per-app notification settings/history keying without a .desktop file + icon in the release package.
+- **Fix direction (release phase):** move delivery to Rust-side `notify-rust` (direct D-Bus, no binary dependency), keep notify-send as fallback; log every delivery outcome (dispatch/delivered/FAILED — added 2026-09-04 in the reminder tick); ship `com.tide.app.desktop` + icons in RPM/DEB; consider org.freedesktop.portal.Notification as sandboxed fallback.
+- **Files:** `src/application/notification_delivery.ts`, `src/persistence/bridges/sidecar_server.ts` (reminderTick), `src-tauri/` (future notify-rust), packaging specs.
+
+## TD-023 — Dev-launch taskbar icon depends on binary-stem app_id ("app")
+- **ID:** TD-023
+- **Title:** Wayland app_id in dev = binary stem ("app"), not the bundle identifier; icons must be installed under both names
+- **Priority:** 2/10 — LOW (dev-environment only; release build is correctly keyed to com.tide.app)
+- **Status:** PARTIALLY RESOLVED (2026-09-04, commit ad69d6d): new icon installed in ~/.local/share/icons/hicolor under BOTH com.tide.app and app (32/64/128/256); kbuildsycoca6 + gtk-update-icon-cache run; app.desktop carries StartupWMClass=app.
+- **Residual:** this is machine-local state, not repo state — a fresh dev machine needs the icon install repeated. Release RPM/DEB with proper .desktop + icon makes this moot. Optional: a `scripts/install-dev-icons.sh` to codify it.
+
+## TD-024 — Damaged series data from the pre-fix re-anchoring bug (owner DB)
+- **ID:** TD-024
+- **Title:** "Test repeat daily" series base re-anchored to 2026-09-10; two occurrence overrides orphaned in owner DB
+- **Priority:** 3/10 — LOW (cosmetic/user-data, not replicated-state corruption; the BUG that caused it is fixed in 5b51f78)
+- **Status:** OPEN (repair pending owner go-ahead)
+- **State:** events row evt-d0af2335… anchored 09-10 16:15 (should be 09-03 19:15); series FREQ=DAILY;UNTIL=20260910; overrides 20260903T191500→20:15 and 20260904T211500→14:45 exist but never render (recurrence_ids no longer generated → R1 orphans).
+- **Repair plan:** domain write path only (updateEvent with corrected anchor + HLC change records); both overrides resume rendering. Never hand-edit the DB.
+- **Files:** owner live DB (~/.local/share/com.tide.app/tide-domain.db), via EventCore ops.
