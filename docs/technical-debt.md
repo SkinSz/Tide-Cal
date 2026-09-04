@@ -300,9 +300,8 @@ stable, blind final verification PASS WITH CONCERNS with zero new issues).
 - **ID:** TD-021
 - **Title:** WebKitGTK renderer crashes fatally during normal use; swallows any reminder due while down
 - **Priority:** 6/10 — MEDIUM-HIGH (blocks release quality; user-facing stability)
-- **Status:** OPEN
-- **Reported:** `/usr/libexec/webkit2gtk-4.1/WebKitWebProcess has encountered a fatal error and was closed` — owner saw a random crash during use. No Tide logic involved (renderer-level), but a crash kills the webview and can take the sidecar down with it → reminders due in that window surface as "missed" on next launch (D1), or are silently absent if the whole app dies.
-- **Next step:** capture the crash signature on recurrence (`journalctl --user -b | grep -iA5 webkit` around the timestamp), match against known WebKitGTK 2.4x bugs, consider webview content mitigations (CSS filters? <input type=date> popover?) before the RPM/DEB release.
+- **Status:** DROPPED by owner (2026-09-04). Owner assessment: the observed WebKitWebProcess fatal errors coincided with the hard recurrence rework period — the app was firing errors while exercising recurrence, and the renderer crashes are attributed to that era, not to an independent upstream defect. No crash signature was captured post-rework; item withdrawn without upstream filing. Re-open only if a fatal renderer crash recurs on the current recurrence-stable codebase (capture `journalctl --user -b | grep -iA5 webkit` at that time).
+- **Original report:** `/usr/libexec/webkit2gtk-4.1/WebKitWebProcess has encountered a fatal error and was closed` — owner saw a random crash during use. No Tide logic involved (renderer-level), but a crash kills the webview and can take the sidecar down with it → reminders due in that window surface as "missed" on next launch (D1), or are silently absent if the whole app dies.
 - **Files:** n/a (upstream + possibly frontend rendering features).
 
 ## TD-022 — Notification delivery portability: multi-strategy (2026-09-04)
@@ -316,8 +315,7 @@ stable, blind final verification PASS WITH CONCERNS with zero new issues).
 - **ID:** TD-023
 - **Title:** Wayland app_id in dev = binary stem ("app"), not the bundle identifier; icons must be installed under both names
 - **Priority:** 2/10 — LOW (dev-environment only; release build is correctly keyed to com.tide.app)
-- **Status:** PARTIALLY RESOLVED (2026-09-04, commit ad69d6d): new icon installed in ~/.local/share/icons/hicolor under BOTH com.tide.app and app (32/64/128/256); kbuildsycoca6 + gtk-update-icon-cache run; app.desktop carries StartupWMClass=app.
-- **Residual:** this is machine-local state, not repo state — a fresh dev machine needs the icon install repeated. Release RPM/DEB with proper .desktop + icon makes this moot. Optional: a `scripts/install-dev-icons.sh` to codify it.
+- **Status:** RESOLVED (2026-09-04, commit ad69d6d + codification). Icon install codified as `scripts/install-dev-icons.sh` (idempotent: installs hicolor icons under both com.tide.app and the dev binary stem `app` in 32/64/128/256, writes a dev .desktop with StartupWMClass=app, refreshes kbuildsycoca6/gtk caches). Verified by live run (EXIT 0, all files installed). Machine-local state is now reproducible from the repo on any fresh dev machine; release RPM/DEB with proper .desktop + icon remains the permanent fix and makes this moot.
 
 ## TD-024 — Damaged series data from the pre-fix re-anchoring bug (owner DB)
 - **ID:** TD-024
