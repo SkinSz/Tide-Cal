@@ -450,8 +450,11 @@ function openTimeMenu(inputId: string): void {
     menu.appendChild(opt);
   }
   dlg().appendChild(menu);
-  // Open scrolled so the currently selected value is visible.
-  menu.querySelector(".picked")?.scrollIntoView({ block: "center" });
+  // Owner feedback (2026-09-04): the menu must open scrolled to the TOP —
+  // the old scrollIntoView(center on picked) jumped deep into the list,
+  // which reads as "the early times are missing". The picked entry stays
+  // highlighted; the user simply starts browsing from 00:00.
+  menu.scrollTop = 0;
 }
 
 function closeTimeMenus(): void {

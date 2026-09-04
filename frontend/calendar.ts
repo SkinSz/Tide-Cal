@@ -912,13 +912,19 @@ function weekDayColumn(
   }
 
   // Single click on empty space: select day + highlight that hour band.
+  // NOTE (owner bug 2026-09-04): NO render() here. render() synchronously
+  // calls root.replaceChildren(), destroying this column between the two
+  // clicks of a double-click — the browser then never dispatches dblclick
+  // (both clicks must land on the same element) and dblclick-to-create was
+  // dead. Selection state alone is enough: the .picked-band highlight is
+  // applied by the next natural render (event save, view switch, nav), and
+  // the band keeps its :hover affordance meanwhile.
   col.addEventListener("click", (e) => {
     const target = e.target as HTMLElement;
     if (target.closest(".chip")) return; // chip handler owns that click
     selectedDate = startOfDay(cell.date);
     const cellDiv = target.closest(".hour-cell") as HTMLElement | null;
     clickedHour = cellDiv ? Number(cellDiv.dataset.hour) : null;
-    render();
     document.dispatchEvent(
       new CustomEvent("tide:dayclick", { detail: cell.date.toISOString() }),
     );
