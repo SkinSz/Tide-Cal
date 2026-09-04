@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en-GB">
+  <!-- en-GB: WebKitGTK formats <input type="time"> per document language;
+       en-GB is 24h, so no AM/PM suffix is rendered (belt-and-braces CSS in
+       style.css hides the ampm field too). -->
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Tide</title>
+    <link rel="icon" type="image/png" sizes="32x32" href="./assets/tide-icon-32.png" />
+    <link rel="icon" type="image/png" sizes="64x64" href="./assets/tide-icon-64.png" />
+    <link rel="icon" type="image/png" sizes="128x128" href="./assets/tide-icon-128.png" />
+    <link rel="icon" type="image/png" sizes="256x256" href="./assets/tide-icon-256.png" />
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header id="toolbar">
+      <button id="btn-prev" title="Previous">‹</button>
+      <button id="btn-today">Today</button>
+      <button id="btn-next" title="Next">›</button>
+      <h1 id="cal-label"></h1>
+      <span class="spacer"></span>
+      <button id="btn-devices" title="Devices & sync">
+        <span class="devices-label">⇄ Devices</span>
+      </button>
+      <button id="btn-conflicts" title="No unresolved conflicts">
+        <span class="conflicts-label">⚠ Conflicts (0)</span>
+      </button>
+      <button id="btn-sync-errors" title="No sync problems">
+        <span class="sync-errors-label">⛔ Sync errors (<span id="sync-errors-count">0</span>)</span>
+      </button>
+      <button id="btn-new">+ New event</button>
+      <div class="seg">
+        <button id="btn-month">Month</button>
+        <button id="btn-week">Week</button>
+      </div>
+    </header>
+
+    <main id="calendar-grid" aria-label="Calendar"></main>
+
+    <dialog id="event-dialog">
+      <div class="dlg-body">
+        <h2 id="dialog-title">New event</h2>
+        <label>Title
+          <input id="ev-title" required maxlength="200" />
+        </label>
+        <label>Description
+          <textarea id="ev-desc" rows="2"></textarea>
+        </label>
+        <p id="ev-recurrence-info" class="recurrence-info" hidden></p>
+        <label>Day
+          <input type="date" id="ev-date" required />
+        </label>
+        <label class="check"><input type="checkbox" id="ev-allday" /> Whole day</label>
+        <label class="check"><input type="checkbox" id="ev-repeat-on" /> Repeat</label>
+        <label class="check"><input type="checkbox" id="ev-remind-on" /> Remind me
+          <select id="ev-remind-minutes">
+            <option value="5">5 minutes before</option>
+            <option value="10">10 minutes before</option>
+            <option value="15" selected>15 minutes before</option>
+            <option value="30">30 minutes before</option>
+            <option value="60">1 hour before</option>
+            <option value="1440">1 day before</option>
+          </select>
+        </label>
+        <div id="ev-time-row">
+          <label>Start
+            <span class="time-wrap">
+              <!-- Smoke-test bug (2026-09-03): WebKitGTK formats native
+                   <input type="time"> from the SYSTEM locale (ignores both
+                   the document lang and the Blink-only ::-webkit CSS
+                   suppression), so 24h mode rendered an AM/PM suffix. Plain
+                   text inputs carry the internal 24h "HH:MM" value instead —
+                   read/save/dropdown logic is untouched; validity is
+                   enforced in dialog.ts readInput/normalizeTime. -->
+              <input type="text" id="ev-start-t" inputmode="numeric" maxlength="5" placeholder="09:00" autocomplete="off" />
+              <button type="button" class="time-arrow" data-for="ev-start-t" title="Choose time">▾</button>
+              <button type="button" class="ampm-toggle" data-for="ev-start-t" title="Switch AM/PM" hidden>AM</button>
+            </span>
+          </label>
+          <label>End
+            <span class="time-wrap">
+              <input type="text" id="ev-end-t" inputmode="numeric" maxlength="5" placeholder="10:00" autocomplete="off" />
+              <button type="button" class="time-arrow" data-for="ev-end-t" title="Choose time">▾</button>
+              <button type="button" class="ampm-toggle" data-for="ev-end-t" title="Switch AM/PM" hidden>PM</button>
+            </span>
+          </label>
+        </div>
+        <input type="hidden" id="ev-id" />
+        <!-- DC-12 recurrence rule builder: OPT-IN via the "Repeat" checkbox
+             above. Hidden until checked; unchecking clears the draft so a
+             plain event is saved (on a series, the whole-series removal
+             path — D7 — applies). -->
+        <div id="ev-rule-builder" hidden>
+          <div id="ev-repeat-row">
+            <label>Repeats
+              <select id="ev-repeat">
+                <option value="NONE">Does not repeat</option>
+                <option value="DAILY">Daily</option>
+                <option value="WEEKLY">Weekly</option>
+                <option value="MONTHLY">Monthly</option>
+                <option value="YEARLY">Yearly</option>
+              </select>
+            </label>
+            <label id="ev-every-wrap" hidden>Every
+              <input type="number" id="ev-every" min="1" max="999" step="1" value="1" />
+            </label>
+            <label id="ev-until-wrap" hidden>Until
+              <input type="date" id="ev-until" />
+            </label>
+          </div>
+          <div id="ev-byday-row" hidden>
+            <span class="byday-buttons" id="ev-byday">
+              <button type="button" class="byday-toggle" data-day="MO">M</button>
+              <button type="button" class="byday-toggle" data-day="TU">T</button>
+              <button type="button" class="byday-toggle" data-day="WE">W</button>
+              <button type="button" class="byday-toggle" data-day="TH">T</button>
+              <button type="button" class="byday-toggle" data-day="FR">F</button>
+              <button type="button" class="byday-toggle" data-day="SA">S</button>
+              <button type="button" class="byday-toggle" data-day="SU">S</button>
+            </span>
+          </div>
+          <p id="ev-rule-preview" class="recurrence-info" hidden></p>
+        </div>
+        <div id="ev-scope-row" hidden>
+          <label>Apply to
+            <select id="ev-scope">
+              <option value="series">Whole series</option>
+              <option value="occurrence">This occurrence only</option>
+            </select>
+          </label>
+        </div>
+        <menu>
+          <button type="button" id="ev-delete" class="danger" hidden>Delete</button>
+          <span class="spacer"></span>
+          <button type="button" id="ev-cancel">Cancel</button>
+          <button type="button" id="ev-save" class="primary">Save</button>
+        </menu>
+      </div>
+    </dialog>
+
+    <dialog id="conflict-dialog">
+      <div class="dlg-body conflicts-dlg">
+        <h2>Conflicts</h2>
+        <div class="conflicts-layout">
+          <div id="conflict-list"></div>
+          <div id="conflict-detail"></div>
+        </div>
+        <menu>
+          <span class="spacer"></span>
+          <button type="button" id="conflict-close">Close</button>
+        </menu>
+      </div>
+    </dialog>
+
+    <dialog id="devices-dialog">
+      <div class="dlg-body devices-dlg">
+        <h2>Devices &amp; Sync</h2>
+        <div class="devices-self">
+          <span>This device: <code id="self-device-id">…</code></span>
+          <span class="muted">listening on port <span id="self-listen-port">…</span></span>
+        </div>
+        <div class="pairing-grid">
+          <fieldset>
+            <legend>Show pairing code</legend>
+            <button type="button" id="btn-pairing-show" class="primary">Create code</button>
+            <div id="pairing-step-show">
+              <textarea id="pairing-code-out" rows="8" readonly placeholder="Click “Create code” to generate a pairing code."></textarea>
+              <p class="muted">Paste this into “Enter pairing code” on the other device.</p>
+              <button type="button" id="btn-pairing-cancel" hidden>Cancel offer</button>
+            </div>
+          </fieldset>
+          <fieldset>
+            <legend>Enter pairing code</legend>
+            <textarea id="pairing-code-in" rows="4" placeholder='{"v":1,"device_id":…}'></textarea>
+            <button type="button" id="btn-pairing-accept">Pair device</button>
+          </fieldset>
+        </div>
+        <h3>Paired devices</h3>
+        <div id="peers-list"></div>
+        <div id="devices-busy" hidden class="muted">Working…</div>
+        <div id="devices-log"></div>
+        <menu>
+          <span class="spacer"></span>
+          <button type="button" id="devices-close">Close</button>
+        </menu>
+      </div>
+    </dialog>
+
+    <dialog id="sync-errors-dialog">
+      <div class="dlg-body devices-dlg">
+        <h2>Sync errors</h2>
+        <p class="muted">
+          Occasionally, an update from one of your devices can't be applied
+          automatically — for example if it conflicts with a change made here.
+          Tide never loses these updates; they're held here so you can decide
+          what to do. Nothing has been lost or overwritten.
+        </p>
+        <div id="sync-errors-list"></div>
+        <div id="peer-state-list"></div>
+        <menu>
+          <span class="spacer"></span>
+          <button type="button" id="sync-errors-close">Close</button>
+        </menu>
+      </div>
+    </dialog>
+
+    <dialog id="paired-devices-dialog">
+      <div class="dlg-body devices-dlg">
+        <h2>Paired devices</h2>
+        <p class="muted">
+          Devices paired with this one, with their sync-behavior state.
+          Read-only except the explicit actions below.
+        </p>
+        <div id="paired-devices-list"></div>
+        <menu>
+          <span class="spacer"></span>
+          <button type="button" id="paired-devices-close">Close</button>
+        </menu>
+      </div>
+    </dialog>
+
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

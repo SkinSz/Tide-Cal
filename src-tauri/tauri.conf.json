@@ -1,0 +1,61 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "Tide",
+  "version": "0.1.0",
+  "identifier": "com.tide.app",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "npm run ui:build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Tide",
+        "width": 800,
+        "height": 600,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["rpm", "deb"],
+    "publisher": "SkinS / Tide Project",
+    "copyright": "Copyright © 2026 SkinS / Tide Project",
+    "category": "Productivity",
+    "shortDescription": "Local-first calendar with encrypted sync",
+    "longDescription": "Tide is a local-first calendar application with end-to-end encrypted multi-device sync. Appointments, whole-day events and per-occurrence reminders live in an encrypted on-device database; pairing with other devices syncs changes over the local network or direct TCP with Noise-protocol encryption. Licensed under the Tide Source-Available Non-Commercial License: free for personal, educational and non-commercial use; commercial use requires a separate written license (swy@uplink-incorporated.net).",
+    "license": "LicenseRef-Tide-Source-Available-Non-Commercial",
+    "licenseFile": "../LICENSE.md",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "resources/sidecar.mjs": "dist/sidecar.mjs",
+      "resources/better-sqlite3/": "node_modules/better-sqlite3/",
+      "../LICENSE.md": "LICENSE"
+    },
+    "linux": {
+      "deb": {
+        "section": "utils",
+        "priority": "optional",
+        "depends": ["nodejs (>= 18)"]
+      },
+      "rpm": {
+        "depends": ["nodejs >= 18"]
+      }
+    },
+    "android": {
+      "debugApplicationIdSuffix": ".debug"
+    }
+  }
+}

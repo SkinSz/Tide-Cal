@@ -1,0 +1,30 @@
+{
+  "name": "tide",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "ui:dev": "vite --config vite.ui.config.ts",
+    "ui:build": "vite build --config vite.ui.config.ts",
+    "test": "vitest run",
+    "sidecar:build": "esbuild src/persistence/bridges/sidecar_server.ts --bundle --platform=node --format=esm --external:better-sqlite3 --outfile=dist/sidecar.mjs",
+    "harness:three-device": "node tests/probes/three_device_harness.mjs --scenario=all"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4",
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^24.3.1",
+    "typescript": "^5.9.2",
+    "vite": "^7.3.6",
+    "vitest": "^3.2.4"
+  },
+  "dependencies": {
+    "@noble/curves": "^2.3.0",
+    "@noble/ed25519": "^3.1.0",
+    "@noble/hashes": "^2.3.0",
+    "@tauri-apps/api": "^2.11.1",
+    "better-sqlite3": "^13.0.3",
+    "noise-c.wasm": "^0.4.0"
+  }
+}

@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Tide — Options</title>
+    <link rel="icon" type="image/png" sizes="32x32" href="./assets/tide-icon-32.png" />
+    <link rel="stylesheet" href="./style.css" />
+    <link rel="stylesheet" href="./options.css" />
+  </head>
+  <body class="options-body">
+    <div class="options-layout">
+      <nav class="options-nav" aria-label="Settings categories">
+        <h1 class="options-title">Tide Options</h1>
+        <button class="options-nav-item active" data-category="sync" type="button">Sync</button>
+        <button class="options-nav-item" data-category="general" type="button">General</button>
+      </nav>
+      <main class="options-content" id="options-content">
+        <section class="options-category" data-category-content="sync">
+          <h2>Sync</h2>
+          <p class="muted">
+            Tuning for how Tide keeps your calendars in sync across paired
+            devices. Values outside the allowed range are adjusted when saved.
+          </p>
+          <label class="opt-field">
+            <span class="opt-label">Sync debounce (seconds)</span>
+            <input id="opt-sync-debounce" type="number" min="5" max="120" step="1" />
+            <span class="opt-hint">After you change something, Tide waits this long before syncing to your other devices (5–120&nbsp;s). Larger = fewer syncs; smaller = faster propagation.</span>
+          </label>
+          <label class="opt-field">
+            <span class="opt-label">Sweep interval (minutes)</span>
+            <input id="opt-sweep-interval" type="number" min="1" max="1440" step="1" />
+            <span class="opt-hint">How often Tide runs a background maintenance pass to reconcile any missed updates (1–1440 minutes). Smaller = quicker recovery; larger = less background activity.</span>
+          </label>
+          <label class="opt-field">
+            <span class="opt-label">Max concurrent sync sessions</span>
+            <input id="opt-max-concurrent" type="number" min="1" max="5" step="1" />
+            <span class="opt-hint">How many devices Tide syncs with at the same time (1–5). Higher is faster with many devices; lower uses less network and battery.</span>
+          </label>
+          <label class="opt-field">
+            <span class="opt-label">Incremental backlog limit</span>
+            <input id="opt-backlog" type="number" min="100" max="100000" step="100" />
+            <span class="opt-hint">If more than this many changes pile up, Tide offers a full re-sync instead of catching up one by one (100–100,000). Takes effect after restart.</span>
+          </label>
+        </section>
+        <section class="options-category" data-category-content="general" hidden>
+          <h2>General</h2>
+          <p class="muted">
+            How Tide looks and reads times. Changes apply when you save.
+          </p>
+          <fieldset class="opt-field opt-choice" id="opt-theme-group">
+            <legend class="opt-label">Look</legend>
+            <label class="opt-radio">
+              <input type="radio" name="opt-theme" value="dark" />
+              <span>Dark</span>
+            </label>
+            <label class="opt-radio">
+              <input type="radio" name="opt-theme" value="light" />
+              <span>Light</span>
+            </label>
+            <span class="opt-hint">Pick how Tide looks. Tide keeps your choice — it never changes on its own.</span>
+          </fieldset>
+          <fieldset class="opt-field opt-choice" id="opt-time-format-group">
+            <legend class="opt-label">Time format</legend>
+            <label class="opt-radio">
+              <input type="radio" name="opt-time-format" value="24h" />
+              <span>24-hour (13:45)</span>
+            </label>
+            <label class="opt-radio">
+              <input type="radio" name="opt-time-format" value="12h" />
+              <span>12-hour (1:45 PM)</span>
+            </label>
+            <span class="opt-hint">How times appear when you add or edit events. Calendar data is stored the same way either way.</span>
+          </fieldset>
+          <fieldset class="opt-field opt-choice" id="opt-locale-group">
+            <legend class="opt-label">Date &amp; number format</legend>
+            <label class="opt-radio">
+              <input type="radio" name="opt-locale" value="system" />
+              <span>System default</span>
+            </label>
+            <label class="opt-radio">
+              <input type="radio" name="opt-locale" value="de" />
+              <span>31.12.2026 · 1.234,5</span>
+            </label>
+            <label class="opt-radio">
+              <input type="radio" name="opt-locale" value="en-GB" />
+              <span>31/12/2026 · 1,234.5</span>
+            </label>
+            <label class="opt-radio">
+              <input type="radio" name="opt-locale" value="en-US" />
+              <span>12/31/2026 · 1,234.5</span>
+            </label>
+            <span class="opt-hint">How dates and numbers appear in the event dialog and calendar headings — shown as day·month·year. Fixes mixed-locale systems where the desktop shows one style but Tide shows another. Takes effect the next time Tide starts.</span>
+          </fieldset>
+        </section>
+        <div class="options-footer">
+          <span class="dialog-error" id="options-error" role="alert" hidden></span>
+          <span class="spacer"></span>
+          <button type="button" id="options-cancel">Cancel</button>
+          <button type="button" id="options-save" class="primary">Save</button>
+        </div>
+      </main>
+    </div>
+    <script type="module" src="./options.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,128 @@
+/* Tide DC-20 options window — Outlook-style: left nav pane + right content.
+   Owned by the options window only; does not touch calendar styles. */
+
+.options-body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  height: 100vh;
+  overflow: hidden;
+  user-select: none;
+}
+
+.options-layout {
+  display: grid;
+  grid-template-columns: 200px 1fr;
+  height: 100%;
+}
+
+/* Left navigation pane (persistent; DC-20 §3.1) */
+.options-nav {
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  padding: 14px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.options-title {
+  font-size: 0.95rem;
+  margin: 0 0 12px 4px;
+  color: var(--text);
+}
+.options-nav-item {
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+.options-nav-item:hover { background: var(--accent-soft); color: var(--text); }
+.options-nav-item.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* Right content pane */
+.options-content {
+  padding: 18px 22px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+.options-content h2 { margin: 0 0 6px; font-size: 1.05rem; }
+.options-content .muted { color: var(--muted); font-size: 0.8rem; margin: 0 0 14px; }
+
+.opt-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-bottom: 14px;
+  max-width: 420px;
+}
+.opt-label { font-size: 0.82rem; font-weight: 600; }
+.opt-field input {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 6px 8px;
+  font-size: 0.85rem;
+  width: 140px;
+}
+.opt-field input:focus { outline: 1px solid var(--accent); }
+.opt-hint { font-size: 0.72rem; color: var(--muted); line-height: 1.45; max-width: 460px; }
+
+/* Footer: error + Save/Cancel */
+.options-footer {
+  margin-top: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.options-footer .spacer { flex: 1; }
+.options-footer button {
+  padding: 6px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+.options-footer button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #08131c;
+  font-weight: 600;
+}
+.options-footer button:hover { filter: brightness(1.15); }
+
+.dialog-error {
+  color: var(--danger);
+  font-size: 0.8rem;
+}
+
+/* General category: radio choice groups (theme, time format) */
+.opt-choice {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin: 0 0 12px;
+}
+.opt-choice legend { padding: 0 4px; }
+.opt-radio {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: 16px;
+  cursor: pointer;
+}
+.opt-radio input { margin: 0; }

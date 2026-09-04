@@ -1,0 +1,12 @@
+node_modules/
+dist/
+data/
+
+# Packaging: better-sqlite3 resource copy is refreshed from node_modules by
+# the packaging step (only linux prebuilds kept); never commit vendored deps.
+src-tauri/resources/better-sqlite3/
+
+
+# Internal-only material (QA logs, reviews, handoffs, agent instructions,
+# owner comms). NEVER pushed to GitHub.
+internal/

@@ -1,0 +1,588 @@
+/* Theme layer (CSS custom properties). The un-scoped :root values are the
+   current (dark) look and remain the default; a future light/dark setting
+   can set <html data-theme="..."> to switch palettes. No UI toggle yet —
+   the General settings (options window) will own that later. */
+:root,
+:root[data-theme="dark"] {
+  --bg: #101418;
+  --panel: #171c22;
+  --border: #262d36;
+  --text: #e6e9ee;
+  --muted: #8b95a1;
+  --accent: #4aa3df;
+  --accent-soft: rgba(74, 163, 223, 0.18);
+  --danger: #e05561;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+:root[data-theme="light"] {
+  --bg: #f5f6f8;
+  --panel: #ffffff;
+  --border: #d7dce2;
+  --text: #1c2430;
+  --muted: #66707c;
+  --accent: #2f7fc1;
+  --accent-soft: rgba(47, 127, 193, 0.14);
+  --danger: #c73f4b;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  user-select: none;
+}
+
+/* Toolbar */
+#toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+#toolbar h1 { font-size: 1.05rem; margin: 0; letter-spacing: 0.03em; }
+#toolbar .spacer { flex: 1; }
+#cal-label { font-weight: 600; min-width: 170px; }
+.nav { display: flex; gap: 2px; }
+.seg { display: flex; gap: 2px; }
+
+button {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 12px;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+button:hover { background: var(--accent-soft); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #08131c; font-weight: 600; }
+button.danger { color: var(--danger); border-color: var(--danger); }
+.seg button.active { background: var(--accent-soft); border-color: var(--accent); }
+
+/* Grid */
+main { flex: 1; overflow: auto; padding: 8px; }
+#calendar-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  grid-auto-rows: minmax(96px, auto);
+  gap: 4px;
+  height: 100%;
+}
+.weekday-head {
+  text-align: center;
+  font-size: 0.75rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: 4px 0;
+  grid-row: 1;
+}
+.day-col {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px;
+  cursor: pointer;
+  overflow: hidden;
+}
+.day-outside { opacity: 0.45; }
+.day-today { border-color: var(--accent); }
+.day-selected { outline: 2px solid var(--accent-soft); outline-offset: -2px; }
+.day-num { font-size: 0.78rem; color: var(--muted); margin-bottom: 4px; }
+.day-today .day-num { color: var(--accent); font-weight: 700; }
+
+.chip {
+  font-size: 0.72rem;
+  background: var(--accent-soft);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  padding: 2px 5px;
+  margin-bottom: 3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chip-allday { background: var(--accent); color: #08131c; font-weight: 600; }
+.chip-selected { outline: 2px solid var(--accent); outline-offset: 1px; }
+.chip:hover { filter: brightness(1.15); }
+
+/* Dialog */
+dialog {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px 24px;
+  min-width: 340px;
+}
+dialog::backdrop { background: rgba(0, 0, 0, 0.55); }
+dialog h2 { margin: 0 0 14px; font-size: 1rem; }
+dialog label { display: block; font-size: 0.78rem; color: var(--muted); margin-bottom: 10px; }
+dialog label.check { display: flex; align-items: center; gap: 6px; }
+dialog input[type="text"],
+dialog input[type="datetime-local"],
+dialog textarea {
+  width: 100%;
+  margin-top: 4px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 9px;
+  font: inherit;
+  font-size: 0.85rem;
+}
+dialog menu { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0 0; padding: 0; }
+/* "Done" (date-picker escape hatch): only visible while the Day picker is
+   open — never part of the dialog's normal action row. */
+/* The old #ev-date-ok "Done" escape hatch was removed (owner 2026-09-03):
+   auto-blur on change closes the picker; the button appeared uselessly
+   whenever the picker was open. Keep the .date-picking/.until-picking
+   classes' state tracking (dialog.ts uses them), drop the button rules. */
+dialog menu .spacer { flex: 1 1 auto; }
+/* Smoke-test fix: the delete confirm warning (width:100% inside a flex menu)
+   forced the event dialog to jump ~2x wider. Cap the dialog and let the
+   warning wrap instead of stretching the row. */
+#event-dialog { max-width: min(92vw, 560px); }
+#event-dialog menu .delete-warning { min-width: 100%; }
+
+/* Conflicts (DC-14 surface) */
+#btn-conflicts.has-conflicts { border-color: var(--danger); color: var(--danger); }
+.conflicts-dlg { min-width: 640px; }
+.conflicts-layout { display: flex; gap: 16px; max-height: 60vh; }
+#conflict-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+#conflict-detail { flex: 1.4; overflow-y: auto; }
+.conflict-row {
+  text-align: left;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font: inherit;
+  cursor: pointer;
+}
+.conflict-row:hover { border-color: var(--accent); }
+.conflict-row.selected { border-color: var(--accent); background: var(--panel); }
+.conflict-row-title { display: block; font-weight: 600; margin-bottom: 2px; }
+.muted { color: var(--muted); font-size: 0.78rem; }
+.conflict-empty { color: var(--muted); font-size: 0.85rem; padding: 8px 0; }
+.conflict-candidate { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-top: 10px; }
+.conflict-candidate-head { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.conflict-value {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 9px;
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.conflict-value.deleted { color: var(--muted); text-decoration: line-through; }
+.conflict-actions { display: flex; gap: 8px; margin-top: 8px; justify-content: flex-end; }
+
+/* Event dialog: day + whole-day + time row */
+#ev-time-row { display: flex; gap: 10px; }
+#ev-time-row label { flex: 1; }
+
+/* Week view: time-grid with duration-proportional blocks */
+#calendar-grid.week {
+  /* ruler + 7 day columns (root default is 7 cols total -> Sunday clipped) */
+  grid-template-columns: 44px repeat(7, 1fr);
+  grid-template-rows: auto auto 1fr;
+  height: 100%;
+}
+#calendar-grid.week .weekday-head { grid-row: 1; }
+.hour-corner { grid-column: 1; }
+.hour-ruler {
+  grid-row: 3;
+  grid-column: 1;
+  position: relative;
+}
+/* Labels centre on their hour line (top = h/24 %, translated up half). */
+.hour-label {
+  position: absolute;
+  right: 0;
+  transform: translateY(-50%);
+  font-size: 0.68rem;
+  color: var(--muted);
+  text-align: right;
+  padding-right: 4px;
+}
+#calendar-grid.week .day-col {
+  grid-row: 3;
+  position: relative;
+  overflow-y: hidden;
+}
+.chip-timed {
+  position: absolute;
+  left: 2px;
+  right: 2px;
+  min-height: 18px;
+  overflow: hidden;
+  z-index: 1;
+}
+.lane-chip {
+  margin-bottom: 3px;
+  /* Smoke-test fix: all-day chips are appended BEFORE the absolute
+     .hour-cell click-catcher bands; without positioning+z-index the
+     transparent hour cells painted on top and swallowed every click
+     (owner report: all-day events unselectable in week view). */
+  position: relative;
+  z-index: 2;
+}
+
+/* Drag-n-drop + delete-arm affordances */
+.chip-dragging { opacity: 0.5; }
+.chip[draggable="true"] { cursor: grab; }
+.week-col.drop-target {
+  outline: 2px dashed var(--accent);
+  outline-offset: -2px;
+}
+.chip-delete-arm {
+  background: #b3402e !important;
+  color: #fff !important;
+  font-weight: 600;
+}
+.chip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* Whole-day banner: a SOLID full-height appointment block covering the entire
+   day column (00:00–24:00) — same visual language as the all-day lane chip
+   (solid accent fill, dark text) so it unambiguously reads as an appointment,
+   never as day highlighting (owner: translucent washes confused it with the
+   today marking). Click-through (pointer-events: none): the lane chip owns
+   selection/edit/delete; hour cells keep click + drop behavior underneath;
+   timed chips paint on top (z-index 2 vs 1). */
+.allday-banner {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  left: 2px;
+  right: 2px;
+  background: var(--accent);
+  border: none;
+  border-radius: 6px;
+  color: #08131c;
+  font-size: 0.68rem;
+  font-weight: 600;
+  text-align: center;
+  overflow: hidden;
+  opacity: 0.92; /* slight translucency so hour lines stay faintly visible */
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* Live drag ghost: semi-transparent preview with the real target time */
+.drag-ghost {
+  opacity: 0.85;
+  background: color-mix(in srgb, var(--accent) 45%, var(--panel));
+  border: 1px dashed var(--accent);
+  pointer-events: none;
+}
+
+/* Whole-day drag ghost: brighter banner preview on the target day column */
+.drag-ghost-allday {
+  background: color-mix(in srgb, var(--accent) 35%, transparent);
+  border: 2px dashed var(--accent);
+  pointer-events: none;
+  z-index: 40;
+}
+
+/* Hour guide lines through the day columns (week view) */
+.hour-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+  pointer-events: none;
+}
+.chip-timed { z-index: 2; }
+
+/* Event dialog: keep layout stable when the time menu opens */
+.conflicts-dlg, .dlg-body { position: relative; }
+#event-dialog { overflow: visible; }
+
+/* Hour-band cells in week view */
+.hour-cell {
+  position: absolute;
+  left: 0;
+  right: 0;
+  z-index: 1;
+  cursor: pointer;
+}
+.hour-cell:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.picked-band {
+  background: color-mix(in srgb, var(--accent) 22%, transparent) !important;
+}
+
+/* Outlook-style time dropdown (inside the event dialog) */
+.time-wrap { position: relative; display: flex; align-items: center; gap: 4px; }
+.time-wrap input[type="time"] { flex: 1; margin-top: 4px; }
+
+/* 12h mode: the AM/PM cycle is owned by the explicit .ampm-toggle button
+   (owner design, 2026-08-31) — the native input's own AM/PM field is hidden
+   in BOTH modes so there is exactly one AM/PM surface. document lang stays
+   en-GB (24h rendering); the toggle + dropdown carry the 12h presentation. */
+/* Smoke-test bug (2026-09-03): the two dialog time fields are now PLAIN TEXT
+   inputs (WebKitGTK formats native <input type="time"> from the system
+   locale, ignoring the document lang — an AM/PM suffix leaked into 24h mode
+   and no Blink CSS backstop applies on WebKit). The internal value contract
+   (24h "HH:MM") is unchanged; validity is enforced in dialog.ts
+   normalizeTime/readInput. The legacy ::-webkit suppression rules below are
+   kept harmless (no <input type="time"> remains in the UI) — they document
+   why the fields were switched and satisfy the options_general contract
+   test. */
+input[type="time"]::-webkit-datetime-edit-ampm-field { display: none; }
+input[type="time"]::-webkit-time-picker-indicator { display: none; }
+.ampm-toggle {
+  padding: 4px 6px;
+  font-size: 0.7rem;
+  min-width: 3.2em;
+  color: var(--muted);
+}
+.ampm-toggle:hover { color: var(--text); border-color: var(--accent); }
+.time-arrow {
+  padding: 4px 6px;
+  font-size: 0.7rem;
+  color: var(--muted);
+}
+.time-arrow:hover { color: var(--text); border-color: var(--accent); }
+#time-menu {
+  position: absolute;
+  z-index: 50;
+  width: 110px;
+  max-height: 380px;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  display: flex;
+  flex-direction: column;
+  padding: 2px;
+}
+.time-option {
+  border: none;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  font-size: 0.78rem;
+  padding: 3px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.time-option:hover { background: var(--accent-soft); }
+.time-option.picked { color: var(--accent); font-weight: 600; }
+
+/* Clicked-hour highlight in week view */
+/* Devices & sync dialog */
+.devices-dlg { min-width: 620px; }
+.devices-self { display: flex; gap: 16px; margin-bottom: 12px; font-size: 0.85rem; }
+.devices-self code { font-size: 0.8rem; color: var(--accent); }
+.pairing-grid { display: flex; gap: 14px; }
+.pairing-grid fieldset {
+  flex: 1;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.pairing-grid textarea {
+  width: 100%;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-family: ui-monospace, monospace;
+  font-size: 0.72rem;
+  resize: vertical;
+}
+#peers-list { max-height: 140px; overflow-y: auto; margin-bottom: 8px; }
+.peer-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  margin-bottom: 4px;
+  font-size: 0.85rem;
+}
+#devices-log {
+  max-height: 90px;
+  overflow-y: auto;
+  font-size: 0.75rem;
+  color: var(--muted);
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+}
+
+/* TD-006 / DC-16 §4: Paired Devices list + per-peer state rows */
+.paired-device-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: baseline;
+  border-bottom: 1px solid rgba(128, 128, 128, 0.25);
+  padding: 0.4rem 0;
+}
+.paired-device-actions {
+  display: flex;
+  gap: 0.4rem;
+  margin-left: auto;
+}
+.unblock-warning {
+  width: 100%;
+  white-space: normal;
+}
+.peer-state-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: baseline;
+}
+
+/* TD-005 remainder: Sync-Errors per-row human reason + Retry/Delete actions */
+.reason-human { font-size: 0.8rem; margin-top: 2px; }
+
+/* Owner-approved card redesign (2026-08-27): card-per-error layout, contained
+   technical details, constrained dialog width. The raw metadata <pre> must
+   NEVER widen the dialog: max-width + overflow + break-all containment. */
+#sync-errors-dialog .dlg-body {
+  max-width: min(92vw, 760px);
+  max-height: 85vh;
+  overflow: auto;
+}
+.sync-error-card {
+  border: 1px solid var(--border, #444);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 8px 0;
+}
+.sync-error-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: baseline;
+  justify-content: space-between;
+}
+.sync-error-head .reason-human { font-size: 0.9rem; margin-top: 0; }
+.sync-error-context { font-size: 0.78rem; margin-top: 2px; }
+.sync-error-ids { margin-top: 2px; font-size: 0.72rem; opacity: 0.8; }
+.sync-error-details {
+  margin-top: 4px;
+  max-width: 100%;
+  overflow: hidden;
+}
+.sync-error-details summary {
+  cursor: pointer;
+  font-size: 0.78rem;
+  color: var(--muted, #9a9a9a);
+}
+.sync-error-details code {
+  display: block;
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+.sync-error-details pre {
+  margin: 4px 0 0;
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  overflow-wrap: anywhere;
+  max-width: 100%;
+}
+.sync-error-actions { justify-content: flex-end; }
+.sync-error-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: center;
+  margin-top: 4px;
+}
+.sync-error-actions button { font-size: 0.75rem; padding: 2px 10px; }
+.sync-error-actions button.danger { color: var(--danger); border-color: var(--danger); }
+.delete-warning {
+  color: var(--danger);
+  font-size: 0.78rem;
+  width: 100%;
+  white-space: normal;
+}
+
+/* In-app inline error line (replaces native alert() popups). */
+.dialog-error {
+  color: var(--danger);
+  font-size: 0.8rem;
+  margin: 6px 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* Recurrence surfacing (DC-12 §2, display-only): series indicator + override
+   marker on grid chips, and the read-only info line in the event dialog. */
+.recurrence-glyph {
+  margin-left: 4px;
+  font-size: 0.85em;
+  opacity: 0.85;
+}
+.override-marker {
+  margin-left: 3px;
+  font-size: 0.8em;
+  font-weight: 700;
+  opacity: 0.9;
+}
+.recurrence-info {
+  margin: 0 0 8px;
+  padding: 6px 8px;
+  font-size: 0.8rem;
+  color: var(--muted, #6b7680);
+  background: rgba(128, 128, 128, 0.1);
+  border-left: 3px solid var(--accent, #4aa3df);
+  border-radius: 4px;
+}
+/* DC-12: recurrence rule builder + occurrence scope (event dialog).
+   OPT-IN (owner feedback, 2026-08-31): the whole builder block is revealed
+   by the "Repeat" checkbox (#ev-repeat-on) next to "Whole day". */
+#ev-rule-builder {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(128, 128, 128, 0.25);
+}
+#ev-repeat-row { display: flex; gap: 10px; align-items: end; }
+#ev-repeat-row label:first-child { flex: 1; }
+#ev-repeat-row select { width: 100%; margin-top: 4px; }
+#ev-every-wrap input { width: 64px; margin-top: 4px; }
+#ev-until-wrap input { margin-top: 4px; }
+#ev-byday-row { margin-top: 6px; }
+.byday-buttons { display: flex; gap: 4px; }
+.byday-toggle {
+  min-width: 28px;
+  padding: 3px 0;
+  border: 1px solid rgba(128, 128, 128, 0.4);
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.byday-toggle.picked {
+  background: var(--accent, #4aa3df);
+  border-color: var(--accent, #4aa3df);
+  color: #fff;
+}
+#ev-scope-row { margin-top: 6px; }
+#ev-scope-row select { width: 100%; margin-top: 4px; }
