@@ -139,9 +139,19 @@ export function rebuildSchedule(
     // fire moment (updated_hlc_ms > fireAt) is a late configuration, not a
     // missed-while-not-running surface — the user set it up knowingly, an
     // instant fire is pure noise. The event-ends discard below still applies.
+    // Grace window (owner bug 2026-09-04): the tick runs every 30s, so a
+    // reminder whose fire moment passed by a few SECONDS while Tide WAS
+    // running was labeled "Missed" — wrong: D1's semantic is "passed while
+    // not running". A fire evaluated within one tick interval (30s) of its
+    // moment fired ON TIME, just tick-quantized. Missed labeling requires
+    // the fire moment to have passed by MORE than the tick interval.
     if (rem.updated_hlc_ms != null && rem.updated_hlc_ms > fireAt) continue;
     const endMs = endMsFor(startMs + 3_600_000);
-    if (endMs > nowMs) out.push(makeFire(rem, ev, fireAt, true));
+    if (endMs > nowMs) {
+      const TICK_MS = 30_000;
+      const onTime = nowMs - fireAt <= TICK_MS;
+      out.push(makeFire(rem, ev, fireAt, !onTime));
+    }
   }
   return out.sort((a, b) => a.fire_at_ms - b.fire_at_ms);
 }
