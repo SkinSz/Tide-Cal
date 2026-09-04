@@ -57,6 +57,71 @@ describe("DC-22 D1: missed-while-not-running = show-on-launch, discard after end
     expect(fires[0]!.fire_at_ms).toBe(ms("2026-09-08T08:30"));
   });
 
+  test("on-time decision: previous tick BEFORE fireAt → on-time even if this tick is very late (owner 2026-09-04)", () => {
+    // Fire moment 11:30, event 12:00. Previous tick ran 11:29 (before the
+    // moment) — the engine was alive when the moment passed; the current
+    // tick (NOW=12:00, 30 min late because of an overrun/suspend edge) is
+    // still the FIRST delivery chance → on-time, NOT missed.
+    const ev = event({
+      entity_id: "e-1",
+      start_wall: "2026-09-08T12:00",
+      end_wall: "2026-09-08T14:00",
+      utc_start_ms: ms("2026-09-08T12:00"),
+      utc_end_ms: ms("2026-09-08T14:00"),
+    });
+    const lastTick = ms("2026-09-08T11:29");
+    const fires = rebuildSchedule(
+      [ev],
+      [reminder({ member_id: "m-1", entity_id: "e-1", minutes_before: 30 })],
+      NOW,
+      lastTick,
+    );
+    expect(fires).toHaveLength(1);
+    expect(fires[0]!.missed).toBe(false);
+    expect(fires[0]!.fire_at_ms).toBe(ms("2026-09-08T11:30"));
+  });
+
+  test("on-time decision: fire moment predates previous tick → genuinely missed (engine was down)", () => {
+    // Fire moment 08:30, previous tick 09:00 — the moment passed BEFORE the
+    // last tick, so that tick should have delivered it and didn't: the
+    // engine was down/suspended → missed.
+    const ev = event({
+      entity_id: "e-1",
+      start_wall: "2026-09-08T09:00",
+      end_wall: "2026-09-08T13:00",
+      utc_start_ms: ms("2026-09-08T09:00"),
+      utc_end_ms: ms("2026-09-08T13:00"),
+    });
+    const lastTick = ms("2026-09-08T09:00");
+    const fires = rebuildSchedule(
+      [ev],
+      [reminder({ member_id: "m-1", entity_id: "e-1", minutes_before: 30 })],
+      NOW,
+      lastTick,
+    );
+    expect(fires).toHaveLength(1);
+    expect(fires[0]!.missed).toBe(true);
+  });
+
+  test("on-time decision: first tick after start (lastTickMs null) → missed per D1", () => {
+    // No previous tick exists — show-on-launch semantic.
+    const ev = event({
+      entity_id: "e-1",
+      start_wall: "2026-09-08T09:00",
+      end_wall: "2026-09-08T13:00",
+      utc_start_ms: ms("2026-09-08T09:00"),
+      utc_end_ms: ms("2026-09-08T13:00"),
+    });
+    const fires = rebuildSchedule(
+      [ev],
+      [reminder({ member_id: "m-1", entity_id: "e-1", minutes_before: 30 })],
+      NOW,
+      null,
+    );
+    expect(fires).toHaveLength(1);
+    expect(fires[0]!.missed).toBe(true);
+  });
+
   test("event fully ended → reminder discarded (not noise)", () => {
     const ev = event({
       entity_id: "e-1",

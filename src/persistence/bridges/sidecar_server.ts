@@ -1225,6 +1225,13 @@ function main(): void {
   // failures (§7.1/D11). Delivery is an EPHEMERAL LOCAL SIDE EFFECT (D9) —
   // nothing here ever enters the changelog.
   const deliveredReminderKeys = new Set<string>();
+  // D1 on-time decision context (owner question 2026-09-04): epoch ms of the
+  // previous tick, null until the second tick runs. rebuildSchedule uses it
+  // to distinguish "fire moment passed while we were ticking" (on-time) from
+  // "passed while down/suspended" (missed) — exact under arbitrary tick
+  // delay, no grace constant. setInterval hands its callback no args, so the
+  // timestamp is captured here before each tick runs.
+  let lastTickMs: number | null = null;
   // pkg10 F5: bound the delivered set — prune keys older than 25h (no live
   // reminder key can predate that: future keys aren't in the set until
   // fired, and a fired key more than a day old can only re-derive if the
@@ -1324,7 +1331,7 @@ function main(): void {
           "SELECT member_id, entity_id, minutes_before, updated_hlc AS updated_hlc_ms FROM reminders WHERE enabled IS NULL OR enabled = 1",
         )
         .all() as never[];
-      const schedule = rebuildSchedule(events, reminders, Date.now());
+      const schedule = rebuildSchedule(events, reminders, Date.now(), lastTickMs);
       deliveredPrune();
       // Smoke-test bug (2026-09-04, delegate investigation deleg_25c67eca):
       // filterDelivered only removes already-delivered keys — FUTURE fires
@@ -1366,9 +1373,19 @@ function main(): void {
       );
     }
   };
-  // §3.2: initial rebuild immediately at start (missed policy D1 applies).
+  // §3.2: initial rebuild immediately at start (missed policy D1 applies —
+  // lastTickMs is null here, so anything already past its moment is by
+  // definition "passed while not running" unless configured late).
   reminderTick();
-  const reminderTimer = setInterval(reminderTick, 30_000);
+  const reminderTimer = setInterval(() => {
+    const started = Date.now();
+    reminderTick();
+    // Record THIS tick's start as the next tick's "previous tick" context.
+    // (Started, not ended: a tick that overruns past a fire moment still
+    // proves the engine was alive at that moment — the on-time test wants
+    // the last moment we KNOW we were ticking, and tick start is exactly it.)
+    lastTickMs = started;
+  }, 30_000);
   void reminderTimer; // cleared implicitly at process exit
 
   const schedulerRuntime = startSchedulerRuntime({

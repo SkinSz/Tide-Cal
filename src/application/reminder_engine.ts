@@ -84,6 +84,21 @@ export function rebuildSchedule(
   events: EventRow[],
   reminders: ReminderRow[],
   nowMs: number,
+  /**
+   * Grace context for the D1 missed/on-time decision (owner question,
+   * 2026-09-04): "was the engine actually ticking when the fire moment
+   * passed?" The caller supplies the epoch ms of the tick that ran
+   * immediately BEFORE this one (null on the first tick after start /
+   * suspend-resume). Decision:
+   *   - lastTickMs != null AND lastTickMs < fireAt  → the engine was alive
+   *     at the fire moment and THIS tick is the first delivery chance →
+   *     ON TIME (tick-quantized), regardless of how late this tick ran.
+   *   - otherwise (first tick, or fire moment predates the previous tick)
+   *     → the moment passed while the engine was down/suspended → MISSED.
+   * This is exact and self-adjusting: no fixed grace constant to tune, and
+   * a delayed/overrun tick never mislabels a live-fire as missed.
+   */
+  lastTickMs?: number | null,
 ): ScheduledFire[] {
   const out: ScheduledFire[] = [];
   const byEntity = new Map(events.map((e) => [e.entity_id, e]));
@@ -139,17 +154,18 @@ export function rebuildSchedule(
     // fire moment (updated_hlc_ms > fireAt) is a late configuration, not a
     // missed-while-not-running surface — the user set it up knowingly, an
     // instant fire is pure noise. The event-ends discard below still applies.
-    // Grace window (owner bug 2026-09-04): the tick runs every 30s, so a
-    // reminder whose fire moment passed by a few SECONDS while Tide WAS
-    // running was labeled "Missed" — wrong: D1's semantic is "passed while
-    // not running". A fire evaluated within one tick interval (30s) of its
-    // moment fired ON TIME, just tick-quantized. Missed labeling requires
-    // the fire moment to have passed by MORE than the tick interval.
+    // D1 on-time test (owner question 2026-09-04, replaces the earlier
+    // fixed-30s grace): was the engine TICKING when the moment passed?
+    // If the PREVIOUS tick ran before fireAt, this tick is the first
+    // delivery chance — on time, however late THIS tick itself ran
+    // (overrun, suspend edge). First tick after start/resume (lastTickMs
+    // null) or a moment older than the previous tick = the moment passed
+    // while the engine was down → genuinely missed. Self-adjusting: no
+    // grace constant to tune, correct under arbitrary tick delay.
     if (rem.updated_hlc_ms != null && rem.updated_hlc_ms > fireAt) continue;
     const endMs = endMsFor(startMs + 3_600_000);
     if (endMs > nowMs) {
-      const TICK_MS = 30_000;
-      const onTime = nowMs - fireAt <= TICK_MS;
+      const onTime = lastTickMs != null && lastTickMs < fireAt;
       out.push(makeFire(rem, ev, fireAt, !onTime));
     }
   }
