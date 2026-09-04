@@ -1326,12 +1326,36 @@ function main(): void {
         .all() as never[];
       const schedule = rebuildSchedule(events, reminders, Date.now());
       deliveredPrune();
-      const due = filterDelivered(schedule, deliveredReminderKeys);
+      // Smoke-test bug (2026-09-04, delegate investigation deleg_25c67eca):
+      // filterDelivered only removes already-delivered keys — FUTURE fires
+      // (fire_at_ms > now) passed straight through and were delivered on the
+      // next 30s tick, then marked delivered, so the reminder NEVER fired at
+      // its actual due time ("set 10min before, nothing at the time"). The
+      // tick must deliver only fires that are DUE NOW; future ones stay in
+      // the schedule and fire on a later tick.
+      const due = filterDelivered(schedule, deliveredReminderKeys).filter(
+        (f) => f.fire_at_ms <= Date.now(),
+      );
       for (const fire of due) {
         // pkg10 F1: mark delivered ONLY on confirmed dispatch. A failed
         // delivery stays unmarked → §7.1 retry on the next rebuild tick.
+        // Deleg_25c67eca recommendation: log every delivery outcome with the
+        // schedule key — success AND failure. The eager-fire bug above was
+        // undiagnosable for a day because delivery was fire-and-forget
+        // silent; one observability line per dispatch makes the pipeline
+        // auditable from the dev log alone.
+        console.log(
+          `[tide] reminder dispatch: key=${fire.key} missed=${fire.missed} title="${fire.title}"`,
+        );
         deliverNotification(fire, (ok) => {
-          if (ok) markDelivered(deliveredReminderKeys, [fire]);
+          if (ok) {
+            markDelivered(deliveredReminderKeys, [fire]);
+            console.log(`[tide] reminder delivered: key=${fire.key}`);
+          } else {
+            console.warn(
+              `[tide] reminder delivery FAILED (will retry next tick): key=${fire.key}`,
+            );
+          }
         });
       }
     } catch (err) {
