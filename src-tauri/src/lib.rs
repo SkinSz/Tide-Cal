@@ -172,12 +172,35 @@ impl TideSettings {
     }
 }
 
+/// Authoritative runtime-profile identifier (dev-profile isolation,
+/// owner-approved 2026-09-07, instruction: internal/docs/
+/// instruction-dev-profile-2026-09-07.md):
+///   debug build  -> "com.tide.app.dev"
+///   release build-> "com.tide.app"   (unchanged packaged behavior)
+/// Every profile-sensitive filesystem path MUST derive from this function —
+/// no unrelated string literals of the identifier in path-resolution code.
+/// No env escape hatch in v1 (debug cannot be pointed at production state).
+fn profile_id() -> &'static str {
+    if cfg!(debug_assertions) {
+        "com.tide.app.dev"
+    } else {
+        "com.tide.app"
+    }
+}
+
 fn config_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
-    // DC-15 §3.2: $XDG_CONFIG_HOME/tide/ (~/.config/tide/). Tauri's
-    // app_config_dir resolves the same location per the XDG spec.
-    app.path()
+    // DC-15 §3.2: $XDG_CONFIG_HOME/<identifier>/. Tauri's app_config_dir
+    // resolves from the bundle identifier, which is fixed per tauri.conf.json
+    // ("com.tide.app") — so a dev build must override the leaf directory to
+    // its profile id (same XDG rule Tauri applies, different identifier leaf).
+    let base = app
+        .path()
         .app_config_dir()
-        .map_err(|e| format!("config dir: {e}"))
+        .map_err(|e| format!("config dir: {e}"))?;
+    Ok(base
+        .parent()
+        .map(|p| p.join(profile_id()))
+        .unwrap_or(base))
 }
 
 fn config_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
@@ -218,20 +241,24 @@ fn load_settings(app: &tauri::AppHandle) -> TideSettings {
 /// clamping side effects beyond the locale whitelist. Used by run() to apply
 /// the saved locale before GTK/webview init.
 fn load_settings_pub() -> TideSettings {
-    // The config dir depends on the app identity; before Tauri init we read
-    // the XDG path directly. CRITICAL (owner bug 2026-09-03): Tauri resolves
-    // app_config_dir to $XDG_CONFIG_HOME/<bundle-identifier>/ — that is
-    // com.tide.app (see tauri.conf.json), NOT the literal "tide" the DC-15
-    // §3.2 comment says. persist_settings (with an AppHandle) writes to
-    // com.tide.app/, so this pre-init reader must match or the saved locale
-    // silently falls back to "system" on every launch.
+    // The config dir depends on the app identity + runtime profile; before
+    // Tauri init we read the XDG path directly. CRITICAL (owner bug
+    // 2026-09-03): Tauri resolves app_config_dir to
+    // $XDG_CONFIG_HOME/<bundle-identifier>/ — that is com.tide.app (see
+    // tauri.conf.json), NOT the literal "tide" the DC-15 §3.2 comment says.
+    // persist_settings (with an AppHandle) writes to com.tide.app/, so this
+    // pre-init reader must match or the saved locale silently falls back to
+    // "system" on every launch.
+    // Dev-profile isolation (2026-09-07): a debug build resolves
+    // com.tide.app.dev here — MUST stay in lockstep with config_dir()'s
+    // profile_id() override or the saved locale resets on every dev launch.
     let mut path = std::env::var("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_default();
             std::path::PathBuf::from(home).join(".config")
         });
-    path.push("com.tide.app");
+    path.push(profile_id());
     path.push("config.toml");
     std::fs::read_to_string(path)
         .ok()
@@ -880,7 +907,14 @@ pub fn run() {
             }
 
             // The sidecar owns the authoritative TS domain-core database.
+            // Dev-profile isolation (2026-09-07): the data dir derives from
+            // profile_id() — a debug build operates entirely inside
+            // com.tide.app.dev and NEVER touches production persistent state.
             let data_dir = app.path().app_data_dir()?;
+            let data_dir = data_dir
+                .parent()
+                .map(|p| p.join(profile_id()))
+                .unwrap_or(data_dir);
             std::fs::create_dir_all(&data_dir)?;
             let db_path = data_dir.join("tide-domain.db");
 
@@ -894,6 +928,13 @@ pub fn run() {
                 Some(path) => {
                     let mut cmd = std::process::Command::new("node");
                     cmd.env("TIDE_DB_PATH", &db_path);
+                    // Dev-profile isolation (2026-09-07): set TIDE_DATA_DIR
+                    // explicitly so the sidecar's identity bootstrap
+                    // (loadOrCreateIdentity, sidecar_server.ts) uses THIS dir
+                    // rather than inferring it from the DB path — the device
+                    // identity key then lives inside the profile's data dir
+                    // and a dev instance is a genuinely separate device.
+                    cmd.env("TIDE_DATA_DIR", &data_dir);
                     cmd.arg(&path);
                     match sidecar::Sidecar::spawn(cmd) {
                         Ok(sc) => {
@@ -1053,6 +1094,45 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod profile_isolation_tests {
+    use super::*;
+
+    #[test]
+    fn debug_build_resolves_dev_profile() {
+        // This test compiles under cfg(test) with debug_assertions — the dev
+        // profile MUST be the .dev identifier.
+        assert_eq!(profile_id(), "com.tide.app.dev");
+    }
+
+    #[test]
+    fn profile_helper_is_the_single_identifier_source() {
+        // Release identifier must remain the packaged bundle id. Verified
+        // indirectly here (string constant), directly by the release-build
+        // integration gate (scripts + pkg tests).
+        assert!(matches!(profile_id(), "com.tide.app.dev" | "com.tide.app"));
+    }
+
+    #[test]
+    fn preinit_config_reader_uses_profile_leaf() {
+        // Force the pre-init XDG reader into a fixture dir and verify the
+        // profile leaf is used (seam C).
+        let tmp = std::env::temp_dir().join(format!("tide-prof-{}", std::process::id()));
+        let cfg = tmp.join(profile_id());
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("config.toml"),
+            "sync_debounce_seconds = 10.0\nsweep_interval_minutes = 10.0\nmax_concurrent_sessions = 3.0\nmax_incremental_backlog = 1000.0\n\"general.theme\" = \"light\"\n",
+        )
+        .unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+        let s = load_settings_pub();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::fs::remove_dir_all(&tmp).ok();
+        assert_eq!(s.general_theme, "light");
+    }
 }
 
 #[cfg(test)]

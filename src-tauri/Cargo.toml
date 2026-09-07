@@ -30,3 +30,9 @@ mdns-sd = { version = "0.21.0", optional = true }
 
 [features]
 mdns = ["dep:mdns-sd"]
+
+# Dev-profile: keep the historical "app" binary stem for the dev launcher
+# (Wayland app_id = binary stem; scripts/install-dev-icons.sh, TD-023).
+[[bin]]
+name = "app"
+path = "src/main.rs"
