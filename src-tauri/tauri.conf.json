@@ -24,7 +24,10 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["rpm", "deb"],
+    "targets": [
+      "rpm",
+      "deb"
+    ],
     "publisher": "SkinS / Tide Project",
     "copyright": "Copyright © 2026 SkinS / Tide Project",
     "category": "Productivity",
@@ -48,14 +51,19 @@
       "deb": {
         "section": "utils",
         "priority": "optional",
-        "depends": ["nodejs (>= 18)"]
+        "depends": [
+          "nodejs (>= 18)"
+        ]
       },
       "rpm": {
-        "depends": ["nodejs"]
+        "depends": [
+          "nodejs"
+        ]
       }
     },
     "android": {
       "debugApplicationIdSuffix": ".debug"
     }
-  }
+  },
+  "mainBinaryName": "tide"
 }
