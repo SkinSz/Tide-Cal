@@ -90,6 +90,44 @@ future extensions where relevant.
   Runtime/cache:
     - $XDG_CACHE_HOME/tide/ (~/.cache/tide/) for anything disposable.
 
+3.2.1 Dev profile isolation (binding; owner-approved 2026-09-07,
+      implemented in commit 408bad5)
+  Problem addressed: dev/debug builds previously resolved ALL runtime
+  paths (DB, config, device identity) from the same bundle identifier
+  as the installed app — a dev launch could open, migrate, or corrupt
+  production data and masquerade as the production sync device.
+  Rules:
+    - Trigger: `#[cfg(debug_assertions)]` ONLY. No environment
+      variable selects the profile. Release builds are unchanged.
+    - Debug builds resolve to identifier `com.tide.app.dev` via a
+      single authoritative helper `profile_id()` in
+      `src-tauri/src/lib.rs`. No second hardcoded identifier may
+      appear anywhere (duplication of the identifier string is what
+      caused the 2026-09-03 locale-reset bug; the Windows port must
+      reuse profile_id(), not re-derive it).
+    - All path seams derive from profile_id(): config_dir, the run()
+      data-dir resolution, the pre-init locale reader, and the
+      sidecar spawn (which sets TIDE_DB_PATH and TIDE_DATA_DIR
+      explicitly to the profile's paths).
+    - Dev state is DISPOSABLE and starts empty. NO migration from
+      production into the dev profile, ever; copying prod data into
+      the dev profile defeats the isolation.
+    - Dev identity: a dev instance generates its own device identity
+      inside the dev profile; it never reuses the production
+      device_identity.key. Dev and production are separate sync
+      devices and can run concurrently without touching each other's
+      persistent state (verified by the dual-instance concurrency
+      gate, 2026-09-08).
+    - No `TIDE_PROFILE=prod`-style escape hatch in v1 (owner
+      decision): the invariant is simply
+      debug build -> dev profile, release build -> production profile.
+      A future escape hatch requires a separate owner-approved design.
+  Consequences for §3.2/§4.1: the XDG paths above denote the
+  PRODUCTION profile; debug builds see the same layout under
+  `com.tide.app.dev/` instead of `com.tide.app/`. The §4.1 Windows
+  portability rule inherits this: %APPDATA%\<profile_id()> semantics,
+  profile_id() reused, never a second literal.
+
 3.3 Environment overrides (binding)
   - TIDE_DB_PATH and TIDE_DATA_DIR remain supported (existing sidecar
     contract and E2E tests depend on them). Precedence:
@@ -256,3 +294,8 @@ us into a corner; everything else is deferred until the port starts.
       user-level.
   D8  Windows: only portability constraints fixed (§4.1); everything
       else WIP until the port work package starts.
+  D9  Dev-profile isolation (§3.2.1): debug builds resolve all
+      runtime paths to the com.tide.app.dev identifier via a single
+      profile_id() helper; dev state is disposable, starts empty,
+      gets its own device identity, never migrates production data,
+      and has no environment-variable escape hatch in v1.
