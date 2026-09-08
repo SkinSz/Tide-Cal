@@ -15,6 +15,7 @@
   </head>
   <body>
     <header id="toolbar">
+      <button id="btn-menu" title="Menu" aria-label="Open menu" aria-expanded="false">☰</button>
       <button id="btn-prev" title="Previous">‹</button>
       <button id="btn-today">Today</button>
       <button id="btn-next" title="Next">›</button>
@@ -35,6 +36,24 @@
         <button id="btn-week">Week</button>
       </div>
     </header>
+
+    <!-- DC-18 §2/§7 + burger menu (owner request 2026-09-08): slide-in nav
+         drawer. Data I/O (Import/Export) lives here; status indicators stay
+         in the toolbar so their counts remain visible at a glance. -->
+    <div id="menu-backdrop" hidden></div>
+    <nav id="menu-drawer" aria-label="Main menu" hidden>
+      <div class="menu-head">
+        <h2>Tide</h2>
+        <button id="btn-menu-close" title="Close menu" aria-label="Close menu">✕</button>
+      </div>
+      <div class="menu-section">
+        <h3>Calendar data</h3>
+        <button id="menu-import" title="Import events from an .ics file">
+          Import .ics…
+        </button>
+        <button id="menu-export">Export .ics…</button>
+      </div>
+    </nav>
 
     <main id="calendar-grid" aria-label="Calendar"></main>
 

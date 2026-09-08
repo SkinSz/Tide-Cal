@@ -67,6 +67,75 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 button.danger { color: var(--danger); border-color: var(--danger); }
 .seg button.active { background: var(--accent-soft); border-color: var(--accent); }
 
+/* Burger menu drawer (owner request 2026-09-08) */
+/* Guard: the display rules below would override the HTML hidden attribute
+   (hidden only wins when no CSS display is set), leaving the drawer stuck
+   open and Escape/✕/backdrop seemingly dead. Force hidden to always win. */
+#menu-backdrop[hidden],
+#menu-drawer[hidden] { display: none; }
+#btn-menu { font-size: 1rem; padding: 5px 10px; }
+#menu-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  z-index: 40;
+}
+#menu-drawer {
+  position: fixed;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  width: 260px;
+  max-width: 80vw;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  z-index: 41;
+  display: flex;
+  flex-direction: column;
+  padding: 12px;
+  gap: 10px;
+  box-shadow: 4px 0 18px rgba(0, 0, 0, 0.25);
+}
+#menu-drawer .menu-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+#menu-drawer .menu-head h2 {
+  margin: 0;
+  font-size: 1rem;
+  letter-spacing: 0.03em;
+}
+#menu-drawer .menu-section h3 {
+  margin: 8px 0 6px;
+  font-size: 0.72rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+#menu-drawer .menu-section button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  text-align: left;
+  margin-bottom: 6px;
+  font-size: 0.85rem;
+}
+#menu-drawer .menu-section button:disabled {
+  color: var(--muted);
+  cursor: default;
+}
+#menu-drawer .menu-section button:disabled:hover { background: transparent; }
+#menu-drawer .menu-soon {
+  font-size: 0.68rem;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+
+
 /* Grid */
 main { flex: 1; overflow: auto; padding: 8px; }
 #calendar-grid {

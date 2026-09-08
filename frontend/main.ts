@@ -4,6 +4,7 @@ import { initDialog } from "./dialog.ts";
 import { initConflicts } from "./conflicts.ts";
 import { initDevices } from "./devices.ts";
 import { initSyncErrors } from "./sync_errors.ts";
+import { initMenu } from "./menu.ts";
 import { initPairedDevices } from "./paired_devices.ts";
 import { applyTheme, getTheme, setTheme, setTimeFormat, type Theme, type TimeFormat } from "./theme.ts";
 
@@ -98,6 +99,7 @@ window.addEventListener("resize", () => {
 initDialog();
 initConflicts();
 initDevices();
+initMenu();
 initSyncErrors();
 initPairedDevices();
 if (getViewMode() === "week") setMode("week");
