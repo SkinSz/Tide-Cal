@@ -45,6 +45,8 @@
     "resources": {
       "resources/sidecar.mjs": "dist/sidecar.mjs",
       "resources/better-sqlite3/": "node_modules/better-sqlite3/",
+      "resources/bindings/": "node_modules/bindings/",
+      "resources/file-uri-to-path/": "node_modules/file-uri-to-path/",
       "../LICENSE.md": "LICENSE"
     },
     "linux": {

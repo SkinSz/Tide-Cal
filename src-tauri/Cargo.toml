@@ -27,6 +27,7 @@ toml = "0.8"
 tauri = { version = "2.11.3", features = ["tray-icon"] }
 tauri-plugin-log = "2"
 mdns-sd = { version = "0.21.0", optional = true }
+tauri-plugin-dialog = "2.7.3"
 
 [features]
 mdns = ["dep:mdns-sd"]

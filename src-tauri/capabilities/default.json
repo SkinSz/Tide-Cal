@@ -6,6 +6,9 @@
     "main"
   ],
   "permissions": [
-    "core:default"
+    "core:default",
+    "dialog:allow-save",
+    "dialog:allow-message",
+    "dialog:allow-open"
   ]
 }

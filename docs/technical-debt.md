@@ -322,3 +322,65 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 - **Title:** "Test repeat daily" series base re-anchored to 2026-09-10; two occurrence overrides orphaned in owner DB
 - **Priority:** 3/10 — LOW
 - **Status:** RESOLVED (verified 2026-09-04, no repair needed) — owner deleted the test series themselves after the underlying bug was fixed in 5b51f78. DB re-inspection: series row, base event, and overrides all gone; remaining data (weekly series + cancelled override, whole-day event, single event) consistent; no tombstone anomalies. The orphaned-override repair became moot.
+
+## TD-025 — Sidecar SIGSEGV (signal 11) during pairing-code creation on Debian (external user report)
+- **ID:** TD-025
+- **Title:** DEB install on stock Debian: sidecar exits with SIGSEGV when creating a pairing code
+- **Priority:** 6/10 — MEDIUM-HIGH (first external-user install broken at a core feature)
+- **Status:** RESOLVED-PENDING-VERIFICATION (2026-09-08): fix applied (better-sqlite3 12.11.1 + extra vendored deps); awaiting friend's confirmation on the rebuilt DEB.
+- **Report:** Owner's friend installed Tide_0.1.0_amd64.deb on (actual) Debian. Creating a pairing code → error "sidecar exited: signal 11 (SIGSEGV)".
+- **Why it matters:** SIGSEGV in the sidecar means Node started and died in NATIVE code — the only native module in the sidecar is better-sqlite3. Pairing-code creation is the first operation that WRITES to the domain DB, so the crash site is consistent with the sqlite binding. NOT a missing-nodejs problem: absent node yields spawn failure ("command not found"), not signal 11.
+- **Artifact facts (verified from the shipped DEB):** `prebuilds/linux-x64.node` IS present and bundled (`usr/lib/Tide/node_modules/better-sqlite3/prebuilds/`). So the file is not missing — a runtime-level mismatch remains the prime suspect.
+- **Leading hypotheses (ranked):**
+  1. better-sqlite3 v13 prebuild vs Debian's distro Node (Debian 11 → Node 12, Debian 12 → Node 18): N-API addon built with newer toolchain segfaults on older/patched runtime.
+  2. Conflicting Node installs on the user machine (distro node + snap/nvm) → mismatched runtime/native load.
+  3. Old glibc or missing CPU ISA in the prebuilt binary (rarer).
+  4. Own sync/crypto path — unlikely; pure TS throws instead of segfaulting.
+- **Diagnostics received (2026-09-08, tide-faults.txt):** Debian 13.6 (trixie), x64,
+  system Node **v20.19.2** at /usr/bin/node (single install, no nvm/snap conflict).
+  His probe `node -e "require('node_modules/better-sqlite3')"` failed with
+  **MODULE_NOT_FOUND — NOT a segfault**: the probe syntax itself is broken
+  (a path without `./` prefix is resolved as a module name, never hits the
+  native binding). Reproduced identically on the owner machine. So the native
+  binding has NOT yet been exercised on his machine.
+- **Owner-machine verification of the shipped DEB payload (2026-09-08, OBSERVED):**
+  extracted Tide_0.1.0_amd64.deb data.tar.gz to a fake /usr/lib/Tide; ran the
+  actual shipped `dist/sidecar.mjs` against the actual vendored
+  better-sqlite3 13.0.3 (prebuild md5 4a98ff01…): ping OK, device_info OK,
+  **pairing_offer OK** (the reported crasher) — on Node v26.7.0. Prebuild ELF
+  needs max GLIBC_2.34 (trixie ships 2.41 — fine) and only old NAPI symbols
+  (Node 20 supports NAPI 9 — fine on paper).
+- **Next diagnostics (corrected probes, sent to user 2026-09-08):**
+  P1 `node -e "const D = require('/usr/lib/Tide/node_modules/better-sqlite3'); const db = new D(':memory:'); db.exec('create table t(x)'); db.prepare('insert into t values (1)').run(); console.log('sqlite ok:', db.prepare('select x from t').get().x)"`
+  P2 `cd /usr/lib/Tide && TIDE_DB_PATH=/tmp/t.db TIDE_DATA_DIR=/tmp node dist/sidecar.mjs` then paste `{"id":1,"op":"ping","args":{}}` + Enter; report output + exit code.
+  P3 `node -e "console.log(process.report.getReport().header.glibcVersionRuntime, process.versions.napi)"`
+  Decision tree: P1 segfault → hypothesis 1 confirmed (prebuild vs Node 20
+  runtime) → candidate fixes (bundle Node runtime / rebuild prebuild on
+  Node 20 / document Node >= 22). P1 ok but P2 segfault → JS-level difference
+  between Node 20 and 26 running sidecar.mjs (esbuild target). P1+P2 ok →
+  crash is in the GUI launch environment (env vars, working dir, permissions).
+- **Previous diagnostics requested (2026-09-07, superseded):** `node --version`; `cat /etc/debian_version` / `lsb_release -a`; `which node`; Tide log tail from `~/.local/share/com.tide.app/logs/` or terminal stderr; isolation probe `cd /usr/lib/Tide && node -e "require('node_modules/better-sqlite3'); console.log('ok')"` — segfault here confirms hypothesis 1.
+- **ROOT CAUSE CONFIRMED (2026-09-08, PROVEN):** friend's P1 probe segfaulted
+  (Speicherzugriffsfehler) on Node v20.19.2 — the native binding itself crashes.
+  Upstream bug: WiseLibs/better-sqlite3#1514 — v13.0.3 prebuilds segfault at
+  napi_module_register on Node 20 and early Node 22 (cross-platform:
+  darwin-arm64, win32-x64, linux-x64 all reported; v12.x unaffected on all
+  Node versions). v13 declares engines ">=22" but even 22.x < 22.14 crashes.
+  Debian 13 (trixie) ships Node 20.x → the v13 DEB can never work there.
+  P3 confirmed glibc 2.41 / NAPI 9 on his machine (those were never the problem).
+- **FIX APPLIED (2026-09-08, uncommitted):** downgrade better-sqlite3
+  13.0.3 → 12.11.1 (engines "20.x || 22.x || … 26.x"). Full suite re-run:
+  786/786 PASS. DEB-layout simulation with the v12 tree (sidecar.mjs +
+  vendored better-sqlite3 + bindings + file-uri-to-path): P1-equivalent write
+  OK, sidecar ping + device_info OK on Node v26. NOTE: v12 loads the addon via
+  require('bindings') — tauri.conf.json resources now ALSO ship
+  node_modules/bindings and node_modules/file-uri-to-path (v13 did not need
+  them). Sidecar bundle rebuilt. Packages need rebuild + re-upload
+  (same-NVRA reinstall trap: bump Release or md5-verify).
+- **Candidate fixes (decision after diagnosis, SUPERSEDED by the downgrade):** document/require Node >= X for DEB targets; or re-vendor better-sqlite3 with wider prebuild range; or bundle a Node runtime in the DEB (ties into Windows-port Node-runtime decision).
+- **Relevant files:** `src-tauri/resources/better-sqlite3/` (vendored prebuilds), `src-tauri/tauri.conf.json` (resources/deb depends), `src/persistence/bridges/sidecar_server.ts` (sidecar startup), DC-15 packaging.
+
+## Owner rulings recorded 2026-09-08 (DC-18 implementation review)
+- SEQUENCE on cancellation VEVENTs: v1 uses SEQUENCE:0; §3.4's increment language does NOT override §3.7's v1 rule. (Exporter already implements this.)
+- tauri-plugin-dialog: approved. v1 scope (all calendars, one VCALENDAR): approved. X-TIDE-CALENDAR grouping: approved.
+- Manual cross-suite import test (Google/Apple/Outlook) is a real RELEASE GATE, owner-executed.

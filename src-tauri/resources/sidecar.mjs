@@ -1602,6 +1602,74 @@ var EventCore = class {
     }
     return event;
   }
+  /**
+   * DC-23 §4 Case B: create an event with a CALLER-SUPPLIED canonical Tide
+   * id (import identity resolution). Same T1/validation machinery as
+   * createEvent — the ONLY difference is the id source. Guard: the id must
+   * match the canonical evt-<uuid> shape AND not already exist (a collision
+   * is a hard error, never a silent upsert). Non-canonical ids are refused
+   * here so the M-1 invariant (core-owned identity) keeps holding for the
+   * ordinary createEvent path — this method exists for the importer only
+   * and is NOT exposed on any surface op.
+   */
+  createEventWithId(id, input) {
+    if (!/^evt-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+      throw new Error(`create_event_with_id: id is not canonical evt-<uuid> shape: ${id}`);
+    }
+    assertNoInjectedId(input, "create");
+    if (this.getEventRow(id) !== void 0) {
+      throw new Error(`create_event_with_id: event already exists: ${id}`);
+    }
+    const rule = input.recurrenceRule !== void 0 ? validateRRule(input.recurrenceRule, "create_event") : void 0;
+    const event = {
+      id,
+      title: input.title,
+      description: input.description,
+      startMs: input.startMs,
+      endMs: input.endMs,
+      allDay: input.allDay
+    };
+    validateEventValues(event, "create_event");
+    const hlc = this.hlc.now();
+    createLocalChange(
+      this.db,
+      this.deviceId,
+      {
+        entity_id: event.id,
+        entity_type: "event",
+        field_path: "event",
+        operation: "set",
+        payload: { value: eventFields(event) },
+        hlc_now: () => hlc
+      },
+      (db, _record) => {
+        insertEventRow(db, event, hlc);
+      }
+    );
+    if (rule !== void 0) {
+      const seriesId = `ser-${randomUUID2()}`;
+      const seriesHlc = this.hlc.now();
+      createLocalChange(
+        this.db,
+        this.deviceId,
+        {
+          entity_id: seriesId,
+          entity_type: "series",
+          field_path: "recurrence_rule",
+          operation: "set",
+          payload: { value: rule },
+          hlc_now: () => seriesHlc
+        },
+        (db) => {
+          db.prepare(
+            `INSERT INTO series (series_id, base_event_id, recurrence_rule, created_hlc, updated_hlc)
+             VALUES (?, ?, ?, ?, ?)`
+          ).run(seriesId, event.id, rule, seriesHlc, seriesHlc);
+        }
+      );
+    }
+    return event;
+  }
   updateEvent(id, input) {
     assertNoInjectedId(input, "update");
     const existing = this.getEventRow(id);
@@ -3366,14 +3434,14 @@ function pow(num, power, modulo) {
   if (d < _0n2)
     d += modulo;
   if (power < POW_WINDOWED_MIN) {
-    let p2 = _1n2;
+    let p3 = _1n2;
     while (power > _0n2) {
       if (power & _1n2)
-        p2 = p2 * d % modulo;
+        p3 = p3 * d % modulo;
       d = d * d % modulo;
       power >>= _1n2;
     }
-    return p2;
+    return p3;
   }
   const digits = [];
   while (power > _0n2) {
@@ -5459,6 +5527,986 @@ function resolveEndpoint(cache, source, deviceId) {
   const last = source.lastKnown(deviceId);
   if (last !== null) return { deviceId, endpoint: { host: last.host, port: last.port } };
   return void 0;
+}
+
+// src/interop/ics_shared.ts
+function isIANAZoneGuard(tz) {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// src/interop/ics_export.ts
+function escapeText(s) {
+  return s.replace(/\\/g, "\\\\").replace(/;/g, "\\;").replace(/,/g, "\\,").replace(/\r?\n/g, "\\n").replace(/\r/g, "\\n");
+}
+function foldLine(line) {
+  const enc = new TextEncoder();
+  if (enc.encode(line).length <= 75) return line;
+  const parts = [];
+  let chunk = "";
+  let width = 0;
+  for (const ch of line) {
+    const w = enc.encode(ch).length;
+    if (width + w > (parts.length === 0 ? 75 : 74)) {
+      parts.push(chunk);
+      chunk = "";
+      width = 0;
+    }
+    chunk += ch;
+    width += w;
+  }
+  if (chunk) parts.push(chunk);
+  return parts.join("\r\n ");
+}
+var p2 = (n) => String(n).padStart(2, "0");
+function utcStamp(ms) {
+  const d = new Date(ms);
+  return `${d.getUTCFullYear()}${p2(d.getUTCMonth() + 1)}${p2(d.getUTCDate())}T${p2(d.getUTCHours())}${p2(d.getUTCMinutes())}${p2(d.getUTCSeconds())}Z`;
+}
+function wallStamp(dateStr, wall) {
+  return `${dateStr.replace(/-/g, "")}T${wall.replace(/:/g, "")}`;
+}
+function localDateOf(utcMs, tz) {
+  try {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: tz,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    }).formatToParts(new Date(utcMs));
+    const get2 = (t) => parts.find((x) => x.type === t)?.value ?? "";
+    return `${get2("year")}-${get2("month")}-${get2("day")}`;
+  } catch {
+    return new Date(utcMs).toISOString().slice(0, 10);
+  }
+}
+function zonedEpochMs(dateStr, wall, tz) {
+  const [h2, m, s] = wall.split(":").map(Number);
+  const naive = Date.parse(`${dateStr}T${p2(h2)}:${p2(m)}:${p2(s ?? 0)}Z`);
+  if (!Number.isFinite(naive)) return NaN;
+  return offsetCorrected(naive, tz);
+}
+function offsetCorrected(guess, tz) {
+  const off1 = tzOffsetMs(guess, tz);
+  const corrected = guess - off1;
+  const off2 = tzOffsetMs(corrected, tz);
+  return off1 === off2 ? corrected : guess - off2;
+}
+function tzOffsetMs(utcMs, tz) {
+  try {
+    const t = Math.floor(utcMs / 1e3) * 1e3;
+    const dtf = new Intl.DateTimeFormat("en-US", {
+      timeZone: tz,
+      hour12: false,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit"
+    });
+    const parts = dtf.formatToParts(new Date(t));
+    const get2 = (t2) => Number(parts.find((x) => x.type === t2)?.value);
+    let hour = get2("hour");
+    let dayShift = 0;
+    if (hour === 24) {
+      hour = 0;
+      dayShift = 1;
+    }
+    const asUtc = Date.UTC(
+      get2("year"),
+      get2("month") - 1,
+      get2("day") + dayShift,
+      hour,
+      get2("minute"),
+      get2("second")
+    );
+    return asUtc - t;
+  } catch {
+    return NaN;
+  }
+}
+function isIANAZone(tz) {
+  return isIANAZoneGuard(tz ?? "");
+}
+function exclusiveEndDate(inclusiveYYYYMMDD) {
+  const [y, m, d] = inclusiveYYYYMMDD.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + 1);
+  return `${dt.getUTCFullYear()}-${p2(dt.getUTCMonth() + 1)}-${p2(dt.getUTCDate())}`;
+}
+function vtimezone(tz, aroundMs) {
+  const lines = ["BEGIN:VTIMEZONE", `TZID:${tz}`];
+  const o0 = tzOffsetMs(aroundMs, tz);
+  const year = 365.25 * 864e5;
+  function nextTransition(from) {
+    const off0 = tzOffsetMs(from, tz);
+    if (!Number.isFinite(off0)) return null;
+    const step = 15 * 864e5;
+    const horizon = from + year;
+    let lo = null;
+    for (let t = from + step; t <= horizon; t += step) {
+      const o = tzOffsetMs(t, tz);
+      if (Number.isFinite(o) && o !== off0) {
+        lo = t - step;
+        break;
+      }
+    }
+    if (lo === null) return null;
+    let hi = lo + step;
+    while (hi - lo > 1e3) {
+      const mid = Math.floor((lo + hi) / 2);
+      if (tzOffsetMs(mid, tz) === off0) lo = mid;
+      else hi = mid;
+    }
+    return { at: hi, from_off: off0, to_off: tzOffsetMs(hi, tz) };
+  }
+  function block(t) {
+    const isDst = t.to_off > t.from_off;
+    return [
+      "BEGIN:" + (isDst ? "DAYLIGHT" : "STANDARD"),
+      `DTSTART:${localWallStamp(t.at, tz)}`,
+      `TZOFFSETFROM:${fmtOffset(t.from_off)}`,
+      `TZOFFSETTO:${fmtOffset(t.to_off)}`,
+      `TZNAME:${tz}`,
+      "END:" + (isDst ? "DAYLIGHT" : "STANDARD")
+    ];
+  }
+  const t1 = nextTransition(aroundMs);
+  if (t1) {
+    lines.push(...block(t1));
+    const t2 = nextTransition(t1.at + 30 * 864e5);
+    if (t2) lines.push(...block(t2));
+  } else if (Number.isFinite(o0)) {
+    lines.push(
+      "BEGIN:STANDARD",
+      `DTSTART:19700101T000000`,
+      `TZOFFSETFROM:${fmtOffset(o0)}`,
+      `TZOFFSETTO:${fmtOffset(o0)}`,
+      `TZNAME:${tz}`,
+      "END:STANDARD"
+    );
+  }
+  lines.push("END:VTIMEZONE");
+  return lines;
+}
+function localWallStamp(utcMs, tz) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    hour12: false,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit"
+  }).formatToParts(new Date(utcMs));
+  const get2 = (t) => parts.find((x) => x.type === t)?.value ?? "00";
+  return `${get2("year")}${get2("month")}${get2("day")}T${get2("hour") === "24" ? "00" : get2("hour")}${get2("minute")}${get2("second")}`;
+}
+function fmtOffset(ms) {
+  const sign = ms < 0 ? "-" : "+";
+  const a = Math.abs(ms);
+  const totalMin = Math.round(a / 6e4);
+  const h2 = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return `${sign}${p2(h2)}${p2(m)}`;
+}
+function exportToIcs(input) {
+  const calendars = new Map(input.calendars.map((c) => [c.calendar_id, c.title]));
+  const seriesByBase = new Map(input.series.map((s) => [s.base_event_id, s]));
+  const overridesBySeries = /* @__PURE__ */ new Map();
+  for (const o of input.overrides) {
+    let list = overridesBySeries.get(o.series_id);
+    if (!list) overridesBySeries.set(o.series_id, list = []);
+    list.push(o);
+  }
+  const lines = [
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//Tide//Calendar Export//EN",
+    "CALSCALE:GREGORIAN"
+  ];
+  const zones = /* @__PURE__ */ new Set();
+  for (const e of input.events) if (isIANAZone(e.tz_id)) zones.add(e.tz_id);
+  for (const o of input.overrides) if (isIANAZone(o.tz_id)) zones.add(o.tz_id);
+  for (const tz of zones) lines.push(...vtimezone(tz, input.nowMs));
+  const dtstamp = utcStamp(input.nowMs);
+  for (const e of input.events) {
+    const series = seriesByBase.get(e.event_id);
+    const calTitle = calendars.get(e.calendar_id);
+    lines.push(...vevent(e, calTitle, dtstamp, series?.recurrence_rule));
+    if (!series) continue;
+    for (const o of overridesBySeries.get(series.series_id) ?? []) {
+      lines.push(...overrideVevent(e, series, o, calTitle, dtstamp));
+    }
+  }
+  lines.push("END:VCALENDAR");
+  return lines.map(foldLine).join("\r\n") + "\r\n";
+}
+function vevent(e, calTitle, dtstamp, recurrenceRule) {
+  const lines = ["BEGIN:VEVENT"];
+  lines.push(`UID:${escapeText(e.event_id)}`);
+  lines.push(`DTSTAMP:${dtstamp}`);
+  lines.push(`SEQUENCE:0`);
+  if (recurrenceRule !== void 0) lines.push(`RRULE:${recurrenceRule}`);
+  const anomalies = [];
+  if (e.all_day) {
+    if (!e.start_date || !e.end_date) {
+      anomalies.push("all_day event missing start_date/end_date");
+      lines.push("DTSTART;VALUE=DATE:19700101", "DTEND;VALUE=DATE:19700102");
+    } else {
+      lines.push(`DTSTART;VALUE=DATE:${e.start_date.replace(/-/g, "")}`);
+      lines.push(`DTEND;VALUE=DATE:${exclusiveEndDate(e.end_date).replace(/-/g, "")}`);
+    }
+  } else if (isIANAZone(e.tz_id) && e.start_wall && e.end_wall && e.utc_start_ms != null) {
+    const endDate = e.utc_end_ms != null ? localDateOf(e.utc_end_ms, e.tz_id) : localDateOf(e.utc_start_ms, e.tz_id);
+    const startLocal = wallStamp(localDateOf(e.utc_start_ms ?? 0, e.tz_id), e.start_wall);
+    const endLocal = wallStamp(endDate, e.end_wall);
+    lines.push(`DTSTART;TZID=${e.tz_id}:${startLocal}`);
+    lines.push(`DTEND;TZID=${e.tz_id}:${endLocal}`);
+  } else if (e.utc_start_ms != null && e.utc_end_ms != null) {
+    lines.push(`DTSTART:${utcStamp(e.utc_start_ms)}`);
+    lines.push(`DTEND:${utcStamp(e.utc_end_ms)}`);
+  } else {
+    anomalies.push("timed event missing utc_start_ms/utc_end_ms");
+    lines.push("DTSTART:19700101T000000Z", "DTEND:19700101T000000Z");
+  }
+  lines.push(`SUMMARY:${escapeText(e.title)}`);
+  if (e.description !== "") lines.push(`DESCRIPTION:${escapeText(e.description)}`);
+  if (calTitle !== void 0) lines.push(`X-TIDE-CALENDAR:${escapeText(calTitle)}`);
+  for (let i = 0; i < anomalies.length; i++) {
+    lines.push(`X-TIDE-ERROR${anomalies.length > 1 ? `-${i + 1}` : ""}:${escapeText(anomalies[i])}`);
+  }
+  lines.push("END:VEVENT");
+  return lines;
+}
+function overrideVevent(base, series, o, calTitle, dtstamp) {
+  const lines = ["BEGIN:VEVENT"];
+  lines.push(`UID:${escapeText(base.event_id)}`);
+  lines.push(`DTSTAMP:${dtstamp}`);
+  lines.push("SEQUENCE:0");
+  const anomalies = [];
+  const effTz = isIANAZone(o.tz_id) ? o.tz_id : isIANAZone(base.tz_id) ? base.tz_id : null;
+  const ridDate = o.recurrence_id.slice(0, 8);
+  const occurrenceDate = `${ridDate.slice(0, 4)}-${ridDate.slice(4, 6)}-${ridDate.slice(6, 8)}`;
+  lines.push(`RECURRENCE-ID:${o.recurrence_id}`);
+  if (o.cancelled) {
+    lines.push("STATUS:CANCELLED");
+    if (base.all_day && base.end_date) {
+      lines.push(`DTSTART;VALUE=DATE:${occurrenceDate.replace(/-/g, "")}`);
+      lines.push(`DTEND;VALUE=DATE:${exclusiveEndDate(base.end_date).replace(/-/g, "")}`);
+    } else if (base.utc_start_ms != null && base.utc_end_ms != null) {
+      const baseUtcDate = new Date(base.utc_start_ms).toISOString().slice(0, 10);
+      const [by, bm, bd] = baseUtcDate.split("-").map(Number);
+      const [oy, om, od] = occurrenceDate.split("-").map(Number);
+      const dayDeltaMs = Date.UTC(oy, om - 1, od) - Date.UTC(by, bm - 1, bd);
+      lines.push(`DTSTART:${utcStamp(base.utc_start_ms + dayDeltaMs)}`);
+      lines.push(`DTEND:${utcStamp(base.utc_end_ms + dayDeltaMs)}`);
+    } else {
+      anomalies.push("cancelled override: base event has no usable time basis");
+    }
+    lines.push(`SUMMARY:${escapeText(o.title ?? base.title)}`);
+  } else {
+    const title = o.title ?? base.title;
+    const startWall = o.start_wall ?? base.start_wall;
+    const endWall = o.end_wall ?? base.end_wall;
+    const tz = effTz;
+    if (base.all_day) {
+      if (base.start_date && base.end_date) {
+        void base.start_date;
+        lines.push(`DTSTART;VALUE=DATE:${occurrenceDate.replace(/-/g, "")}`);
+        lines.push(`DTEND;VALUE=DATE:${exclusiveEndDate(base.end_date).replace(/-/g, "")}`);
+      } else {
+        anomalies.push("modified all-day override: base missing date columns");
+      }
+      lines.push(`SUMMARY:${escapeText(title)}`);
+    } else if (tz && startWall && endWall) {
+      const s = zonedEpochMs(occurrenceDate, startWall, tz);
+      const en = zonedEpochMs(occurrenceDate, endWall, tz);
+      if (Number.isFinite(s) && Number.isFinite(en)) {
+        lines.push(`DTSTART;TZID=${tz}:${wallStamp(occurrenceDate, startWall)}`);
+        lines.push(`DTEND;TZID=${tz}:${wallStamp(occurrenceDate, endWall)}`);
+      } else {
+        anomalies.push("modified override: wall times not resolvable");
+      }
+      lines.push(`SUMMARY:${escapeText(title)}`);
+    } else if (base.utc_start_ms != null && base.utc_end_ms != null) {
+      const baseUtcDate = new Date(base.utc_start_ms).toISOString().slice(0, 10);
+      const [by, bm, bd] = baseUtcDate.split("-").map(Number);
+      const [oy, om, od] = occurrenceDate.split("-").map(Number);
+      const dayDeltaMs = Date.UTC(oy, om - 1, od) - Date.UTC(by, bm - 1, bd);
+      lines.push(`DTSTART:${utcStamp(base.utc_start_ms + dayDeltaMs)}`);
+      lines.push(`DTEND:${utcStamp(base.utc_end_ms + dayDeltaMs)}`);
+      lines.push(`SUMMARY:${escapeText(title)}`);
+    } else {
+      anomalies.push("modified override: no resolvable time basis");
+      lines.push(`SUMMARY:${escapeText(title)}`);
+    }
+  }
+  if (calTitle !== void 0) lines.push(`X-TIDE-CALENDAR:${escapeText(calTitle)}`);
+  for (let i = 0; i < anomalies.length; i++) {
+    lines.push(`X-TIDE-ERROR${anomalies.length > 1 ? `-${i + 1}` : ""}:${escapeText(anomalies[i])}`);
+  }
+  lines.push("END:VEVENT");
+  return lines;
+}
+function buildExportInput(core, nowMs) {
+  const events = core.db.prepare(
+    `SELECT event_id, calendar_id, title, description, all_day, start_date,
+              end_date, start_wall, end_wall, tz_id, utc_start_ms, utc_end_ms
+       FROM events ORDER BY utc_start_ms`
+  ).all().map((r) => ({ ...r, all_day: r.all_day !== 0 }));
+  const calendars = core.db.prepare(
+    "SELECT calendar_id, title FROM calendars ORDER BY calendar_id"
+  ).all();
+  const series = core.db.prepare(
+    "SELECT series_id, base_event_id, recurrence_rule FROM series"
+  ).all();
+  const overrides = core.db.prepare(
+    `SELECT series_id, recurrence_id, cancelled, title, start_wall, end_wall, tz_id
+       FROM occurrence_overrides ORDER BY series_id, recurrence_id`
+  ).all().map((o) => ({ ...o, cancelled: o.cancelled !== 0 }));
+  return { calendars, events, series, overrides, nowMs };
+}
+
+// src/interop/ics_import.ts
+import { randomUUID as randomUUID3 } from "node:crypto";
+var MAX_FILE_BYTES = 8 * 1024 * 1024;
+var MAX_LINES = 2e5;
+var MAX_EVENTS = 5e4;
+function failHard(reason) {
+  throw new Error(`ics import: ${reason}`);
+}
+function parseIcs(text) {
+  const bytes = new TextEncoder().encode(text).length;
+  if (bytes > MAX_FILE_BYTES) failHard(`input too large (${bytes} bytes > ${MAX_FILE_BYTES})`);
+  const lines0 = text.split(/\r?\n/);
+  if (lines0.length > MAX_LINES) failHard(`too many lines (${lines0.length} > ${MAX_LINES})`);
+  const skipped = [];
+  if (!/\bBEGIN:VCALENDAR\b/.test(text)) {
+    failHard("input is not a VCALENDAR (no BEGIN:VCALENDAR found) \u2014 nothing imported");
+  }
+  if (!/\bBEGIN:VEVENT\b/.test(text)) {
+    failHard("VCALENDAR contains no VEVENT components \u2014 nothing imported");
+  }
+  const lines = [];
+  for (const raw of lines0) {
+    if ((raw.startsWith(" ") || raw.startsWith("	")) && lines.length > 0) {
+      lines[lines.length - 1] += raw.slice(1);
+    } else {
+      lines.push(raw);
+    }
+  }
+  const events = [];
+  let inVtimezone = false;
+  let current = null;
+  let inForeignComponent = false;
+  let foreignName = "";
+  for (const line of lines) {
+    if (line === "BEGIN:VTIMEZONE") {
+      inVtimezone = true;
+      continue;
+    }
+    if (line === "END:VTIMEZONE") {
+      inVtimezone = false;
+      continue;
+    }
+    if (inVtimezone) continue;
+    if (line.startsWith("BEGIN:")) {
+      const comp = line.slice(6).trim().toUpperCase();
+      if (comp === "VEVENT" && current === null && !inForeignComponent) {
+        if (events.length >= MAX_EVENTS) failHard(`too many VEVENTs (> ${MAX_EVENTS})`);
+        current = { props: [] };
+      } else if (comp === "VEVENT" && (current !== null || inForeignComponent)) {
+        skipped.push({ kind: "VEVENT", detail: "nested or misplaced VEVENT ignored" });
+      } else if (comp !== "VCALENDAR") {
+        inForeignComponent = true;
+        foreignName = comp;
+      }
+      continue;
+    }
+    if (line.startsWith("END:")) {
+      const comp = line.slice(4).trim().toUpperCase();
+      if (comp === "VEVENT" && current !== null) {
+        const ev = buildParsedEvent(current.props, skipped);
+        if (ev) events.push(ev);
+        current = null;
+      } else if (inForeignComponent && comp === foreignName) {
+        inForeignComponent = false;
+      }
+      continue;
+    }
+    const colon = propertyColon(line);
+    if (colon < 0) {
+      if (line.trim().length > 0) skipped.push({ kind: "line", detail: `unparseable line ignored: ${line.slice(0, 60)}` });
+      continue;
+    }
+    const left = line.slice(0, colon);
+    const value = line.slice(colon + 1);
+    const semi = left.indexOf(";");
+    const name = (semi >= 0 ? left.slice(0, semi) : left).trim().toUpperCase();
+    const params = semi >= 0 ? left.slice(semi + 1) : "";
+    if (inForeignComponent) {
+      if (current === null) skipped.push({ kind: foreignName || "component", detail: `${name} inside unsupported component ignored` });
+      continue;
+    }
+    if (current === null) {
+      if (name !== "VERSION" && name !== "PRODID" && name !== "CALSCALE") {
+        skipped.push({ kind: "property", detail: `${name} outside a component ignored` });
+      }
+      continue;
+    }
+    current.props.push({ name, params, value });
+  }
+  const seen = /* @__PURE__ */ new Set();
+  const deduped = [];
+  for (const e of events) {
+    if (e.recurrenceId === null) {
+      if (seen.has(e.uid)) {
+        deduped.push({ ...e, duplicate: true });
+        continue;
+      }
+      seen.add(e.uid);
+    }
+    deduped.push(e);
+  }
+  return { events: deduped, skipped };
+}
+function propertyColon(line) {
+  let inQuote = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '"') inQuote = !inQuote;
+    else if (c === ":" && !inQuote) return i;
+  }
+  return -1;
+}
+function buildParsedEvent(props, skipped) {
+  let uid = "";
+  let summary = "";
+  let description = "";
+  let dtstart = null;
+  let dtend = null;
+  let rrule = null;
+  let recurrenceId = null;
+  let cancelled = false;
+  for (const p of props) {
+    switch (p.name) {
+      case "UID":
+        uid = p.value.trim();
+        break;
+      case "SUMMARY":
+        summary = unescapeText(p.value);
+        break;
+      case "DESCRIPTION":
+        description = unescapeText(p.value);
+        break;
+      case "DTSTART":
+        dtstart = { value: p.value, params: p.params };
+        break;
+      case "DTEND":
+        dtend = { value: p.value, params: p.params };
+        break;
+      case "RRULE":
+        rrule = p.value.trim();
+        break;
+      case "RECURRENCE-ID":
+        recurrenceId = p.value.trim();
+        break;
+      case "STATUS":
+        if (p.value.trim().toUpperCase() === "CANCELLED") cancelled = true;
+        break;
+      case "SEQUENCE":
+      case "DTSTAMP":
+        break;
+      // accepted, unused (§3.1)
+      default:
+        skipped.push({ kind: "property", detail: `${p.name} not supported \u2014 ignored` });
+    }
+  }
+  if (!uid) {
+    skipped.push({ kind: "VEVENT", detail: "VEVENT without UID ignored" });
+    return null;
+  }
+  if (!dtstart) {
+    skipped.push({ kind: "VEVENT", detail: `VEVENT ${uid || "(duplicate)"} without DTSTART ignored` });
+    return null;
+  }
+  const allDay = dtstart.params.match(/VALUE=DATE(?![T])/i) !== null || /^\d{8}$/.test(dtstart.value.trim());
+  let startDate = null;
+  let endDate = null;
+  let utcStartMs = null;
+  let utcEndMs = null;
+  let tzId = null;
+  let startWall = null;
+  let endWall = null;
+  const tzParam = /TZID=([^;:]+)/i.exec(dtstart.params)?.[1]?.trim() ?? null;
+  if (allDay) {
+    startDate = dateFromIcs(dtstart.value);
+    if (!startDate) {
+      skipped.push({ kind: "VEVENT", detail: `VEVENT ${uid} has malformed all-day DTSTART \u2014 ignored` });
+      return null;
+    }
+    endDate = dtend ? inclusiveEndFromExclusive(dateFromIcs(dtend.value)) : startDate;
+  } else {
+    const knownTz = tzParam !== null && isIANAZoneGuard(tzParam);
+    if (tzParam !== null && !knownTz) {
+      skipped.push({ kind: "timezone", detail: `TZID "${tzParam}" unknown \u2014 falling back to UTC` });
+    }
+    tzId = knownTz ? tzParam : null;
+    const s = parseDateTime(dtstart.value, tzId);
+    const e = dtend ? parseDateTime(dtend.value, tzId) : null;
+    if (s === null) {
+      skipped.push({ kind: "VEVENT", detail: `VEVENT ${uid} has malformed DTSTART \u2014 ignored` });
+      return null;
+    }
+    utcStartMs = s;
+    utcEndMs = e ?? s;
+    if (tzId) {
+      startWall = wallFromUtc(utcStartMs, tzId);
+      endWall = wallFromUtc(utcEndMs, tzId);
+    }
+  }
+  return {
+    uid,
+    summary,
+    description,
+    allDay,
+    startDate,
+    endDate,
+    utcStartMs,
+    utcEndMs,
+    tzId,
+    startWall,
+    endWall,
+    rrule,
+    recurrenceId,
+    cancelled
+  };
+}
+function dateFromIcs(v) {
+  const m = /^(\d{4})(\d{2})(\d{2})/.exec(v.trim().replace(/-/g, ""));
+  if (!m) return null;
+  return `${m[1]}-${m[2]}-${m[3]}`;
+}
+function inclusiveEndFromExclusive(excl) {
+  if (!excl) return "";
+  const [y, m, d] = excl.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() - 1);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${dt.getUTCFullYear()}-${p(dt.getUTCMonth() + 1)}-${p(dt.getUTCDate())}`;
+}
+function parseDateTime(v, tzId) {
+  const m = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})?(Z)?$/.exec(v.trim());
+  if (!m) return null;
+  const [, Y, Mo, D, H, Mi, S, Z] = m;
+  const utcMs = Date.UTC(+Y, +Mo - 1, +D, +H, +Mi, S ? +S : 0);
+  if (!Number.isFinite(utcMs)) return null;
+  if (Z) return utcMs;
+  if (!tzId) return utcMs;
+  const withOffset = zonedEpoch(utcMs, tzId);
+  return withOffset;
+}
+function zonedEpoch(naiveUtcMs, tz) {
+  const off1 = tzOffsetMs2(naiveUtcMs, tz);
+  const corrected = naiveUtcMs - off1;
+  const off2 = tzOffsetMs2(corrected, tz);
+  return off1 === off2 ? corrected : naiveUtcMs - off2;
+}
+function tzOffsetMs2(utcMs, tz) {
+  try {
+    const t = Math.floor(utcMs / 1e3) * 1e3;
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: tz,
+      hour12: false,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit"
+    }).formatToParts(new Date(t));
+    const get2 = (type) => Number(parts.find((x) => x.type === type)?.value);
+    return Date.UTC(get2("year"), get2("month") - 1, get2("day"), get2("hour") % 24, get2("minute"), get2("second")) - t;
+  } catch {
+    return NaN;
+  }
+}
+function wallFromUtc(utcMs, tz) {
+  const p = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    hour12: false,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit"
+  }).formatToParts(new Date(utcMs));
+  const get2 = (t) => p.find((x) => x.type === t)?.value ?? "00";
+  return `${get2("hour") === "24" ? "00" : get2("hour")}:${get2("minute")}:${get2("second")}`;
+}
+function unescapeText(v) {
+  let out = "";
+  for (let i = 0; i < v.length; i++) {
+    const c = v[i];
+    if (c === "\\" && i + 1 < v.length) {
+      const n = v[++i];
+      if (n === "n" || n === "N") out += "\n";
+      else if (n === ";" || n === "," || n === "\\") out += n;
+      else out += n;
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+var TIDE_ID_RE = /^evt-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function tzByBaseOf(existing, uid) {
+  return existing.tzByBase.get(uid) ?? null;
+}
+function zonedEpochFromWall(anchorMs, wall, tz) {
+  const localDate = localDateOf2(anchorMs, tz);
+  return zonedEpochFromParts(localDate, wall, tz);
+}
+function zonedEpochFromParts(dateStr, wall, tz) {
+  const [h2, m, s] = wall.split(":").map(Number);
+  const naive = Date.parse(`${dateStr}T${String(h2).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s ?? 0).padStart(2, "0")}Z`);
+  if (!Number.isFinite(naive)) return NaN;
+  const off1 = tzOffsetMs2(naive, tz);
+  const corrected = naive - off1;
+  const off2 = tzOffsetMs2(corrected, tz);
+  return off1 === off2 ? corrected : naive - off2;
+}
+function localDateOf2(utcMs, tz) {
+  try {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: tz,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    }).formatToParts(new Date(utcMs));
+    const get2 = (t) => parts.find((x) => x.type === t)?.value ?? "";
+    return `${get2("year")}-${get2("month")}-${get2("day")}`;
+  } catch {
+    return new Date(utcMs).toISOString().slice(0, 10);
+  }
+}
+function allDayStartMs(dateStr) {
+  return (/* @__PURE__ */ new Date(`${dateStr}T00:00:00`)).getTime();
+}
+function allDayEndMs(dateStr) {
+  return (/* @__PURE__ */ new Date(`${dateStr}T23:59:59.999`)).getTime();
+}
+function planImport(parsed, existing) {
+  const notices = [];
+  const actions = [];
+  const uidToEventId = /* @__PURE__ */ new Map();
+  const seriesBaseEventIds = /* @__PURE__ */ new Set();
+  const plannedSeries = /* @__PURE__ */ new Map();
+  const skippedUids = /* @__PURE__ */ new Set();
+  for (const e of parsed.events) {
+    if (e.recurrenceId !== null) continue;
+    if (e.duplicate) {
+      actions.push({ kind: "skip", uid: e.uid, reason: "duplicate UID in file \u2014 occurrence after the first skipped" });
+      continue;
+    }
+    planSingle(e, false);
+  }
+  for (const e of parsed.events) {
+    if (e.duplicate) {
+      notices.push(`duplicate UID "${e.uid}" in file \u2014 occurrence after the first skipped`);
+    }
+  }
+  const seenOverrides = /* @__PURE__ */ new Set();
+  for (const e of parsed.events) {
+    if (e.recurrenceId === null) continue;
+    if (e.duplicate) continue;
+    const key = `${e.uid}|${e.recurrenceId}`;
+    if (seenOverrides.has(key)) {
+      notices.push(`duplicate override for UID "${e.uid}" RECURRENCE-ID ${e.recurrenceId} \u2014 occurrence after the first skipped`);
+      continue;
+    }
+    seenOverrides.add(key);
+    const base = e.uid ? plannedSeries.get(e.uid) : void 0;
+    const basePlanned = base !== void 0 || existing.liveIds.has(e.uid);
+    if (!basePlanned) {
+      actions.push({
+        kind: "skip",
+        uid: e.uid,
+        reason: `override for UID "${e.uid}" has no importable series base`
+      });
+      continue;
+    }
+    let startWall = e.startWall;
+    let endWall = e.endWall;
+    let overrideTz = e.tzId;
+    if (!e.allDay && startWall === null && e.utcStartMs != null) {
+      const baseTz = base?.tzId ?? existing.tzByBase.get(e.uid) ?? null;
+      const zone = baseTz ?? null;
+      startWall = wallFromUtc(e.utcStartMs, zone ?? "UTC");
+      endWall = wallFromUtc(e.utcEndMs, zone ?? "UTC");
+      overrideTz = zone;
+      if (zone === null) {
+        notices.push(
+          `UID "${e.uid}": override ${e.recurrenceId} has UTC-form times \u2014 imported as UTC walls (no zone available)`
+        );
+      }
+    }
+    if (!e.allDay && startWall !== null && e.tzId !== null && base?.tzId !== void 0 && base?.tzId !== null && overrideTz !== null && overrideTz !== base.tzId) {
+      const absolute = zonedEpochFromWall(e.utcStartMs, startWall, overrideTz);
+      startWall = wallFromUtc(absolute, base.tzId);
+      endWall = wallFromUtc(absolute + (e.utcEndMs - e.utcStartMs), base.tzId);
+      overrideTz = base.tzId;
+      notices.push(
+        `UID "${e.uid}": override ${e.recurrenceId} TZID "${e.tzId}" differs from the series zone "${base.tzId}" \u2014 times re-expressed in the series zone`
+      );
+    }
+    actions.push({
+      kind: "override",
+      uid: e.uid,
+      seriesId: base?.seriesId ?? existing.seriesByBase.get(e.uid) ?? null,
+      eventId: base?.eventId ?? e.uid,
+      recurrenceId: e.recurrenceId,
+      cancelled: e.cancelled,
+      title: e.summary !== "" ? e.summary : null,
+      startWall,
+      endWall
+    });
+  }
+  return { plan: { actions }, notices };
+  function planSingle(e, isDuplicate) {
+    if (e.uid === "" || skippedUids.has(e.uid)) return;
+    if (existing.tombstonedIds.has(e.uid)) {
+      actions.push({ kind: "skip", uid: e.uid, reason: "matches a tombstoned (deleted) entity \u2014 never resurrected" });
+      skippedUids.add(e.uid);
+      return;
+    }
+    const match = existing.liveIds.has(e.uid);
+    const canonical = TIDE_ID_RE.test(e.uid);
+    let startMs;
+    let endMs;
+    if (e.allDay) {
+      startMs = allDayStartMs(e.startDate);
+      endMs = allDayEndMs(e.endDate ?? e.startDate);
+    } else {
+      startMs = e.utcStartMs;
+      endMs = e.utcEndMs;
+    }
+    let rrule = null;
+    if (e.rrule) {
+      try {
+        rrule = validateRRule(e.rrule, "import_ics");
+      } catch {
+        rrule = null;
+        notices.push(
+          `UID "${e.uid}": RRULE "${e.rrule}" is outside Tide's supported subset \u2014 imported as a NON-RECURRING single event (recurrence simplified/lost)`
+        );
+      }
+    }
+    if (match) {
+      const seriesId = existing.seriesByBase.get(e.uid);
+      if (rrule !== null || seriesId !== void 0) {
+        if (seriesId === void 0) {
+          actions.push({ kind: "skip", uid: e.uid, reason: "existing event is a plain event but file has an RRULE \u2014 mixed identity not supported in v1" });
+          skippedUids.add(e.uid);
+          return;
+        }
+        plannedSeries.set(e.uid, { seriesId, eventId: e.uid, tzId: tzByBaseOf(existing, e.uid) });
+        seriesBaseEventIds.add(e.uid);
+        uidToEventId.set(e.uid, e.uid);
+        actions.push({
+          kind: "update_series_base",
+          uid: e.uid,
+          eventId: e.uid,
+          title: e.summary,
+          description: e.description,
+          startMs,
+          endMs,
+          allDay: e.allDay,
+          rrule: rrule ?? ""
+        });
+        return;
+      }
+      uidToEventId.set(e.uid, e.uid);
+      actions.push({
+        kind: "update_event",
+        uid: e.uid,
+        eventId: e.uid,
+        title: e.summary,
+        description: e.description,
+        startMs,
+        endMs,
+        allDay: e.allDay
+      });
+      return;
+    }
+    const eventId = canonical ? e.uid : `evt-${randomUUID3()}`;
+    if (!canonical) {
+      notices.push(`UID "${e.uid}" is a foreign id \u2014 imported with a fresh Tide event_id (foreign UID not persisted; re-importing this file will duplicate it)`);
+    }
+    uidToEventId.set(e.uid, eventId);
+    if (rrule !== null) {
+      plannedSeries.set(e.uid, { seriesId: null, eventId, tzId: e.tzId });
+      actions.push({
+        kind: "create_series_base",
+        uid: e.uid,
+        eventId,
+        allDay: e.allDay,
+        title: e.summary,
+        description: e.description,
+        startMs,
+        endMs,
+        rrule
+      });
+      return;
+    }
+    actions.push({
+      kind: "create_event",
+      uid: e.uid,
+      eventId,
+      allDay: e.allDay,
+      title: e.summary,
+      description: e.description,
+      startMs,
+      endMs,
+      rrule: null
+    });
+  }
+}
+function buildExistingIndex(core) {
+  const liveIds = /* @__PURE__ */ new Set();
+  for (const e of core.listEvents()) liveIds.add(e.id);
+  const tombstonedIds = new Set(
+    core.db.prepare(
+      "SELECT DISTINCT entity_id FROM entities_tombstones WHERE entity_type IN ('event','series')"
+    ).all().map((r) => r.entity_id)
+  );
+  const history = core.db.prepare(
+    `SELECT entity_id, operation FROM changes
+       WHERE entity_type IN ('event','series')
+       ORDER BY hlc_timestamp ASC`
+  ).all();
+  const lastOp = /* @__PURE__ */ new Map();
+  for (const row of history) lastOp.set(row.entity_id, row.operation);
+  for (const [entityId, op] of lastOp) {
+    if (op === "remove") {
+      tombstonedIds.add(entityId);
+      liveIds.delete(entityId);
+    }
+  }
+  const seriesByBase = new Map(
+    core.listSeries().map((s) => [s.baseEventId, s.seriesId])
+  );
+  const tzRows = core.db.prepare(
+    "SELECT event_id, tz_id FROM events WHERE event_id IN (SELECT base_event_id FROM series)"
+  ).all();
+  const tzByBase = /* @__PURE__ */ new Map();
+  for (const row of tzRows) {
+    if (row.tz_id) tzByBase.set(row.event_id, row.tz_id);
+  }
+  return { liveIds, tombstonedIds, seriesByBase, tzByBase };
+}
+function applyImportPlan(core, plan) {
+  const report = { created: [], updated: [], skipped: [], failed: [], notices: [] };
+  for (const a of plan.actions) {
+    try {
+      switch (a.kind) {
+        case "skip": {
+          report.skipped.push({ uid: a.uid, reason: a.reason });
+          break;
+        }
+        case "create_event": {
+          const isCanonical = /^evt-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(a.eventId);
+          if (isCanonical) {
+            core.createEventWithId(a.eventId, {
+              title: a.title,
+              description: a.description,
+              startMs: a.startMs,
+              endMs: a.endMs,
+              allDay: a.allDay
+            });
+          } else {
+            core.createEvent({
+              title: a.title,
+              description: a.description,
+              startMs: a.startMs,
+              endMs: a.endMs,
+              allDay: a.allDay
+            });
+          }
+          report.created.push(a.uid);
+          break;
+        }
+        case "update_event": {
+          core.updateEvent(a.eventId, {
+            title: a.title,
+            description: a.description,
+            startMs: a.startMs,
+            endMs: a.endMs,
+            allDay: a.allDay
+          });
+          report.updated.push(a.uid);
+          break;
+        }
+        case "create_series_base": {
+          const isCanonical = /^evt-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(a.eventId);
+          const input = {
+            title: a.title,
+            description: a.description,
+            startMs: a.startMs,
+            endMs: a.endMs,
+            allDay: a.allDay,
+            recurrenceRule: a.rrule
+          };
+          if (isCanonical) {
+            core.createEventWithId(a.eventId, input);
+          } else {
+            core.createEvent(input);
+          }
+          report.created.push(a.uid);
+          break;
+        }
+        case "update_series_base": {
+          core.updateEvent(a.eventId, {
+            title: a.title,
+            description: a.description,
+            startMs: a.startMs,
+            endMs: a.endMs,
+            allDay: a.allDay
+          });
+          if (a.rrule !== "") {
+            const series = core.listSeries().find((s) => s.baseEventId === a.eventId);
+            if (series && series.recurrenceRule !== a.rrule) {
+              core.updateSeriesRule(series.seriesId, a.rrule);
+            }
+          }
+          report.updated.push(a.uid);
+          break;
+        }
+        case "override": {
+          const seriesId = a.seriesId ?? core.listSeries().find((s) => s.baseEventId === a.eventId)?.seriesId;
+          if (!seriesId) {
+            throw new Error(`override: no series found for base ${a.eventId}`);
+          }
+          core.updateOccurrence(seriesId, a.recurrenceId, {
+            ...a.cancelled ? { cancelled: true } : {},
+            ...a.title !== null ? { title: a.title } : {},
+            ...a.startWall !== null ? { start_wall: a.startWall } : {},
+            ...a.endWall !== null ? { end_wall: a.endWall } : {}
+          });
+          report.updated.push(a.uid);
+          break;
+        }
+      }
+    } catch (err2) {
+      report.failed.push({ uid: a.uid, reason: err2 instanceof Error ? err2.message : String(err2) });
+    }
+  }
+  return report;
 }
 
 // src/network/pairing_manager.ts
@@ -8762,6 +9810,35 @@ function makeDispatcher(core, sync) {
     switch (op) {
       case "ping":
         return { pong: true, device_id: core.selfDeviceId };
+      // DC-18 §5: export_ics is its own typed surface op (NOT part of the
+      // sync_op allow-list semantics — registered here and in lib.rs's
+      // ALLOWED list for the passthrough, mirroring the event-CRUD pattern).
+      // READ-ONLY: buildExportInput is pure SELECT; the exporter is a pure
+      // function; file placement happens in the shell, not here.
+      case "export_ics": {
+        if (args.now_ms !== void 0 && args.now_ms !== null && typeof args.now_ms !== "number") {
+          fail("export_ics: args.now_ms must be a number or null");
+        }
+        const nowMs = typeof args.now_ms === "number" && Number.isFinite(args.now_ms) ? Math.trunc(args.now_ms) : Date.now();
+        const input = buildExportInput(core, nowMs);
+        return { ics: exportToIcs(input) };
+      }
+      // DC-23 §6: import_ics — the applier runs INSIDE the sidecar (EventCore
+      // lives here). The shell reads the file and passes the TEXT; the
+      // importer stays fs-free. Report JSON is the truth surface.
+      case "import_ics": {
+        if (typeof args.ics_text !== "string") {
+          fail("import_ics: args.ics_text must be the raw .ics file text");
+        }
+        if (args.ics_text.length > 8 * 1024 * 1024) {
+          fail("import_ics: ics_text exceeds the 8 MiB bound");
+        }
+        const existingIndex = buildExistingIndex(core);
+        const { plan, notices } = planImport(parseIcs(args.ics_text), existingIndex);
+        const report = applyImportPlan(core, plan);
+        report.notices.push(...notices);
+        return { report };
+      }
       case "list_events": {
         const { from_ms: f, to_ms: t } = args;
         for (const [k, v] of [
