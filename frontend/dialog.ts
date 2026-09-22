@@ -621,7 +621,17 @@ export function initDialog(): void {
   // recurrence at the edited occurrence (TD-016 owner semantics, 2026-09-02)
   // — the rule is terminated via UNTIL, nothing is deleted.
   field("ev-repeat-on").addEventListener("change", () => {
-    if (!repeatOn()) clearRuleDraft();
+    if (repeatOn()) {
+      // Owner UX rule (2026-09-22): a checked "Repeat" box must never sit
+      // next to a dropdown reading "Does not repeat" — that combination is
+      // contradictory. The cleared draft starts at DAILY; the user picks a
+      // different FREQ from there if they want one.
+      if (field<HTMLSelectElement>("ev-repeat").value === "NONE") {
+        field<HTMLSelectElement>("ev-repeat").value = "DAILY";
+      }
+    } else {
+      clearRuleDraft();
+    }
     syncRepeatVisibility();
   });
   // Mandatory end date: editing it refreshes the live preview.

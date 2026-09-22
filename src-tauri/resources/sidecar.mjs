@@ -10,7 +10,7 @@ import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 
 // src/persistence/schema.ts
-var SCHEMA_VERSION = 7;
+var SCHEMA_VERSION = 8;
 var DDL = `
 CREATE TABLE calendars (
     calendar_id   TEXT PRIMARY KEY,
@@ -636,6 +636,24 @@ function initializeSchema(db) {
           db.exec("ALTER TABLE events ADD COLUMN all_day_reminder_time TEXT");
         }
       }
+      if (row.version < 8) {
+        const hasEvents = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").get() !== void 0;
+        if (hasEvents) {
+          db.exec(`
+            UPDATE events SET
+              end_date = strftime('%Y-%m-%d', (utc_end_ms - 1) / 1000, 'unixepoch', 'localtime')
+            WHERE all_day = 1
+              AND utc_end_ms IS NOT NULL
+              AND utc_end_ms > 0
+              AND end_date IS NOT NULL
+              AND end_date != strftime('%Y-%m-%d', (utc_end_ms - 1) / 1000, 'unixepoch', 'localtime')
+              -- Safety: never let the re-derivation move end_date BEFORE
+              -- start_date (legacy shell-store rows carry utc_* = 0 and their
+              -- truth lives in the date columns themselves).
+              AND strftime('%Y-%m-%d', (utc_end_ms - 1) / 1000, 'unixepoch', 'localtime') >= start_date;
+          `);
+        }
+      }
       db.prepare("UPDATE schema_version SET version = ?").run(SCHEMA_VERSION);
     });
     tx();
@@ -1252,6 +1270,9 @@ function localWallStr(ms) {
   const p = (n) => String(n).padStart(2, "0");
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
+function inclusiveEndDateFromExclusiveMs(endMs) {
+  return localDateStr(endMs - 1);
+}
 function timezoneId() {
   try {
     return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
@@ -1344,9 +1365,9 @@ function validateRRule(rule, op) {
         break;
       }
       case "UNTIL": {
-        if (!/^\d{8}$/.test(value)) {
+        if (!/^\d{8}$/.test(value) && !/^\d{8}T\d{6}Z$/.test(value)) {
           throw new Error(
-            `${op}: recurrence_rule UNTIL "${value}" must be the form YYYYMMDD`
+            `${op}: recurrence_rule UNTIL "${value}" must be YYYYMMDD or YYYYMMDDTHHMMSSZ (RFC 5545 \xA73.3.10)`
           );
         }
         break;
@@ -1988,7 +2009,7 @@ function derivedScheduleColumns(e) {
   return {
     all_day: e.allDay ? 1 : 0,
     start_date: e.allDay ? localDateStr(e.startMs) : null,
-    end_date: e.allDay ? localDateStr(Math.max(e.endMs, e.startMs)) : null,
+    end_date: e.allDay ? inclusiveEndDateFromExclusiveMs(Math.max(e.endMs, e.startMs)) : null,
     start_wall: e.allDay ? null : localWallStr(e.startMs),
     end_wall: e.allDay ? null : localWallStr(e.endMs),
     tz_id: e.allDay ? null : timezoneId(),
@@ -5748,12 +5769,42 @@ function exportToIcs(input) {
   lines.push("END:VCALENDAR");
   return lines.map(foldLine).join("\r\n") + "\r\n";
 }
+function conformRRule(rule, e) {
+  if (e.all_day) return rule;
+  const m = rule.match(/(^|;)UNTIL=(\d{8})(;|$)/i);
+  if (!m) return rule;
+  const tz = isIANAZone(e.tz_id) ? e.tz_id : "UTC";
+  const startLocal = localWallStamp(e.utc_start_ms ?? 0, tz);
+  const hh = Number(startLocal.slice(9, 11));
+  const mi = Number(startLocal.slice(11, 13));
+  const ss = Number(startLocal.slice(13, 15));
+  const untilDate = m[2];
+  const [y, mo, d] = [Number(untilDate.slice(0, 4)), Number(untilDate.slice(4, 6)), Number(untilDate.slice(6, 8))];
+  const utcMs = wallToUtcMs(Date.UTC(y, mo - 1, d), hh, mi, ss, tz);
+  const replaced = rule.replace(
+    m[0],
+    `${m[1]}UNTIL=${utcStamp(utcMs)}${m[3]}`
+  );
+  return replaced;
+}
+function wallToUtcMs(localMidnightUtcMs, hh, mi, ss, tz) {
+  const targetWall = localMidnightUtcMs + (hh * 36e5 + mi * 6e4 + ss * 1e3);
+  let u = localMidnightUtcMs - tzOffsetMs(localMidnightUtcMs, tz) + (targetWall - localMidnightUtcMs);
+  for (let i = 0; i < 8; i++) {
+    const next = targetWall - tzOffsetMs(u, tz);
+    if (next === u) break;
+    u = next;
+  }
+  return u;
+}
 function vevent(e, calTitle, dtstamp, recurrenceRule) {
   const lines = ["BEGIN:VEVENT"];
   lines.push(`UID:${escapeText(e.event_id)}`);
   lines.push(`DTSTAMP:${dtstamp}`);
   lines.push(`SEQUENCE:0`);
-  if (recurrenceRule !== void 0) lines.push(`RRULE:${recurrenceRule}`);
+  if (recurrenceRule !== void 0) {
+    lines.push(`RRULE:${conformRRule(recurrenceRule, e)}`);
+  }
   const anomalies = [];
   if (e.all_day) {
     if (!e.start_date || !e.end_date) {
