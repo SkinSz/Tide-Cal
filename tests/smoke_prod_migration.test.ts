@@ -32,9 +32,9 @@ describe("runtime migration proof on a copy of the real production DB", () => {
       expect(core.reminderFor(first.id)).toEqual({ minutesBefore: 15, enabled: true });
       core.clearReminder(first.id);
       expect(core.reminderFor(first.id)).toBeNull();
-      // Schema at 7.
+      // Schema at 8 (v8 = GATE-2026-09-22 all-day end_date repair).
       const v = (core.db.prepare("SELECT version FROM schema_version").get() as { version: number }).version;
-      expect(v).toBe(7);
+      expect(v).toBe(8);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

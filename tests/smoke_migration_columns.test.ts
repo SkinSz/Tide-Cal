@@ -34,7 +34,7 @@ describe("smoke round 5: v7 migration repairs existing DBs (reminders.enabled, e
     expect(remCols).toContain("enabled");
     const evCols = db.prepare("PRAGMA table_info(events)").all().map((c: any) => c.name);
     expect(evCols).toContain("all_day_reminder_time");
-    expect(db.prepare("SELECT version FROM schema_version").get() as { version: number }).toEqual({ version: 7 });
+    expect(db.prepare("SELECT version FROM schema_version").get() as { version: number }).toEqual({ version: 8 });
     db.close();
   });
 

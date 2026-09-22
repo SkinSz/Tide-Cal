@@ -29,7 +29,7 @@ test("v6-stamped prod copy migrates: reminders.enabled + events.all_day_reminder
     const evCols = (db.prepare("PRAGMA table_info(events)").all() as Array<{ name: string }>).map((c) => c.name);
     expect(evCols).toContain("all_day_reminder_time");
     const v = db.prepare("SELECT version FROM schema_version").get() as { version: number };
-    expect(v.version).toBe(7);
+    expect(v.version).toBe(8);
     db.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });

@@ -2,7 +2,7 @@
 // One source of truth for table creation. Encryption-at-rest is applied at
 // connection level (SQLCipher key pragma) by the caller, not here.
 
-export const SCHEMA_VERSION = 7; // v2: TD-001 skipped_seqs; v3: TD-005 quarantine lifecycle (resolved_at_hlc, resolved_reason); v4: TD-006/DC-16 hard_blocks + peer_invalid_tally; v5: TD-005 quarantine_prune_stats (retention-cap bookkeeping); v6: Pkg1 entity_versions (durable per-entity version vectors, compaction-proof snapshots); v7: DC-21 peers.last_endpoint_host/port/seen (non-authoritative last-known endpoints)
+export const SCHEMA_VERSION = 8; // v2: TD-001 skipped_seqs; v3: TD-005 quarantine lifecycle (resolved_at_hlc, resolved_reason); v4: TD-006/DC-16 hard_blocks + peer_invalid_tally; v5: TD-005 quarantine_prune_stats (retention-cap bookkeeping); v6: Pkg1 entity_versions (durable per-entity version vectors, compaction-proof snapshots); v7: DC-21 peers.last_endpoint_host/port/seen (non-authoritative last-known endpoints); v8: GATE-2026-09-22 all-day end_date repair (exclusive-ms -> inclusive date, DC-07 'inclusive' semantics restored; no DDL change, data-only)
 
 export const DDL = `
 CREATE TABLE calendars (

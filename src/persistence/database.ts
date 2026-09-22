@@ -199,6 +199,38 @@ function initializeSchema(db: Database.Database): void {
           db.exec("ALTER TABLE events ADD COLUMN all_day_reminder_time TEXT");
         }
       }
+      if (row!.version < 8) {
+        // GATE-2026-09-22 all-day end_date repair (data-only, no DDL).
+        // derivedScheduleColumns derived the INCLUSIVE end_date column
+        // (DC-07: "inclusive, when all_day=1") from the EXCLUSIVE endMs
+        // instant (wholeDay stores next local midnight), writing the day
+        // AFTER the real last covered day. A 1-day all-day event stored
+        // start=Oct1/end=Oct2 and exported as a 2-day DTEND range into
+        // Google. The write seam is fixed (inclusiveEndDateFromExclusiveMs);
+        // this migration re-derives existing rows from the authoritative
+        // utc_end_ms (ms convention unchanged: exclusive endMs, and the
+        // importer's 23:59:59.999 form is idempotent under -1ms).
+        // Guarded: minimal hand-built test DBs may not carry the events
+        // table at all (early-version migration tests).
+        const hasEvents = db
+          .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'")
+          .get() !== undefined;
+        if (hasEvents) {
+          db.exec(`
+            UPDATE events SET
+              end_date = strftime('%Y-%m-%d', (utc_end_ms - 1) / 1000, 'unixepoch', 'localtime')
+            WHERE all_day = 1
+              AND utc_end_ms IS NOT NULL
+              AND utc_end_ms > 0
+              AND end_date IS NOT NULL
+              AND end_date != strftime('%Y-%m-%d', (utc_end_ms - 1) / 1000, 'unixepoch', 'localtime')
+              -- Safety: never let the re-derivation move end_date BEFORE
+              -- start_date (legacy shell-store rows carry utc_* = 0 and their
+              -- truth lives in the date columns themselves).
+              AND strftime('%Y-%m-%d', (utc_end_ms - 1) / 1000, 'unixepoch', 'localtime') >= start_date;
+          `);
+        }
+      }
       db.prepare("UPDATE schema_version SET version = ?").run(SCHEMA_VERSION);
     });
     tx();
