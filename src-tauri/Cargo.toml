@@ -1,6 +1,6 @@
 [package]
 name = "tide"
-version = "0.1.0"
+version = "0.1.1"
 description = "Tide — local-first calendar with encrypted sync"
 authors = ["SkinS / Tide Project"]
 license = "LicenseRef-Tide-Source-Available-Non-Commercial"
