@@ -512,6 +512,80 @@ async fn update_occurrence(
     .map_err(|e| format!("join sidecar task: {e}"))?
 }
 
+// ---------------------------------------------------------------------------
+// DC-18: .ics export (§5 implementation boundary). The exporter lives in the
+// sidecar (src/interop/ics_export.ts, pure function); the shell command
+// reads the produced bytes and places the file — the exporter itself stays
+// fs-free. Not a sync surface op: its own typed command, mirroring the
+// event-CRUD pattern. §2.1 user-invoked only; there is no background export.
+// ---------------------------------------------------------------------------
+
+#[tauri::command(rename_all = "snake_case")]
+async fn export_ics(
+    sc: State<'_, SidecarState>,
+    target_path: String,
+) -> Result<u64, String> {
+    let handle = sidecar_handle(&sc)?;
+    let bytes = tauri::async_runtime::spawn_blocking(move || {
+        proxy(&handle, "export_ics", json!({ "now_ms": null }))
+    })
+    .await
+    .map_err(|e| format!("join sidecar task: {e}"))?
+    .and_then(|v| {
+        v.get("ics")
+            .and_then(|s| s.as_str())
+            .map(String::from)
+            .ok_or_else(|| "sidecar export_ics returned no ics field".to_string())
+    })?;
+    // §2.4 file save via the OS save dialog is UI plumbing (frontend); this
+    // command writes exactly where the user chose. Refuse empty paths and a
+    // non-existent target directory (save-dialog paths always exist).
+    if target_path.trim().is_empty() {
+        return Err("export_ics: target_path must be non-empty".into());
+    }
+    if let Some(parent) = std::path::Path::new(&target_path).parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            return Err(format!(
+                "export_ics: target directory does not exist: {}",
+                parent.display()
+            ));
+        }
+    }
+    std::fs::write(&target_path, bytes.as_bytes())
+        .map(|_| bytes.len() as u64)
+        .map_err(|e| format!("export_ics: write failed: {e}"))
+}
+
+/// DC-23 §8: import plumbing. The shell reads the chosen file (OS open
+/// dialog lives in the frontend via the approved dialog plugin) and passes
+/// the TEXT to the sidecar op `import_ics` — the importer stays fs-free.
+/// The sidecar's ImportReport JSON is returned verbatim as the truth surface.
+#[tauri::command(rename_all = "snake_case")]
+async fn import_ics(
+    sc: State<'_, SidecarState>,
+    source_path: String,
+) -> Result<serde_json::Value, String> {
+    if source_path.trim().is_empty() {
+        return Err("import_ics: source_path must be non-empty".into());
+    }
+    let meta = std::fs::metadata(&source_path)
+        .map_err(|e| format!("import_ics: cannot read {source_path}: {e}"))?;
+    if meta.len() > 8 * 1024 * 1024 {
+        return Err(format!(
+            "import_ics: file too large ({} bytes > 8 MiB bound)",
+            meta.len()
+        ));
+    }
+    let text = std::fs::read_to_string(&source_path)
+        .map_err(|e| format!("import_ics: read failed: {e}"))?;
+    let handle = sidecar_handle(&sc)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        proxy(&handle, "import_ics", json!({ "ics_text": text }))
+    })
+    .await
+    .map_err(|e| format!("join sidecar task: {e}"))?
+}
+
 #[tauri::command]
 async fn sync_op(
     sc: State<'_, SidecarState>,
@@ -869,6 +943,9 @@ pub fn run() {
     // XWayland (`GDK_BACKEND=x11` in the launch environment) or by
     // double-clicking the titlebar once (the buttons then keep working).
     tauri::Builder::default()
+        // DC-18 §2.4: export file placement via the OS save dialog (plugin
+        // provides the dialog; the exporter itself stays fs/pure, §5).
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // Runtime window icon: in a dev launch (cargo run) nothing else
             // sets the GTK window icon, so the taskbar falls back to the
@@ -1090,7 +1167,9 @@ pub fn run() {
             clear_reminder,
             list_series,
             update_series_rule,
-            update_occurrence
+            update_occurrence,
+            export_ics,
+            import_ics
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

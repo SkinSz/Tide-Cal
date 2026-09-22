@@ -79,6 +79,20 @@ function localWallStr(ms: number): string {
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
+/**
+ * All-day end_date derivation (GATE-2026-09-22, DC-07 'inclusive' restored).
+ * The ms convention is EXCLUSIVE (wholeDay stores endMs = next local
+ * midnight; grid/reminder code already uses `endMs - 1`). The
+ * `end_date` column is INCLUSIVE (DC-07 line 109) — the LAST covered day.
+ * Deriving the date from the exclusive instant wrote the next day's date
+ * (a 1-day event stored `start=end+1`), which then exported as a 2-day
+ * DTEND range into Google Calendar. Subtract 1 ms before taking the local
+ * date. 23:59:59.999-style rows (importer) are unchanged by the -1ms.
+ */
+function inclusiveEndDateFromExclusiveMs(endMs: number): string {
+  return localDateStr(endMs - 1);
+}
+
 function timezoneId(): string {
   try {
     return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
@@ -259,9 +273,15 @@ export function validateRRule(rule: unknown, op: string): string {
         break;
       }
       case "UNTIL": {
-        if (!/^\d{8}$/.test(value)) {
+        // Two RFC 5545-legal forms (GATE-2026-09-22 widening, owner-approved):
+        // `YYYYMMDD` (Tide's storage canon, DTSTART=DATE series) and
+        // `YYYYMMDDTHHMMSSZ` (required by RFC §3.3.10 when DTSTART is a
+        // DATE-TIME — e.g. re-importing a Tide-exported / Google-written
+        // timed series). Both are form-checked; nothing is loosened.
+        if (!/^\d{8}$/.test(value) && !/^\d{8}T\d{6}Z$/.test(value)) {
           throw new Error(
-            `${op}: recurrence_rule UNTIL "${value}" must be the form YYYYMMDD`,
+            `${op}: recurrence_rule UNTIL "${value}" must be YYYYMMDD or ` +
+              `YYYYMMDDTHHMMSSZ (RFC 5545 §3.3.10)`,
           );
         }
         break;
@@ -520,7 +540,7 @@ export class EventCore {
     // M-1/BND-01: identity is core-owned. Explicit field pick instead of
     // `{id, ...input}` so a client-injected `input.id` can never override
     // the generated id even if the dispatcher guard were bypassed.
-    assertNoInjectedId(input, "create");
+    assertNoInjectedId(input, "create"); // same guard, importer path
     // DC-12 §2.1: validate the RRULE BEFORE any write so an invalid rule
     // leaves rows + change log byte-identical (no orphan series, no event).
     const rule =
@@ -559,6 +579,81 @@ export class EventCore {
     // The series row + its change record land in a SECOND T1 (separate entity:
     // the rule is its own conflict entity, DC-12 §3) only after the event
     // write succeeded — a failed event create never leaves a dangling series.
+    if (rule !== undefined) {
+      const seriesId = `ser-${randomUUID()}`;
+      const seriesHlc = this.hlc.now();
+      createLocalChange(
+        this.db,
+        this.deviceId,
+        {
+          entity_id: seriesId,
+          entity_type: "series",
+          field_path: "recurrence_rule",
+          operation: "set",
+          payload: { value: rule },
+          hlc_now: () => seriesHlc,
+        },
+        (db) => {
+          db.prepare(
+            `INSERT INTO series (series_id, base_event_id, recurrence_rule, created_hlc, updated_hlc)
+             VALUES (?, ?, ?, ?, ?)`,
+          ).run(seriesId, event.id, rule, seriesHlc, seriesHlc);
+        },
+      );
+    }
+    return event;
+  }
+
+  /**
+   * DC-23 §4 Case B: create an event with a CALLER-SUPPLIED canonical Tide
+   * id (import identity resolution). Same T1/validation machinery as
+   * createEvent — the ONLY difference is the id source. Guard: the id must
+   * match the canonical evt-<uuid> shape AND not already exist (a collision
+   * is a hard error, never a silent upsert). Non-canonical ids are refused
+   * here so the M-1 invariant (core-owned identity) keeps holding for the
+   * ordinary createEvent path — this method exists for the importer only
+   * and is NOT exposed on any surface op.
+   */
+  createEventWithId(
+    id: string,
+    input: EventInput,
+  ): CalendarEvent {
+    if (!/^evt-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+      throw new Error(`create_event_with_id: id is not canonical evt-<uuid> shape: ${id}`);
+    }
+    assertNoInjectedId(input, "create"); // same guard, importer path
+    if (this.getEventRow(id) !== undefined) {
+      throw new Error(`create_event_with_id: event already exists: ${id}`);
+    }
+    const rule =
+      input.recurrenceRule !== undefined
+        ? validateRRule(input.recurrenceRule, "create_event")
+        : undefined;
+    const event: CalendarEvent = {
+      id,
+      title: input.title,
+      description: input.description,
+      startMs: input.startMs,
+      endMs: input.endMs,
+      allDay: input.allDay,
+    };
+    validateEventValues(event, "create_event");
+    const hlc = this.hlc.now();
+    createLocalChange(
+      this.db,
+      this.deviceId,
+      {
+        entity_id: event.id,
+        entity_type: "event",
+        field_path: "event",
+        operation: "set",
+        payload: { value: eventFields(event) },
+        hlc_now: () => hlc,
+      },
+      (db, _record) => {
+        insertEventRow(db, event, hlc);
+      },
+    );
     if (rule !== undefined) {
       const seriesId = `ser-${randomUUID()}`;
       const seriesHlc = this.hlc.now();
@@ -1033,7 +1128,7 @@ export function derivedScheduleColumns(e: CalendarEvent): {
   return {
     all_day: e.allDay ? 1 : 0,
     start_date: e.allDay ? localDateStr(e.startMs) : null,
-    end_date: e.allDay ? localDateStr(Math.max(e.endMs, e.startMs)) : null,
+    end_date: e.allDay ? inclusiveEndDateFromExclusiveMs(Math.max(e.endMs, e.startMs)) : null,
     start_wall: e.allDay ? null : localWallStr(e.startMs),
     end_wall: e.allDay ? null : localWallStr(e.endMs),
     tz_id: e.allDay ? null : timezoneId(),

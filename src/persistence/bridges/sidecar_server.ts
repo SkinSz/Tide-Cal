@@ -45,6 +45,8 @@ import {
   type MdnsEvent,
 } from "../../network/endpoint_bridge.ts";
 import { instancePrefix } from "../../network/discovery.ts";
+import { buildExportInput, exportToIcs } from "../../interop/ics_export.ts";
+import { parseIcs, planImport, applyImportPlan, buildExistingIndex } from "../../interop/ics_import.ts";
 import type { DeviceIdentity } from "../../security/identity.ts";
 import {
   createPairingOffer,
@@ -602,6 +604,38 @@ export function makeDispatcher(core: EventCore, sync?: SyncManager): Dispatcher 
     switch (op) {
       case "ping":
         return { pong: true, device_id: core.selfDeviceId };
+      // DC-18 §5: export_ics is its own typed surface op (NOT part of the
+      // sync_op allow-list semantics — registered here and in lib.rs's
+      // ALLOWED list for the passthrough, mirroring the event-CRUD pattern).
+      // READ-ONLY: buildExportInput is pure SELECT; the exporter is a pure
+      // function; file placement happens in the shell, not here.
+      case "export_ics": {
+        if (args.now_ms !== undefined && args.now_ms !== null && typeof args.now_ms !== "number") {
+          fail("export_ics: args.now_ms must be a number or null");
+        }
+        const nowMs =
+          typeof args.now_ms === "number" && Number.isFinite(args.now_ms)
+            ? Math.trunc(args.now_ms)
+            : Date.now();
+        const input = buildExportInput(core, nowMs);
+        return { ics: exportToIcs(input) };
+      }
+      // DC-23 §6: import_ics — the applier runs INSIDE the sidecar (EventCore
+      // lives here). The shell reads the file and passes the TEXT; the
+      // importer stays fs-free. Report JSON is the truth surface.
+      case "import_ics": {
+        if (typeof args.ics_text !== "string") {
+          fail("import_ics: args.ics_text must be the raw .ics file text");
+        }
+        if (args.ics_text.length > 8 * 1024 * 1024) {
+          fail("import_ics: ics_text exceeds the 8 MiB bound");
+        }
+        const existingIndex = buildExistingIndex(core);
+        const { plan, notices } = planImport(parseIcs(args.ics_text), existingIndex);
+        const report = applyImportPlan(core, plan);
+        report.notices.push(...notices);
+        return { report };
+      }
       case "list_events": {
         const { from_ms: f, to_ms: t } = args;
         for (const [k, v] of [
