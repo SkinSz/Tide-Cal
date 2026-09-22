@@ -56,7 +56,7 @@ No mandatory Internet connection.
 | Platform   | Status                 |
 | ---------- | ---------------------- |
 | 🪟 Windows | 🚧 Development         |
-| 🐧 Linux   | 🟢 Approaching release |
+| 🐧 Linux   | Released 0.1.0         |
 | 🤖 Android | 🚧 Development         |
 
 ## Project Status
@@ -69,12 +69,14 @@ The Linux client is currently the most mature and is approaching release readine
 
 Tide as a whole is still under active development and should not yet be considered production-ready.
 
-## Features
+## Current Release Features
 
 * Month, week, and day views
 * Create, edit, and delete events
 * All-day events
 * Event descriptions
+* Event recurrence
+* Event notifications / reminders
 * Offline-first operation
 * Bidirectional device synchronization
 * Local network synchronization
@@ -84,11 +86,7 @@ Tide as a whole is still under active development and should not yet be consider
 
 * `.ics` import and export
 * Multiple calendars/categories
-* Event recurrence needs surfacing (wiring to GUI missing)
-* Event notifications / reminders
-* Three-Device Real Sync Harness (build blocker test)
 * Multi-Language Support (Currently English)
-* First Linux Build
 * Windows Port
 * Android Port and Frontend Rewrite
 * Support for Themes or different colour palletes
