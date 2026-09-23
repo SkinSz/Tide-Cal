@@ -328,6 +328,15 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 - **Title:** DEB install on stock Debian: sidecar exits with SIGSEGV when creating a pairing code
 - **Priority:** 6/10 — MEDIUM-HIGH (first external-user install broken at a core feature)
 - **Status:** RESOLVED-PENDING-VERIFICATION (2026-09-08): fix applied (better-sqlite3 12.11.1 + extra vendored deps); awaiting friend's confirmation on the rebuilt DEB.
+- **CLOSING STATUS UPDATE (2026-09-23):** v0.1.1 packages built from commit ae61943
+  (`Tide-0.1.1-1.x86_64.rpm` + `Tide_0.1.1_amd64.deb`, payload verified: sidecar md5
+  a8357e8a… with conformRRule present, better-sqlite3 12.11.1 + bindings +
+  file-uri-to-path shipped, `nodejs` dep resolves). Both pushed to GitHub main
+  (tag v0.1.1). Awaiting ONLY the friend's re-test on Debian to flip this to
+  fully RESOLVED. Dev-side verification beyond doubt: dev app ran the v12
+  bundle through the entire 2026-09-22 gate session (export→Google→import→
+  export round trip, hours of use) with zero hermes-node fatals — the same
+  crash class that killed the app in the Sep-8 investigation.
 - **Report:** Owner's friend installed Tide_0.1.0_amd64.deb on (actual) Debian. Creating a pairing code → error "sidecar exited: signal 11 (SIGSEGV)".
 - **Why it matters:** SIGSEGV in the sidecar means Node started and died in NATIVE code — the only native module in the sidecar is better-sqlite3. Pairing-code creation is the first operation that WRITES to the domain DB, so the crash site is consistent with the sqlite binding. NOT a missing-nodejs problem: absent node yields spawn failure ("command not found"), not signal 11.
 - **Artifact facts (verified from the shipped DEB):** `prebuilds/linux-x64.node` IS present and bundled (`usr/lib/Tide/node_modules/better-sqlite3/prebuilds/`). So the file is not missing — a runtime-level mismatch remains the prime suspect.
@@ -384,3 +393,19 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 - SEQUENCE on cancellation VEVENTs: v1 uses SEQUENCE:0; §3.4's increment language does NOT override §3.7's v1 rule. (Exporter already implements this.)
 - tauri-plugin-dialog: approved. v1 scope (all calendars, one VCALENDAR): approved. X-TIDE-CALENDAR grouping: approved.
 - Manual cross-suite import test (Google/Apple/Outlook) is a real RELEASE GATE, owner-executed.
+
+## TD-026 — All-day end_date stored EXCLUSIVE violating DC-07 inclusive semantics (gate 2026-09-22)
+- **ID:** TD-026
+- **Title:** derivedScheduleColumns fed the exclusive endMs instant into the INCLUSIVE end_date column; 1-day all-day events stored as 2-day spans and exported as 2-day DTEND ranges
+- **Priority:** 6/10 — MEDIUM-HIGH (data corruption visible to every interchange consumer)
+- **Status:** RESOLVED (2026-09-22, commits 73d42dc + release ae61943). Write seam: inclusiveEndDateFromExclusiveMs (endMs - 1 -> local date) in derivedScheduleColumns; one fix point covers local writes, replicated schedule records (sync_service makeEntityMutator) and full-state upserts (all re-derive via insertEventRow). Data repair: schema v8 migration re-derives existing all_day rows from utc_end_ms, guarded (utc_end_ms > 0 AND derived end >= start_date) so legacy shell-store rows (utc_* = 0) are untouched — verified against a live-DB copy. Importer's 23:59:59.999 form idempotent under -1ms. Regression: tests/gate_allday_end_date.test.ts (6 tests incl. Google-round-trip DTEND + Tide->Tide round-trip + migration). Full suite 835/835.
+- **Root cause class:** same inclusive/exclusive boundary confusion as the DC-18 UNTIL bug fixed the same session (conformRRule in 4b5e6a8) — both found by the owner's Google Calendar gate. Interchange-boundary semantics are now RFC-5545-conformant in both directions.
+
+## TD-027 — .ics interchange conformance sweep candidates (residuals, informational)
+- **ID:** TD-027
+- **Title:** Known interchange residuals after the 2026-09-22 gate: reminders not exported (DC-18 §3.5 by contract), VTIMEZONE two-transition horizon, planner UUID minting at plan time
+- **Priority:** 2/10 — LOW (all documented v1 limitations, no correctness break)
+- **Status:** OPEN (registry of knowns, not defects)
+- 1. Reminders: NOT exported by design (DC-18 §3.5); VALARM mapping deferred to a future contract. Google itself is unreliable at VALARM import (double-import quirk) — worth remembering if VALARM export is ever added.
+- 2. VTIMEZONE horizon: exports carry two concrete transitions, no RRULE (handoff §4.6) — fine for mainstream consumers; revisit only if multi-year imports misbehave.
+- 3. Import planner determinism: foreign-UID Case C mints randomUUID() at PLAN time (handoff §4.5) — intentional per D2; move to applier only if pure-plan ever matters mechanically.
