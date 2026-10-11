@@ -59,6 +59,24 @@ No mandatory Internet connection.
 | 🐧 Linux   | Released 0.1.0         |
 | 🤖 Android | 🚧 Development         |
 
+### Windows install & verification (DC-24 §3.2.1)
+
+Tide's Windows installer is **unsigned** (no code-signing certificate).
+Windows SmartScreen will therefore show a "Windows protected your PC"
+warning on first run — this is expected for an unsigned build. To confirm
+the installer you downloaded is intact and really ours, verify its SHA256
+checksum against the value published **on the same release page** as the
+download:
+
+1. Download the installer from the official release page.
+2. In a terminal (Win+R → `cmd`) run, from the download folder:
+
+       certutil -hashfile Tide_<version>_x64-setup.exe SHA256
+
+3. Compare the printed digest with the `sha256:` value on the release
+   page. They must match **exactly** (order-insensitive, case-insensitive).
+4. On mismatch: **do not run the installer**; report it in an issue.
+
 ## Project Status
 
 🚧 **Early development**

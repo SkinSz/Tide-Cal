@@ -80,11 +80,96 @@ function argsFor(
         "int32:10000",
       ];
     default:
+      if (strategy === "powershell-toast") {
+        return case_powershell_toast_args(summary, body);
+      }
+      if (strategy === "powershell-messagebox") {
+        return case_powershell_messagebox_args(summary, body);
+      }
       return null;
   }
 }
 
-const STRATEGIES = ["notify-send", "gdbus", "dbus-send"] as const;
+// DC-24 §4.5 (2026-10-11): Windows strategy joins the SAME TD-022 chain.
+// powershell-toast uses Windows' built-in Windows.UI.Notifications via a
+// one-shot PowerShell child process (ships with every Windows 10/11 — no
+// new dependency, same spawn shape as notify-send). Chain selection is
+// per-platform: Windows gets [powershell-toast], Linux keeps the D-Bus
+// chain in TD-022 order. Same session-dead-strategy + one-log-line-per-
+// attempt rules; no notification daemon, no scheduled task (DC-24 §4.5).
+
+/** XML-escape for the toast's text nodes (injection surface: body/summary
+ * go into a template XML string; a crafted reminder title must not be able
+ * to inject XML). Escapes &, <, >, ", ' — the five XML entities. */
+function xmlEscape(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+/** arg vector for the "powershell-toast" strategy (DC-24 §4.5). */
+function case_powershell_toast_args(
+  summary: string,
+  body: string,
+): string[] {
+  // The toast XML is passed as a single argv element (PowerShell -Command
+  // via the spawn arg vector — no shell interpreter, no injection beyond
+  // the XML-escaped text nodes). ToastTemplateType toastText02: one bold
+  // summary line + one wrapped body line.
+  const toastXml =
+    `<toast><visual><binding template="ToastText02">` +
+    `<text id="1">${xmlEscape(summary)}</text>` +
+    `<text id="2">${xmlEscape(body)}</text>` +
+    `</binding></visual></toast>`;
+  // PowerShell single-quote escaping is redundant AFTER xmlEscape (all '
+  // became &apos;) — kept as defense-in-depth in case the escape list ever
+  // changes (review note #15).
+  return [
+    "-NoProfile",
+    "-NonInteractive",
+    "-WindowStyle", "Hidden",
+    "-Command",
+    `[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null;` +
+      `[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null;` +
+      `$x = New-Object Windows.Data.Xml.Dom.XmlDocument;` +
+      `$x.LoadXml('${toastXml.replace(/'/g, "''")}');` +
+      `$t = New-Object Windows.UI.Notifications.ToastNotification $x;` +
+      `[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Tide').Show($t)`,
+  ];
+}
+
+/** arg vector for the "powershell-messagebox" fallback strategy
+ * (DC-24 §4.5 tray-fallback equivalent: a blocking popup shown when the
+ * toast subsystem is unavailable/blocked). Text is single-quote-doubled
+ * for the PowerShell string literals; no shell interpreter is involved
+ * (spawned as one argv element via -Command). */
+function case_powershell_messagebox_args(
+  summary: string,
+  body: string,
+): string[] {
+  const q = (s: string): string => s.replace(/'/g, "''");
+  return [
+    "-NoProfile",
+    "-NonInteractive",
+    "-WindowStyle", "Hidden",
+    "-Command",
+    `Add-Type -AssemblyName System.Windows.Forms | Out-Null; ` +
+      `[System.Windows.Forms.MessageBox]::Show('${q(body)}', '${q(summary)}')`,
+  ];
+}
+
+const STRATEGIES_LINUX = ["notify-send", "gdbus", "dbus-send"] as const;
+// DC-24 §4.5 binding chain: powershell-toast → tray-fallback. The fallback
+// writes a tray-balloon equivalent via PowerShell's MessageBox shell
+// (BurntToast-free; a popup the user sees even if the toast subsystem is
+// blocked by policy). Powershell.exe ships with every Windows 10/11.
+const STRATEGIES_WINDOWS = ["powershell-toast", "powershell-messagebox"] as const;
+const STRATEGIES = (
+  process.platform === "win32" ? STRATEGIES_WINDOWS : STRATEGIES_LINUX
+) as readonly string[];
 
 /**
  * Deliver one notification through the OS desktop notification service.
@@ -137,7 +222,14 @@ export function deliverNotification(
     // strategy being attempted — the pipeline stays auditable from the log.
     console.log(`[tide] notify via ${strategy}`);
     try {
-      const child = spawn(strategy, args, { stdio: "ignore" });
+      // DC-24 §4.5: the Windows strategy runs powershell.exe (the spawn
+      // executable), not a bare command name; other strategies spawn
+      // directly. Executable + args resolved together per strategy.
+      const [exe, spawnArgs] =
+        strategy === "powershell-toast" || strategy === "powershell-messagebox"
+          ? (["powershell.exe", args] as const)
+          : ([strategy, args] as const);
+      const child = spawn(exe, spawnArgs, { stdio: "ignore" });
       child.on("error", (err) => {
         // ENOENT etc.: strategy unavailable on this distro — mark dead,
         // try the next strategy (§7.1, TD-022).

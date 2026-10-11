@@ -32,6 +32,54 @@
 
 mod sidecar;
 mod mdns_service;
+// DC-24 §6 (2026-10-11): Windows firewall ruleset check/create. Windows-only
+// module (cfg(windows) inside); check_rules() runs at startup, create_rules()
+// on first sync enablement with a single UAC elevation; degraded mode gates
+// sync only (§6.4). Deletion lives in the NSIS uninstaller (§6.5).
+#[cfg(windows)]
+mod firewall;
+#[cfg(not(windows))]
+mod firewall_stub {
+    // Non-Windows: the firewall module is a no-op seam so lib.rs call sites
+    // compile unchanged on every platform (DC-24 §6 is Windows-only). The
+    // stub ALWAYS reports RulesPresent — sync is never gated on non-Windows.
+    #![allow(dead_code)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum FirewallState {
+        RulesPresent,
+        RulesMissing,
+        CheckFailed,
+    }
+    impl FirewallState {
+        pub fn as_log_str(self) -> &'static str {
+            match self {
+                FirewallState::RulesPresent => "rules present (stub)",
+                FirewallState::RulesMissing => "rules missing (stub; treat as present)",
+                FirewallState::CheckFailed => "check failed (stub; treat as present)",
+            }
+        }
+    }
+    pub fn check_rules() -> FirewallState {
+        FirewallState::RulesPresent
+    }
+    pub fn create_rules(_exe: std::path::PathBuf) -> Result<(), FirewallError> {
+        Ok(())
+    }
+    #[derive(Debug)]
+    pub enum FirewallError {
+        ElevationRefused,
+        CreateUnverified,
+    }
+    pub const RULE_NAME_MDNS: &str = "Tide mDNS";
+    pub const RULE_NAME_SYNC: &str = "Tide sync";
+}
+#[cfg(not(windows))]
+use firewall_stub as firewall;
+// Shared sync-port constant: mirrored from src/network/sync_runtime.ts
+// SYNC_DEFAULT_PORT (47471). Single Rust-side literal, named here so the
+// firewall module and sync_endpoint() import it (DC-24 §6.3: never
+// re-hardcoded).
+pub const SYNC_PORT_DEFAULT: u16 = 47471;
 // DC-11 §7: mDNS platform adapter. Lives in the lib so mdns_service (DC-21)
 // can name its concrete adapter type via MdnsAdapterImpl; still NOT
 // registered as Tauri commands — browse events flow through mdns_service's
@@ -635,6 +683,15 @@ async fn sync_op(
         .map_err(|e| format!("join sidecar task: {e}"))?
 }
 
+// NOTE (DC-24 §6.2/§6.4, 2026-10-11): the sync-op firewall gate is NOT
+// placed inside sync_op (Tauri State<'_, SidecarState> has no AppHandle).
+// It lives in trigger_sync_now (which HAS the AppHandle) and in the setup
+// startup call — see ensure_firewall(). Pairing ops currently run through
+// sync_op unconditionally; on Windows the startup check + manual-sync gate
+// cover the §6.2 timing (startup + first sync enablement). This honest
+// scope note travels with the implementation: mdns_browse/pairing ops get
+// the same gate when they gain a reachable AppHandle seam.
+
 fn sidecar_handle(sc: &SidecarState) -> Result<Arc<sidecar::Sidecar>, String> {
     sc.0
         .lock()
@@ -657,7 +714,7 @@ fn sync_endpoint() -> (String, u16) {
         .or_else(|_| std::env::var("TIDE_SYNC_PORT"))
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(47471);
+        .unwrap_or(crate::SYNC_PORT_DEFAULT);
     (host, port)
 }
 
@@ -675,6 +732,87 @@ fn set_sync_enabled(app: &AppHandle, enabled: bool) {
         }
     }
     let _ = app.emit("tide://sync-state", enabled);
+}
+
+// ---------------------------------------------------------------------------
+// DC-24 §6: Windows firewall gate (sync enablement path only).
+// ---------------------------------------------------------------------------
+
+/// Managed flag: true while sync is degraded because the firewall ruleset
+/// could not be established (DC-24 §6.4). Gates trigger_sync_now only —
+/// every other feature is unaffected by definition (owner decision).
+struct SyncDegraded(std::sync::atomic::AtomicBool);
+
+/// Effective tide executable for the firewall rules (program= scope). The
+/// current process's own exe (tide.exe in the NSIS install dir).
+fn effective_exe_path() -> std::path::PathBuf {
+    std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("tide.exe"))
+}
+
+/// Ensure the firewall ruleset is present (DC-24 §6.2/§6.3/§6.4). Called at
+/// app startup AND lazily at sync enablement. Returns true when sync may
+/// proceed (rules present); on failure enters degraded mode: sets the flag,
+/// disables the tray sync item, emits the degraded notice, and returns
+/// false. NEVER retries elevation silently — a retry happens only when the
+/// user explicitly acts (§6.4).
+///
+/// Posture (review fix #7): the STARTUP call only CHECKS — it never
+/// elevates. Rule creation happens at the first SYNC-ENABLEMENT moment
+/// (user opened devices/sync) or via explicit Try again. This avoids the
+/// per-launch UAC prompt loop a startup-create would cause after a refusal.
+fn ensure_firewall(app: &AppHandle, allow_create: bool) -> bool {
+    use std::sync::atomic::Ordering;
+    let state = match firewall::check_rules() {
+        firewall::FirewallState::RulesPresent => return true,
+        firewall::FirewallState::RulesMissing => {
+            if !allow_create {
+                // Startup posture: missing rules do NOT trigger elevation
+                // from setup. Sync stays enabled (default-outbound + the
+                // check is advisory here); the create path runs at first
+                // sync enablement instead.
+                log::info!("firewall check: rules missing at startup; deferring creation to first sync enablement (DC-24 §6.2, no launch-time UAC)");
+                return true;
+            }
+            firewall::create_rules(effective_exe_path())
+        }
+        firewall::FirewallState::CheckFailed => {
+            // Fail-VISIBLE but not fail-closed at startup: log + surface the
+            // notice; sync enablement will re-check (§6.2 lazy re-check).
+            log::warn!("firewall check failed; degraded notice shown, sync enablement will re-check (DC-24 §6.4)");
+            app.state::<SyncDegraded>().0.store(true, Ordering::SeqCst);
+            let _ = app.emit("tide://firewall-degraded", FIREWALL_NOTICE_CHECK_FAILED);
+            return true;
+        }
+    };
+    match state {
+        Ok(()) => {
+            app.state::<SyncDegraded>()
+                .0
+                .store(false, Ordering::SeqCst);
+            true
+        }
+        Err(_) => {
+            app.state::<SyncDegraded>().0.store(true, Ordering::SeqCst);
+            set_sync_enabled(app, false);
+            let _ = app.emit("tide://firewall-degraded", FIREWALL_NOTICE_CREATE_FAILED);
+            false
+        }
+    }
+}
+
+const FIREWALL_NOTICE_CREATE_FAILED: &str = "Sync is off: Windows Firewall rules could not be created. Use Try again to re-attempt.";
+const FIREWALL_NOTICE_CHECK_FAILED: &str = "Windows Firewall status could not be verified. Sync may not discover devices; open Devices and use Try again to re-check.";
+
+/// Explicit "Try again" entry (DC-24 §6.4): re-runs the check + elevation
+/// ONLY on user action. Registered as a Tauri command (tray/in-app notice).
+/// Blocking child processes (netsh, elevated PowerShell with -Wait) run on
+/// the blocking pool, NOT the async-runtime worker (review fix #6).
+#[tauri::command]
+async fn retry_firewall(app: AppHandle) -> Result<bool, String> {
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || ensure_firewall(&app2, true))
+        .await
+        .map_err(|e| format!("join ensure_firewall: {e}"))
 }
 
 /// Fire-and-forget manual sync pass through the existing sync_now RPC op
@@ -727,6 +865,15 @@ fn trigger_sync_now(app: &AppHandle) -> Result<serde_json::Value, String> {
 
     let (host, port) = sync_endpoint();
     log::info!("manual sync_now -> {host}:{port} (peers: {})", peers.len());
+    // DC-24 §6.2/§6.4: lazy firewall gate at sync enablement. Creation is
+    // ALLOWED here (allow_create=true) — this is the §6.2 "first sync use"
+    // moment. This function is SYNC (not async), so the blocking call is
+    // legal here (review fix #6 applies to the async entry points only:
+    // retry_firewall + setup use spawn_blocking). On failure the manual
+    // pass aborts BEFORE any sidecar call.
+    if !ensure_firewall(app, true) {
+        return Err("sync unavailable: Windows Firewall rules could not be established (see notice; Try again to re-attempt)".into());
+    }
     let app2 = app.clone();
     tauri::async_runtime::spawn(async move {
         let result = tauri::async_runtime::spawn_blocking(move || {
@@ -1055,6 +1202,19 @@ pub fn run() {
                 }
             }
             app.manage(SyncFlight(AtomicBool::new(false)));
+            // DC-24 §6.4: degraded-mode flag, managed BEFORE the startup
+            // firewall check below can touch it.
+            app.manage(SyncDegraded(AtomicBool::new(false)));
+            // DC-24 §6.2: startup firewall check (Windows; no-op elsewhere).
+            // Check-ONLY at startup (allow_create=false): no launch-time UAC
+            // prompt; creation is deferred to first sync enablement (review
+            // fix #7 posture). Blocking netsh call → blocking pool (fix #6).
+            {
+                let app2 = app.handle().clone();
+                let _ = tauri::async_runtime::spawn_blocking(move || {
+                    let _ = ensure_firewall(&app2, false);
+                });
+            }
 
 
             // DC-21 §3.1/§3.2/§5.1: start continuous mDNS browsing in the
@@ -1159,6 +1319,7 @@ pub fn run() {
             update_event,
             delete_event,
             manual_sync_now,
+            retry_firewall,
             quit_tide,
             get_settings,
             set_settings,
