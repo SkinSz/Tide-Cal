@@ -14,3 +14,6 @@ src-tauri/resources/better-sqlite3/deps/
 # Internal-only material (QA logs, reviews, handoffs, agent instructions,
 # owner comms). NEVER pushed to GitHub.
 internal/
+# CI-only: real node.exe is downloaded by windows-release.yml; local placeholder
+# is zero-byte and MUST NOT be bundled (Linux builds use system node).
+src-tauri/resources/runtime-node/

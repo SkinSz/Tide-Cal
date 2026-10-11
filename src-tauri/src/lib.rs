@@ -932,6 +932,27 @@ fn quit_app(app: &AppHandle) {
 /// 1. TIDE_SIDECAR_PATH env override
 /// 2. app resource dir (bundled builds)
 /// 3. ../../dist/sidecar.mjs relative to cwd (dev)
+/// Resolve the Node runtime for the sidecar (DC-24 P3: in-bundle, no system
+/// Node dependency on Windows). Order:
+/// 1. TIDE_NODE_PATH env (test/power-user hook)
+/// 2. bundled node.exe in the app resource dir (Windows NSIS builds)
+/// 3. system `node` on PATH (Linux: deb/rpm nodejs dependency; dev)
+fn resolve_node_command(app: &tauri::AppHandle) -> String {
+    if let Ok(p) = std::env::var("TIDE_NODE_PATH") {
+        if std::path::Path::new(&p).is_file() {
+            return p;
+        }
+        log::warn!("TIDE_NODE_PATH={p} does not exist; trying bundled/system node");
+    }
+    if let Ok(res) = app.path().resource_dir() {
+        let bundled = res.join("node.exe");
+        if bundled.is_file() {
+            return bundled.display().to_string();
+        }
+    }
+    "node".to_string()
+}
+
 fn resolve_sidecar_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("TIDE_SIDECAR_PATH") {
         let p = std::path::PathBuf::from(p);
@@ -1150,7 +1171,11 @@ pub fn run() {
 
             match resolve_sidecar_path(app.handle()) {
                 Some(path) => {
-                    let mut cmd = std::process::Command::new("node");
+                    // DC-24 P3 (2026-10-12): bundled node.exe preferred on
+                    // Windows; system node stays the Linux/dev path.
+                    let node = resolve_node_command(app.handle());
+                    log::info!("sidecar node runtime: {node}");
+                    let mut cmd = std::process::Command::new(&node);
                     cmd.env("TIDE_DB_PATH", &db_path);
                     // Dev-profile isolation (2026-09-07): set TIDE_DATA_DIR
                     // explicitly so the sidecar's identity bootstrap
