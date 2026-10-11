@@ -13,6 +13,8 @@ name: windows-release
 on:
   workflow_dispatch:
   push:
+    branches:
+      - windows
     tags:
       - "v*"
 
