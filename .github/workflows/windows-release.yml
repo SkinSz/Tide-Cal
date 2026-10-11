@@ -42,7 +42,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workdirs: src-tauri
+          workspaces: src-tauri
 
       - name: Install frontend deps
         run: npm ci
@@ -62,11 +62,24 @@ jobs:
           if ($a -ne $b) { throw "sidecar.mjs resource copy mismatch: $a vs $b" }
           Write-Output "sidecar.mjs md5 verified: $a"
 
+      # Note (2026-10-12): first run failed here (exit 1 after ~4 min of
+      # compile); the runner log is admin-only via API, so this step now
+      # tees the full build output to a log file and uploads it as an
+      # artifact ON FAILURE for diagnosis. --verbose for compile errors.
       - name: Build NSIS installer (tauri)
-        run: npx tauri build --bundles nsis
+        run: npx tauri build --bundles nsis --verbose 2>&1 | Tee-Object -FilePath build-log.txt
+        shell: pwsh
         env:
           # Release build; no signing (DC-24 §3.2 — unsigned by design).
           TAURI_SIGNING_PRIVATE_KEY: ""
+
+      - name: Upload build log (failure diagnosis)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build-log.txt
+          if-no-files-found: warn
 
       - name: Locate artifacts
         id: artifacts
