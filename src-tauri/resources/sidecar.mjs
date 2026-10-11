@@ -8879,10 +8879,43 @@ function argsFor(strategy, fire, summary, body) {
         "int32:10000"
       ];
     default:
+      if (strategy === "powershell-toast") {
+        return case_powershell_toast_args(summary, body);
+      }
+      if (strategy === "powershell-messagebox") {
+        return case_powershell_messagebox_args(summary, body);
+      }
       return null;
   }
 }
-var STRATEGIES = ["notify-send", "gdbus", "dbus-send"];
+function xmlEscape(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+}
+function case_powershell_toast_args(summary, body) {
+  const toastXml = `<toast><visual><binding template="ToastText02"><text id="1">${xmlEscape(summary)}</text><text id="2">${xmlEscape(body)}</text></binding></visual></toast>`;
+  return [
+    "-NoProfile",
+    "-NonInteractive",
+    "-WindowStyle",
+    "Hidden",
+    "-Command",
+    `[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null;[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null;$x = New-Object Windows.Data.Xml.Dom.XmlDocument;$x.LoadXml('${toastXml.replace(/'/g, "''")}');$t = New-Object Windows.UI.Notifications.ToastNotification $x;[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Tide').Show($t)`
+  ];
+}
+function case_powershell_messagebox_args(summary, body) {
+  const q = (s) => s.replace(/'/g, "''");
+  return [
+    "-NoProfile",
+    "-NonInteractive",
+    "-WindowStyle",
+    "Hidden",
+    "-Command",
+    `Add-Type -AssemblyName System.Windows.Forms | Out-Null; [System.Windows.Forms.MessageBox]::Show('${q(body)}', '${q(summary)}')`
+  ];
+}
+var STRATEGIES_LINUX = ["notify-send", "gdbus", "dbus-send"];
+var STRATEGIES_WINDOWS = ["powershell-toast", "powershell-messagebox"];
+var STRATEGIES = process.platform === "win32" ? STRATEGIES_WINDOWS : STRATEGIES_LINUX;
 function deliverNotification(fire, onResult) {
   const { summary, body } = renderNotification(fire);
   let settled = false;
@@ -8913,7 +8946,8 @@ function deliverNotification(fire, onResult) {
     }
     console.log(`[tide] notify via ${strategy}`);
     try {
-      const child = spawn(strategy, args, { stdio: "ignore" });
+      const [exe, spawnArgs] = strategy === "powershell-toast" || strategy === "powershell-messagebox" ? ["powershell.exe", args] : [strategy, args];
+      const child = spawn(exe, spawnArgs, { stdio: "ignore" });
       child.on("error", (err2) => {
         deadStrategies.add(strategy);
         console.error(

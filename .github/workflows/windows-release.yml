@@ -62,6 +62,30 @@ jobs:
           if ($a -ne $b) { throw "sidecar.mjs resource copy mismatch: $a vs $b" }
           Write-Output "sidecar.mjs md5 verified: $a"
 
+      # Owner bug report 2026-10-12 (Windows: "sidecar unavailable"): the
+      # vendored tree ships build/Release/better_sqlite3.node as the LINUX
+      # ELF, and `bindings()` searches build/Release FIRST on every platform
+      # (by file existence, not loadability) — so on Windows the sidecar
+      # tried to dlopen the ELF and crashed. Fix: put the ABI-matched win32
+      # prebuild in build/Release before the bundler runs. The linux ELF
+      # stays in build/Release in the REPO (Linux packages need it); only
+      # this CI build staging gets swapped.
+      - name: Stage win32 better-sqlite3 prebuild into build/Release
+        shell: pwsh
+        run: |
+          $src = "src-tauri/resources/better-sqlite3/build/win32-x64-147/better_sqlite3.node"
+          $dst = "src-tauri/resources/better-sqlite3/build/Release/better_sqlite3.node"
+          $expect = (Get-FileHash $src -Algorithm SHA256).Hash.ToLower()
+          Copy-Item $src $dst -Force
+          $got = (Get-FileHash $dst -Algorithm SHA256).Hash.ToLower()
+          if ($got -ne $expect) { throw "prebuild staging mismatch" }
+          # Documented provenance hash (PREBUILDS.md): must be the WiseLibs
+          # v12.11.1 node-v147 win32-x64 asset.
+          if ($expect -ne "1aabe4eeb892f0899e7bc9682c1ab3f5168ac02d08a9d4aa5f5828ece227e0dc") {
+            throw "staged prebuild is NOT the documented win32-x64 v147 prebuild: $expect"
+          }
+          Write-Output "win32 prebuild staged into build/Release: $expect"
+
       # Note (2026-10-12): first run failed here (exit 1 after ~4 min of
       # compile); the runner log is admin-only via API, so this step now
       # tees the full build output to a log file and uploads it as an
