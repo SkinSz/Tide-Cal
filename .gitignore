@@ -2,9 +2,13 @@ node_modules/
 dist/
 data/
 
-# Packaging: better-sqlite3 resource copy is refreshed from node_modules by
-# the packaging step (only linux prebuilds kept); never commit vendored deps.
-src-tauri/resources/better-sqlite3/
+# Packaging: the vendored better-sqlite3 IS committed (trimmed to the JS lib
+# + platform prebuilds, PREBUILDS.md documents provenance). It MUST be in
+# the repo for the Windows CI build — the CI checkout never runs npm's
+# postinstall for the vendored copy, and tauri.conf.json maps it into the
+# bundle resources (DC-24 §4.4). Trimming rule: deps/ (the sqlite3 C source
+# for local rebuilds) stays out of git; both .node prebuilds stay in.
+src-tauri/resources/better-sqlite3/deps/
 
 
 # Internal-only material (QA logs, reviews, handoffs, agent instructions,
