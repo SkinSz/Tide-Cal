@@ -48,6 +48,16 @@ impl Sidecar {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // DC-24 W1 (2026-10-12): on Windows a console-subsystem child (the
+        // bundled node.exe) would otherwise pop up its own black console
+        // window next to the GUI. CREATE_NO_WINDOW suppresses it; Linux is
+        // untouched.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
         let mut child = cmd.spawn().map_err(|e| format!("spawn sidecar: {e}"))?;
         let stdin = child
             .stdin
