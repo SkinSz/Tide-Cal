@@ -48,6 +48,7 @@
       "resources/better-sqlite3/": "node_modules/better-sqlite3/",
       "resources/bindings/": "node_modules/bindings/",
       "resources/file-uri-to-path/": "node_modules/file-uri-to-path/",
+      "resources/noise-c.wasm/": "node_modules/noise-c.wasm/",
       "resources/runtime-node/node.exe": "node.exe",
       "../LICENSE.md": "LICENSE"
     },
