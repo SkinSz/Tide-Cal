@@ -271,20 +271,27 @@ dialog menu .spacer { flex: 1 1 auto; }
 }
 #calendar-grid.week .weekday-head { grid-row: 1; }
 .hour-corner { grid-column: 1; }
+/* Labels sit ON their hour line (top = h/24 %, translateY(-50%)) —
+   Outlook-style (owner request 2026-10-12). The 00:00 and 24:00 edge
+   labels would poke outside the ruler's box, so the ruler gets tiny
+   vertical padding and the labels shift with it (top = pad + h/24 of
+   the padded height ≈ unchanged for interior lines). */
 .hour-ruler {
   grid-row: 3;
   grid-column: 1;
   position: relative;
+  padding: 0.45em 0;
 }
-/* Labels centre on their hour line (top = h/24 %, translated up half). */
 .hour-label {
   position: absolute;
   right: 0;
   transform: translateY(-50%);
   font-size: 0.68rem;
+  line-height: 1;
   color: var(--muted);
   text-align: right;
   padding-right: 4px;
+  pointer-events: none;
 }
 #calendar-grid.week .day-col {
   grid-row: 3;
