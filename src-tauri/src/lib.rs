@@ -946,7 +946,12 @@ fn resolve_node_command(app: &tauri::AppHandle) -> String {
     }
     if let Ok(res) = app.path().resource_dir() {
         let bundled = res.join("node.exe");
-        if bundled.is_file() {
+        // A zero-byte/placeholder node.exe (dev builds: .gitignore keeps the
+        // real runtime out of the repo) must NOT shadow the system node —
+        // it isn't executable, and spawning it fails with EACCES, killing
+        // the sidecar (dev-launch regression, 2026-11-12).
+        let bundled_ok = bundled.is_file() && bundled.metadata().map(|m| m.len() > 0).unwrap_or(false);
+        if bundled_ok {
             return bundled.display().to_string();
         }
     }
