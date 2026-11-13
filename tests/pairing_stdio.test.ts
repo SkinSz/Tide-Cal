@@ -4,6 +4,7 @@
 // — the GUI silently received {"ok":true,"result":{}} with no error.
 // This test fails on the pre-fix code (result === {}) and passes after the fix.
 import { describe, expect, test, beforeEach, afterEach } from "vitest";
+import { EndpointCache } from "../src/network/endpoint_bridge.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -30,7 +31,7 @@ function pipeline(): { core: EventCore; dispatch: Dispatcher } {
   const core = new EventCore(join(dir, "tide.db"));
   const identity = loadOrCreateIdentity(dir);
   const sync = new SyncManager(core, identity, dir);
-  return { core, dispatch: makeSyncDispatcher(sync, core) };
+  return { core, dispatch: makeSyncDispatcher(sync, core, { endpointCache: new EndpointCache() }) };
 }
 
 describe("sidecar stdio pipeline awaits async ops", () => {

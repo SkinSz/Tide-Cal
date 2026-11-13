@@ -108,9 +108,21 @@ fn parse_rule_names(output: &str) -> (bool, bool) {
 }
 
 /// Run the §6.1 check via one netsh child process.
+///
+/// W3 (owner report 2026-11-13): a console-subsystem child (netsh.exe) pops
+/// its own console window on Windows even though the GUI app is windowed.
+/// Suppress it with CREATE_NO_WINDOW — same treatment as the sidecar spawn
+/// in sidecar.rs. Linux behavior unchanged (the flag is Windows-only).
 pub fn check_rules() -> FirewallState {
-    let output = match std::process::Command::new("netsh")
-        .args(["advfirewall", "firewall", "show", "rule", "name=all"])
+    let mut cmd = std::process::Command::new("netsh");
+    cmd.args(["advfirewall", "firewall", "show", "rule", "name=all"]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = match cmd
         .output()
     {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),

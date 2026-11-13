@@ -4,6 +4,7 @@
 // cap pruning semantics (oldest resolved, actives untouched, durable count),
 // and the human-readable reason mapping fallback.
 import { describe, expect, test, beforeEach, afterEach } from "vitest";
+import { EndpointCache } from "../src/network/endpoint_bridge.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -199,7 +200,7 @@ describe("TD-005 remainder: per-item delete (give up)", () => {
     const core = new EventCore(join(dir, "core.db"), SELF);
     const identity = loadOrCreateIdentity(dir);
     const sync = new SyncManager(core, identity, dir);
-    const dispatch = makeSyncDispatcher(sync, core);
+    const dispatch = makeSyncDispatcher(sync, core, { endpointCache: new EndpointCache() });
     quarantineRecord(core.db, {
       reason: "invalid_change_record:bad_operation",
       senderDeviceId: SELF,

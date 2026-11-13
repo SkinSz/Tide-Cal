@@ -30,6 +30,12 @@ mdns-sd = { version = "0.21.0", optional = true }
 tauri-plugin-dialog = "2.7.3"
 
 [features]
+# mdns is DEFAULT-ON as of 2026-11-13 (owner decision, bug #1b): without
+# browse the sidecar has no live endpoint source, so manual "Sync now"
+# fell back to 127.0.0.1 and cross-device sync silently did nothing.
+# Builds that must run without an mdns daemon still degrade honestly
+# (DC-21 §6.1: daemon-unavailable → last-known endpoints).
+default = ["mdns"]
 mdns = ["dep:mdns-sd"]
 
 # Dev-profile: keep the historical "app" binary stem for the dev launcher

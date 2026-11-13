@@ -894,6 +894,11 @@ export function withTimeout<T>(
 export function makeSyncDispatcher(
   sync: SyncManager,
   core: EventCore,
+  endpoints: {
+    // Live mDNS endpoint cache (DC-21 D2, sidecar-local); may be empty when
+    // mdns browse is disabled — the last-known fallback still applies.
+    endpointCache: EndpointCache;
+  },
 ): Dispatcher {
   return (op, args) => {
     switch (op) {
@@ -909,6 +914,40 @@ export function makeSyncDispatcher(
           // DC-21 §3.4/D4: the shell registers mDNS on this port (and
           // re-registers goodbye-first on change).
           listening_port: sync.ensureListener(),
+        };
+      }
+      // DC-21 §4.3/D7 (bug #1b fix, owner decision B): the shell's manual
+      // "Sync now" resolves each paired peer's endpoint through the SAME
+      // priority chain the scheduler uses (live mDNS cache first, then
+      // last-known from the peers table). No localhost fallback exists at
+      // this layer — an unresolvable peer is reported, never guessed.
+      case "sync_endpoints": {
+        const peers = listTrustedPeers(core.db);
+        const byDevice = new Map(peers.map((p) => [p.device_id, p]));
+        return {
+          endpoints: peers.map((p) => ({
+            device_id: p.device_id,
+            endpoint:
+              resolveEndpoint(
+                endpoints.endpointCache,
+                {
+                  deviceIds: () => peers.map((x) => x.device_id),
+                  lastKnown: (deviceId: string) => {
+                    const row = byDevice.get(deviceId);
+                    return row?.last_endpoint_host != null &&
+                      row.last_endpoint_port != null &&
+                      row.last_endpoint_seen != null
+                      ? {
+                          host: row.last_endpoint_host,
+                          port: row.last_endpoint_port,
+                          seen: row.last_endpoint_seen,
+                        }
+                      : null;
+                  },
+                },
+                p.device_id,
+              )?.endpoint ?? null,
+          })),
         };
       }
       case "pairing_offer": {
@@ -1147,7 +1186,11 @@ function main(): void {
   const core = new EventCore(dbPath, syncIdentity.deviceId);
   const sync = new SyncManager(core, syncIdentity);
   const dispatch = makeDispatcher(core);
-  const syncDispatch = makeSyncDispatcher(sync, core);
+  // DC-21 D2: ONE endpoint cache; declared before the sync dispatcher so the
+  // sync_endpoints op (bug #1b) resolves against the same cache the
+  // mdns_event/mdns_snapshot notifications feed.
+  const endpointCache = new EndpointCache();
+  const syncDispatch = makeSyncDispatcher(sync, core, { endpointCache });
   // DC-20: the scheduler runtime handle is registered when main() wires the
   // runtime (below); update_settings live-applies S1-S3 through it.
   let schedulerHandle: ReturnType<typeof startSchedulerRuntime> | null = null;
@@ -1183,10 +1226,9 @@ function main(): void {
     op === "reset_peer_state" || op === "unblock_peer"
       ? syncDispatch(op, args)
       : dispatch(op, args);
-  // DC-21 §3.2/D2: the ONE endpoint cache (sidecar-side, in-memory, keyed by
-  // instance_name). Fed by `mdns_event` pushes from Rust; seeded once at
+  // DC-21 §3.2/D2: the ONE endpoint cache (declared above with the sync
+  // dispatcher). Fed by `mdns_event` pushes from Rust; seeded once at
   // startup by `mdns_snapshot`. Never persisted (§7 privacy).
-  const endpointCache = new EndpointCache();
   // DC-21 §3.3/D3 prefilter source: paired, trusted peer device ids.
   const pairedDeviceIds = (): string[] =>
     listTrustedPeers(core.db).map((p) => p.device_id);

@@ -704,10 +704,13 @@ fn sidecar_handle(sc: &SidecarState) -> Result<Arc<sidecar::Sidecar>, String> {
 // DC-19 §4.2 manual "Sync now" (tray menu + in-app toolbar fallback)
 // ---------------------------------------------------------------------------
 
-/// Peer endpoint for the manual sync pass. Honest v1: the DC-07 peers table
-/// stores no host/port and mDNS browse results are not yet plumbed to the
-/// shell, so the endpoint comes from the environment (dev/single-machine
-/// deployments). Defaults match the sidecar's SYNC_DEFAULT_PORT.
+/// Peer endpoint for the manual sync pass. RETIRED (bug #1b, owner decision
+/// B, 2026-11-13): manual sync now resolves endpoints through the sidecar's
+/// sync_endpoints op (live mDNS / last-known chain, DC-21 §4.3/D7). The
+/// env-var override below previously defaulted to 127.0.0.1 — dialing the
+/// local machine itself — which is exactly why cross-device "Sync now"
+/// silently did nothing. Kept as documentation only; no code path reads it.
+#[allow(dead_code)]
 fn sync_endpoint() -> (String, u16) {
     let host = std::env::var("TIDE_SYNC_PEER_HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let port = std::env::var("TIDE_SYNC_PEER_PORT")
@@ -863,8 +866,56 @@ fn trigger_sync_now(app: &AppHandle) -> Result<serde_json::Value, String> {
         return start(false, "no peers are paired");
     }
 
-    let (host, port) = sync_endpoint();
-    log::info!("manual sync_now -> {host}:{port} (peers: {})", peers.len());
+    // Bug #1b (owner decision B, 2026-11-13): resolve each paired peer's
+    // endpoint through the sidecar's sync_endpoints op — the SAME live-mDNS /
+    // last-known chain the scheduler uses (DC-21 §4.3/D7). The previous
+    // behavior dialed TIDE_SYNC_PEER_HOST (default 127.0.0.1:47471), i.e.
+    // the local machine itself, so cross-device "Sync now" silently did
+    // nothing. Each resolved peer gets its own sync_now pass; peers with no
+    // resolvable endpoint are skipped with a log line (honest degradation,
+    // DC-21 §4.3 step 3).
+    let resolved: Result<Vec<(String, String, u16)>, String> =
+        proxy(&sc, "sync_endpoints", json!({}))
+        .and_then(|v| {
+            serde_json::from_value::<Vec<serde_json::Value>>(
+                serde_json::Value::Array(
+                    v["endpoints"].as_array().cloned().unwrap_or_default(),
+                ),
+            )
+            .map_err(|e| e.to_string())
+        })
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    let device_id = row["device_id"].as_str()?.to_string();
+                    let ep = &row["endpoint"];
+                    if ep.is_null() {
+                        log::info!("manual sync_now: peer {device_id} has no resolvable endpoint (mDNS + last-known empty) — skipped");
+                        return None;
+                    }
+                    let host = ep["host"].as_str()?.to_string();
+                    let port = ep["port"].as_u64()? as u16;
+                    Some((device_id, host, port))
+                })
+                .collect()
+        });
+    let resolved = match resolved {
+        Ok(r) => r,
+        Err(e) => return start(false, &format!("sync_endpoints failed: {e}")),
+    };
+    if resolved.is_empty() {
+        return start(false, "no resolvable peer endpoints (peers paired, but mDNS browse found nothing and no last-known endpoint is stored)");
+    }
+    log::info!(
+        "manual sync_now -> {} peer(s): {} (peers paired: {})",
+        resolved.len(),
+        resolved
+            .iter()
+            .map(|(d, h, p)| format!("{d}@{h}:{p}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        peers.len()
+    );
     // DC-24 §6.2/§6.4: lazy firewall gate at sync enablement. Creation is
     // ALLOWED here (allow_create=true) — this is the §6.2 "first sync use"
     // moment. This function is SYNC (not async), so the blocking call is
@@ -877,14 +928,36 @@ fn trigger_sync_now(app: &AppHandle) -> Result<serde_json::Value, String> {
     let app2 = app.clone();
     tauri::async_runtime::spawn(async move {
         let result = tauri::async_runtime::spawn_blocking(move || {
-            proxy(&sc, "sync_now", json!({ "host": host, "port": port }))
+            // One sync_now pass per resolved peer (serial: DC-13 §4.1 allows
+            // concurrent sessions, but a manual pass is user-triggered —
+            // serial keeps load and log output predictable).
+            let mut results: Vec<serde_json::Value> = Vec::new();
+            for (device_id, host, port) in &resolved {
+                match proxy(&sc, "sync_now", json!({ "host": host, "port": port })) {
+                    Ok(v) => {
+                        log::info!("manual sync_now {device_id}@{host}:{port} finished: {v}");
+                        results.push(json!({
+                            "device_id": device_id, "host": host, "port": port,
+                            "ok": true, "result": v
+                        }));
+                    }
+                    Err(e) => {
+                        log::warn!("manual sync_now {device_id}@{host}:{port} failed: {e}");
+                        results.push(json!({
+                            "device_id": device_id, "host": host, "port": port,
+                            "ok": false, "error": e
+                        }));
+                    }
+                }
+            }
+            serde_json::to_value(results).unwrap_or(serde_json::Value::Null)
         })
         .await
-        .unwrap_or_else(|e| Err(format!("join sidecar task: {e}")));
-        match result {
-            Ok(v) => log::info!("manual sync_now finished: {v}"),
-            Err(e) => log::warn!("manual sync_now failed: {e}"),
-        }
+        .unwrap_or_else(|e| {
+            log::warn!("manual sync_now join failure: {e}");
+            serde_json::Value::Null
+        });
+        log::info!("manual sync_now finished: {}", result);
         app2.state::<SyncFlight>().0.store(false, Ordering::SeqCst);
         set_sync_enabled(&app2, true);
         let _ = app2.emit("tide://sync-state", true);
