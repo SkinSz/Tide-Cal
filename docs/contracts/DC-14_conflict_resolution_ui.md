@@ -1,6 +1,8 @@
 # TIDE DESIGN CONTRACT DC-14
 # Conflict Resolution UI — Semantics and Flows
 Status: APPROVED by project owner (2026-08-25)
+AMENDED v2 by project owner (2026-11-14). See Appendix A; supersedes
+        §3.2(a)/(b) presentation where they conflict.
 
 OWNER AMENDMENTS (2026-08-25):
 - A dedicated "Conflicts" GUI button/entry point opening the conflict
@@ -398,3 +400,128 @@ TR-10 PRESENTATION-ONLY HLCS: behavioral test that no UI path orders,
 - Whether "obsolete" records compact on the same predicates as resolved
   ones                                                     -> DC-06 revision
 - DC-12 recurrence flows interplay                         -> DC-12
+
+==================================================================
+APPENDIX A — READABLE CONFLICT PRESENTATION
+==================================================================
+Status: APPROVED by project owner (2026-11-14), P1-P3 and A.6 as
+        recommended.
+Resolves: TD-030 (owner report 2026-11-14: conflict values shown as raw
+        JSON, field names as internal paths, devices as ids).
+Scope: PRESENTATION ONLY. No change to detection, statuses (§4), the
+        write path (§6) or what is stored. Every rule below formats data
+        the detail view already receives (§3.2: "reads exclusively from
+        the local conflict record + participant payloads").
+
+A.1  WHAT THE USER SEES (owner's real conflict, 2026-11-14)
+
+     Today:   schedule · 2 devices
+              {"startMs":1794679200000,"endMs":1794682800000,
+               "allDay":false}
+
+     Proposed:
+       List row:   "Test-Windoof" · Sun 15 Nov · Date & time
+       Detail:     "Test-Windoof" — Date & time was changed on two
+                   devices at the same time.
+         ┌ This device (local) ─────────┬ Device 2ee25c62 ─────────────┐
+         │ Sun 15 Nov 2026              │ Sun 15 Nov 2026              │
+         │ 09:00 – 10:00                │ 19:00 – 20:00                │
+         │ changed today 00:23          │ changed today 00:30          │
+         └──────────────────────────────┴──────────────────────────────┘
+         [Keep this device's] [Keep Device 2ee25c62's] [Decide later]
+
+A.2  FIELD LABELS (field_path -> label)
+
+     schedule                      Date & time
+     event (whole record)          Appointment
+     title                         Title
+     recurrence_rule (series)      Repeat
+     overrides.<date>.title        Title — only on <date>
+     overrides.<date>.start_wall   Start time — only on <date>
+     overrides.<date>.end_wall     End time — only on <date>
+     overrides.<date>.cancelled    Cancelled — only on <date>
+     reminders.<id>                Reminder
+     calendar title                Calendar name
+     * (whole entity removed)      Deleted
+     anything else                 "Other change" (+ A.5 fallback)
+
+     <date> is the occurrence date in the user's date format. No
+     internal path, id or "field" wording is ever shown by default.
+
+A.3  VALUE RENDERING (per value class)
+
+     Date & time   Weekday + date + time range in the user's General
+                   settings (locale + 12h/24h): "Sun 15 Nov 2026,
+                   19:00 – 20:00". All-day: "Sun 15 Nov 2026, all day";
+                   spans: "Sun 15 – Tue 17 Nov 2026".
+     Appointment   One line per sub-field (title, date & time, all-day,
+                   description). P1: only sub-fields that DIFFER
+                   between the candidates are shown, with "Show all
+                   details" to expand.
+     Text          The text itself; empty -> "(no title)" / "(empty)".
+     Repeat        Plain words: "Every week on Monday until 31 Dec 2026",
+                   "Every day, 3 times". An unparseable rule -> "Custom
+                   repeat rule" + A.5 fallback.
+     Time only     "19:00" in the user's time format.
+     Cancelled     "Cancelled" / "Takes place".
+     Reminder      "15 minutes before", "1 day before at 09:00".
+     Deleted       "Deleted" (the prior value stays recoverable per §3.2b).
+
+A.4  WHO AND WHEN
+
+     Device:  "This device (local)" for self. Other devices: their
+              display name. UNTIL the friendly-device-name contract
+              exists: "Device " + first 8 characters of the device id
+              ("Device 2ee25c62"), never the full id, never truncated
+              with "...".
+     When:    P2: absolute short form ("today 00:30",
+              "yesterday 18:12", "Sat 7 Nov 14:05") rather than relative
+              ("12 minutes ago"), because it does not go stale while the
+              dialog is open. Presentation only (P4 of §3.2b unchanged:
+              no ordering, no pre-selection).
+
+A.5  FALLBACK FOR UNKNOWN SHAPES
+
+     A value that matches no class in A.3 renders as "This change can't
+     be shown in detail". P3: a collapsed "Technical details"
+     disclosure shows the raw value for diagnosis; it is never expanded
+     by default.
+
+A.6  BUTTON WORDING
+
+     Buttons name the side, not "mine/theirs": "Keep this device's" /
+     "Keep <device>'s" / "Decide later". The §4 status mapping is
+     unchanged ("Keep mine" = resolved_keep_local, etc.).
+
+A.7  TESTABLE REQUIREMENTS
+
+     TR-A1  For every field_path kind in A.2, the list row and detail
+            header contain the A.2 label and no internal path.
+     TR-A2  A schedule candidate renders as A.3 Date & time in both 12h
+            and 24h settings and in each supported locale; no epoch
+            number appears in the output.
+     TR-A3  Whole-record candidates show only differing sub-fields by
+            default (P1).
+     TR-A4  No full device id appears anywhere in the dialog; unknown
+            devices show "Device <8 chars>".
+     TR-A5  An unknown value shape renders the A.5 text; raw JSON only
+            inside the collapsed disclosure.
+     TR-A6  Owner acceptance: the A.1 conflict reads as shown, and the
+            owner can tell which side to keep without help.
+
+A.8  OUT OF SCOPE
+
+     Friendly device names themselves (own contract; A.4 is the interim
+     rule). Translations of labels (English only, like the rest of the
+     UI). Any change to resolution semantics.
+
+A.9  DECISIONS
+
+     DECIDED   Conflicts must be human-readable (owner, 2026-11-14);
+               already required by §3.2(a)/(b).
+     DECIDED   (owner, 2026-11-14, approved as recommended)
+               P1 only differing sub-fields shown, "Show all details"
+                  expands.
+               P2 absolute short time ("today 00:30"), not relative.
+               P3 collapsed raw "Technical details" disclosure.
+               A.6 side-named buttons.
