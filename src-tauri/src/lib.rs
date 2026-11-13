@@ -398,23 +398,19 @@ fn spawn_blocking_sidecar_call(
 }
 
 /// Shared mDNS registration entry (DC-21 §3.4): registers the tide-sync
-/// service on the platform adapter. `app` supplies the adapter via managed
-/// state created at setup time; kept separate from the browse loop so a
-/// registration failure never tears browsing down.
+/// service through the app-lifetime RegistrationService (bug #1b: the daemon
+/// must live as long as the app — a function-local daemon was dropped on
+/// return, killing the announce cycle before it ever multicasted).
 #[cfg(feature = "mdns")]
 fn mdns_register_shared(
-    _app: &AppHandle,
+    app: &AppHandle,
     instance_name: &str,
     port: u16,
     txt: &std::collections::HashMap<String, String>,
     host_label: &str,
 ) -> Result<(), String> {
-    // A single TideMdns owns the daemon; browse uses its own instance, so
-    // registration creates an adapter-scoped daemon here. mdns-sd shares the
-    // OS multicast group across daemon instances (each daemon joins the
-    // group independently), which is the DC-11 §7 model.
-    let mdns = crate::mdns_service::MdnsAdapterImpl::new()?;
-    mdns.register(instance_name, port, txt, host_label)
+    app.state::<crate::mdns_service::RegistrationService>()
+        .register(instance_name, port, txt, host_label)
 }
 
 #[tauri::command]
@@ -1284,6 +1280,17 @@ pub fn run() {
             // Tauri state() panics on unmanaged types. Snapshot push and
             // browse-loop start both run after this line.
             app.manage(mdns_service::BrowseService::new());
+            // Bug #1b final piece (2026-11-13): the mDNS registration daemon
+            // MUST live for the app's whole lifetime. mdns-sd's register()
+            // only QUEUES the command — probing (750ms), the announce cycle,
+            // and answering later queries all run on the daemon's background
+            // thread. A daemon created as a function-local and dropped on
+            // return dies before announcing anything (verified by controlled
+            // experiment: same-machine browser saw a held-alive probe within
+            // 50ms, and NEVER saw Tide's service). Managed here; register()
+            // below reuses this instance.
+            #[cfg(feature = "mdns")]
+            app.manage(mdns_service::RegistrationService::new());
 
             match resolve_sidecar_path(app.handle()) {
                 Some(path) => {

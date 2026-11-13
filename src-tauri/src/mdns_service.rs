@@ -73,6 +73,53 @@ impl EventSink for PingSink {
     }
 }
 
+/// DC-21 §3.4: mDNS registration holder. The ServiceDaemon inside TideMdns
+/// MUST outlive the register() call — probing, announcing, and query
+/// answering all run on its background thread (bug #1b: a function-local
+/// daemon was dropped on return and the service never became visible).
+/// Owned by Tauri managed state so it lives as long as the app.
+#[cfg(feature = "mdns")]
+pub struct RegistrationService {
+    inner: Mutex<Option<crate::mdns_service::MdnsAdapterImpl>>,
+}
+
+#[cfg(feature = "mdns")]
+impl RegistrationService {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(None),
+        }
+    }
+
+    /// Register (or re-register) the tide-sync service. Creates the adapter
+    /// lazily on first use and REUSES it afterwards — one daemon for the
+    /// whole app lifetime. Idempotent-friendly: mdns-sd re-registering the
+    /// same fullname updates the existing service (§5.3 re-register path).
+    pub fn register(
+        &self,
+        instance_name: &str,
+        port: u16,
+        txt: &std::collections::HashMap<String, String>,
+        host_label: &str,
+    ) -> Result<(), String> {
+        let mut guard = self.inner.lock().map_err(|_| "mdns registration lock poisoned".to_string())?;
+        if guard.is_none() {
+            *guard = Some(crate::mdns_service::MdnsAdapterImpl::new()?);
+        }
+        guard
+            .as_ref()
+            .expect("just initialized")
+            .register(instance_name, port, txt, host_label)
+    }
+}
+
+#[cfg(all(feature = "mdns", test))]
+impl Default for RegistrationService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // pkg10-fixup: in the default (feature-less) dev build the browse-loop
 // machinery is compiled out; silence the resulting dead-code warnings instead
 // of leaving noise in every `npx tauri dev` run. The fields ARE used by the
