@@ -5474,8 +5474,46 @@ function localIpHint() {
 
 // src/network/discovery.ts
 import { createHash, randomBytes as randomBytes4 } from "node:crypto";
+var PROTOCOL_VERSION = "1";
+var MAX_TXT_VALUE_BYTES = 64;
+var TXT_KEY_PV = "pv";
+var TXT_KEY_DN = "dn";
 function instancePrefix(deviceId) {
   return createHash("sha256").update(deviceId, "utf8").digest("hex").slice(0, 8);
+}
+function buildInstanceName(deviceId) {
+  return `${instancePrefix(deviceId)}-${randomBytes4(2).toString("hex")}`;
+}
+function txtValueByteLength(value) {
+  return Buffer.byteLength(value, "utf8");
+}
+function findForbiddenTxtContent(value) {
+  if (value.length === 0) return "empty value";
+  if (txtValueByteLength(value) > MAX_TXT_VALUE_BYTES) {
+    return `value exceeds ${MAX_TXT_VALUE_BYTES} bytes`;
+  }
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(value)) return "looks like an IP address";
+  if (/^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+\.?$/.test(value)) {
+    return "looks like a hostname";
+  }
+  if (value.includes("@")) return "contains '@' (email/username material)";
+  if (/\d{4}-\d{2}-\d{2}/.test(value)) return "contains a calendar-style date/timestamp";
+  if (/^(?:events?|calendars?|collection)\b/i.test(value)) return "calendar metadata keyword";
+  if (/^\d+\s+(?:events?|calendars?|entries)/i.test(value)) return "event/collection count";
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) return "looks like a URL";
+  return null;
+}
+function buildTxtRecord(opts) {
+  const txt = { [TXT_KEY_PV]: PROTOCOL_VERSION };
+  const displayName = opts.displayName;
+  if (displayName !== void 0 && opts.displayNameOptIn === true) {
+    const reason = findForbiddenTxtContent(displayName);
+    if (reason !== null) {
+      throw new Error(`display name rejected as TXT value: ${reason}`);
+    }
+    txt[TXT_KEY_DN] = displayName;
+  }
+  return txt;
 }
 
 // src/network/endpoint_bridge.ts
@@ -10142,6 +10180,12 @@ function makeSyncDispatcher(sync, core, endpoints) {
         const peers = listTrustedPeers(core.db);
         return {
           device_id: sync.identity.deviceId,
+          // DC-21 §3.4: identity the shell needs to REGISTER this device on
+          // mDNS (instance_name must match the §3.3 prefilter the peer's
+          // browse cache applies; txt carries only pv [+ dn when opted in],
+          // DC-11 §2.3).
+          instance_name: buildInstanceName(sync.identity.deviceId),
+          txt: buildTxtRecord({}),
           paired_peers: peers.map((p) => ({
             device_id: p.device_id,
             display_name: p.display_name,

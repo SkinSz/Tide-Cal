@@ -44,7 +44,7 @@ import {
   resolveEndpoint,
   type MdnsEvent,
 } from "../../network/endpoint_bridge.ts";
-import { instancePrefix } from "../../network/discovery.ts";
+import { instancePrefix, buildInstanceName, buildTxtRecord } from "../../network/discovery.ts";
 import { buildExportInput, exportToIcs } from "../../interop/ics_export.ts";
 import { parseIcs, planImport, applyImportPlan, buildExistingIndex } from "../../interop/ics_import.ts";
 import type { DeviceIdentity } from "../../security/identity.ts";
@@ -906,6 +906,12 @@ export function makeSyncDispatcher(
         const peers = listTrustedPeers(core.db);
         return {
           device_id: sync.identity.deviceId,
+          // DC-21 §3.4: identity the shell needs to REGISTER this device on
+          // mDNS (instance_name must match the §3.3 prefilter the peer's
+          // browse cache applies; txt carries only pv [+ dn when opted in],
+          // DC-11 §2.3).
+          instance_name: buildInstanceName(sync.identity.deviceId),
+          txt: buildTxtRecord({}),
           paired_peers: peers.map((p) => ({
             device_id: p.device_id,
             display_name: p.display_name,

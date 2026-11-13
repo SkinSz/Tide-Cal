@@ -379,6 +379,44 @@ fn proxy(
     })
 }
 
+/// Blocking sidecar call from a sync runtime context (DC-21 §5.1 startup
+/// sequence: the shell must not block the setup thread on a sidecar RPC —
+/// used only where the call is already order-independent or inside a
+/// spawn_blocking worker).
+fn spawn_blocking_sidecar_call(
+    sc: &Arc<sidecar::Sidecar>,
+    op: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let sc = Arc::clone(sc);
+    let op = op.to_string();
+    tauri::async_runtime::block_on(async move {
+        tauri::async_runtime::spawn_blocking(move || proxy(&sc, &op, args))
+            .await
+            .map_err(|e| format!("join sidecar task: {e}"))?
+    })
+}
+
+/// Shared mDNS registration entry (DC-21 §3.4): registers the tide-sync
+/// service on the platform adapter. `app` supplies the adapter via managed
+/// state created at setup time; kept separate from the browse loop so a
+/// registration failure never tears browsing down.
+#[cfg(feature = "mdns")]
+fn mdns_register_shared(
+    _app: &AppHandle,
+    instance_name: &str,
+    port: u16,
+    txt: &std::collections::HashMap<String, String>,
+    host_label: &str,
+) -> Result<(), String> {
+    // A single TideMdns owns the daemon; browse uses its own instance, so
+    // registration creates an adapter-scoped daemon here. mdns-sd shares the
+    // OS multicast group across daemon instances (each daemon joins the
+    // group independently), which is the DC-11 §7 model.
+    let mdns = crate::mdns_service::MdnsAdapterImpl::new()?;
+    mdns.register(instance_name, port, txt, host_label)
+}
+
 #[tauri::command]
 async fn list_events(
     sc: State<'_, SidecarState>,
@@ -1286,7 +1324,50 @@ pub fn run() {
                                 let sc_arc = Arc::new(sc);
                                 let svc = app.state::<mdns_service::BrowseService>();
                                 svc.push_snapshot(Arc::new(mdns_service::PingSink { sc: Arc::clone(&sc_arc) }));
-                                app.manage(SidecarState(Mutex::new(Some(sc_arc))));
+                                app.manage(SidecarState(Mutex::new(Some(Arc::clone(&sc_arc)))));
+
+                                // DC-21 §3.4 (bug #1b follow-up, 2026-11-13):
+                                // REGISTER this device on mDNS. Until now
+                                // TideMdns::register was never called — both
+                                // devices browsed but neither announced, so
+                                // both endpoint caches stayed empty and
+                                // cross-device sync had no addresses to dial.
+                                // Registration uses the sidecar's ACTUAL
+                                // listening port (device_info.listening_port)
+                                // and an instance name matching the §3.3
+                                // prefilter (8-hex SHA-256(device_id) prefix).
+                                // Failure degrades honestly (§6.1): the log
+                                // line names the reason; sync falls back to
+                                // last-known endpoints.
+                                let reg = spawn_blocking_sidecar_call(&Arc::clone(&sc_arc), "device_info", serde_json::json!({}));
+                                if let Ok(info) = reg {
+                                    let port = info["listening_port"].as_u64().unwrap_or(0) as u16;
+                                    let instance = info["instance_name"]
+                                        .as_str()
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let mut txt = std::collections::HashMap::new();
+                                    if let Some(obj) = info["txt"].as_object() {
+                                        for (k, v) in obj {
+                                            if let Some(s) = v.as_str() {
+                                                txt.insert(k.clone(), s.to_string());
+                                            }
+                                        }
+                                    }
+                                    // Host label: opaque, not leaked into TXT
+                                    // (DC-11 §2.3). mdns-sd requires a
+                                    // hostname ending in a dot.
+                                    let host_label = format!("tide-{}.local.", info["device_id"].as_str().unwrap_or("unknown"));
+                                    if port == 0 || instance.is_empty() {
+                                        log::warn!("mdns registration skipped: sidecar supplied no listening port/instance name");
+                                    } else if let Err(e) = mdns_register_shared(
+                                        app.handle(), &instance, port, &txt, &host_label,
+                                    ) {
+                                        log::warn!("mdns service registration failed: {e} (browsing still active; peers must have a last-known endpoint to reach us)");
+                                    } else {
+                                        log::info!("mdns service registered: {instance} on port {port}");
+                                    }
+                                }
                             }
                         }
                         Err(e) => {
