@@ -30,6 +30,7 @@
 //   §6    persistence = ~/.config/tide/config.toml (DC-15 §3.2 layout),
 //         fail-open on malformed files (defaults), env vars win.
 
+mod logfile;
 mod sidecar;
 mod mdns_service;
 // DC-24 §6 (2026-10-11): Windows firewall ruleset check/create. Windows-only
@@ -234,6 +235,25 @@ fn profile_id() -> &'static str {
     } else {
         "com.tide.app"
     }
+}
+
+/// Log files: `tide.log` (active), `tide.1.log` … `tide.<KEEP>.log`.
+const LOG_FILE_STEM: &str = "tide";
+/// Rotate when the active file would exceed 1 MiB.
+const LOG_MAX_FILE_BYTES: u64 = 1024 * 1024;
+/// Numbered archives kept besides the active file → hard ceiling 5 MiB.
+const LOG_KEEP_ARCHIVES: usize = 4;
+
+/// Profile-aware log folder (dev/release isolation like every other path):
+///   Linux:   ~/.local/share/<profile_id>/logs
+///   Windows: %LOCALAPPDATA%\<profile_id>\logs
+fn log_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    let base = app.path().app_local_data_dir().ok()?;
+    let base = base
+        .parent()
+        .map(|p| p.join(profile_id()))
+        .unwrap_or(base);
+    Some(base.join("logs"))
 }
 
 fn config_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
@@ -1237,21 +1257,48 @@ pub fn run() {
             ) {
                 let _ = win.set_icon(icon);
             }
+            // Logging is ON in release builds too (owner decision 2026-11-13:
+            // installed builds previously discarded every log line, which
+            // made field diagnosis impossible). Disk use is hard-bounded by
+            // logfile::RotatingLog (numbered archives, see that module), and
+            // logging is best-effort: a log problem must never stop the app
+            // (a setup() error panics in Tauri = no window at all).
+            let mut log_targets = Vec::new();
+            if let Some(dir) = log_dir(app.handle()) {
+                logfile::prune_legacy_logs(&dir, LOG_FILE_STEM);
+                let writer: Box<dyn std::io::Write + Send> = Box::new(logfile::RotatingLog::new(
+                    dir,
+                    LOG_FILE_STEM,
+                    LOG_MAX_FILE_BYTES,
+                    LOG_KEEP_ARCHIVES,
+                ));
+                log_targets.push(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::Dispatch(
+                        tauri_plugin_log::fern::Dispatch::new().chain(writer),
+                    ),
+                ));
+            }
             if cfg!(debug_assertions) {
-                app.handle().plugin(
-                    tauri_plugin_log::Builder::default()
-                        .level(log::LevelFilter::Info)
-                        // Suppress the libayatana-appindicator deprecation
-                        // notice — it comes from the tray library itself on
-                        // every launch, is not actionable in Tide, and just
-                        // drowns the useful startup lines.
-                        .filter(|metadata| {
-                            !metadata
-                                .target()
-                                .starts_with("libayatana_appindicator")
-                        })
-                        .build(),
-                )?;
+                log_targets.push(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::Stdout,
+                ));
+            }
+            if let Err(e) = app.handle().plugin(
+                tauri_plugin_log::Builder::default()
+                    .targets(log_targets)
+                    .level(log::LevelFilter::Info)
+                    // Suppress the libayatana-appindicator deprecation
+                    // notice — it comes from the tray library itself on
+                    // every launch, is not actionable in Tide, and just
+                    // drowns the useful startup lines.
+                    .filter(|metadata| {
+                        !metadata
+                            .target()
+                            .starts_with("libayatana_appindicator")
+                    })
+                    .build(),
+            ) {
+                eprintln!("tide: logging unavailable ({e}); continuing without a log file");
             }
 
             // DC-19 §2.3: tray-less desktop (no StatusNotifier support) —

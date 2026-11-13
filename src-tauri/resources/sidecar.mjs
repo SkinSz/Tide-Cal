@@ -10542,7 +10542,9 @@ function main() {
       );
       for (const fire of due) {
         console.log(
-          `[tide] reminder dispatch: key=${fire.key} missed=${fire.missed} title="${fire.title}"`
+          // No title: logs persist on disk in release builds and travel in
+          // diagnostics; calendar content must never be written to them.
+          `[tide] reminder dispatch: key=${fire.key} missed=${fire.missed}`
         );
         deliverNotification(fire, (ok) => {
           if (ok) {

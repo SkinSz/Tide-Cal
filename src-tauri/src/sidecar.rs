@@ -15,14 +15,20 @@
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// Longest single sidecar stderr line forwarded to the log; longer lines are
+/// clipped (a runaway payload dump must not blow up the log file).
+const MAX_LOGGED_LINE_BYTES: usize = 2048;
+/// Raw stdout lines logged on protocol errors may carry calendar payloads;
+/// keep only a short prefix for diagnosis.
+const MAX_LOGGED_STDOUT_BYTES: usize = 200;
 
 type PendingTx = Sender<Result<Value, String>>;
 
@@ -67,6 +73,14 @@ impl Sidecar {
             .stdout
             .take()
             .ok_or_else(|| "sidecar: no stdout".to_string())?;
+        // Drain stderr into the app log. Previously piped but never read:
+        // a full pipe would block the sidecar, and its diagnostics were lost.
+        if let Some(stderr) = child.stderr.take() {
+            std::thread::Builder::new()
+                .name("tide-sidecar-stderr".into())
+                .spawn(move || drain_stderr(stderr))
+                .map_err(|e| format!("spawn stderr thread: {e}"))?;
+        }
 
         let pending: Arc<Mutex<HashMap<u64, PendingTx>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -210,12 +224,12 @@ fn read_loop(stdout: std::process::ChildStdout, pending: Arc<Mutex<HashMap<u64, 
             continue;
         }
         let Ok(msg) = serde_json::from_str::<Value>(trimmed) else {
-            log::warn!("sidecar sent non-JSON line: {trimmed}");
+            log::warn!("sidecar sent non-JSON line: {}", clip(trimmed, MAX_LOGGED_STDOUT_BYTES));
             continue;
         };
         // Ids are numbers per protocol; tolerate string ids defensively.
         let Some(id) = msg.get("id").and_then(parse_id) else {
-            log::warn!("sidecar response missing id: {trimmed}");
+            log::warn!("sidecar response missing id: {}", clip(trimmed, MAX_LOGGED_STDOUT_BYTES));
             continue;
         };
         let reply = if msg.get("ok").and_then(Value::as_bool).unwrap_or(false) {
@@ -239,6 +253,71 @@ fn read_loop(stdout: std::process::ChildStdout, pending: Arc<Mutex<HashMap<u64, 
     for tx in waiting {
         let _ = tx.send(Err("sidecar terminated".to_string()));
     }
+}
+
+/// Forward each stderr line to the log (target "sidecar"). Lines longer
+/// than MAX_LOGGED_LINE_BYTES keep their head; the rest of that line is
+/// discarded and counted, so memory and log volume stay bounded.
+fn drain_stderr(stderr: ChildStderr) {
+    let mut reader = BufReader::new(stderr);
+    while let Some((head, dropped)) = read_bounded_line(&mut reader, MAX_LOGGED_LINE_BYTES) {
+        let text = String::from_utf8_lossy(&head);
+        let line = text.trim_end();
+        if line.is_empty() && dropped == 0 {
+            continue;
+        }
+        if dropped > 0 {
+            log::info!(target: "sidecar", "{line}… [clipped {dropped} bytes]");
+        } else {
+            log::info!(target: "sidecar", "{line}");
+        }
+    }
+}
+
+/// Read one line: at most `max` bytes are returned (without the newline);
+/// the remainder of an overlong line is consumed and its length returned.
+/// None at EOF / read error.
+fn read_bounded_line<R: BufRead>(reader: &mut R, max: usize) -> Option<(Vec<u8>, usize)> {
+    let mut head = Vec::new();
+    let n = reader.by_ref().take(max as u64).read_until(b'\n', &mut head).ok()?;
+    if n == 0 {
+        return None;
+    }
+    if head.last() == Some(&b'\n') {
+        head.pop();
+        return Some((head, 0));
+    }
+    let mut dropped = 0usize;
+    if head.len() == max {
+        // Overlong: discard up to and including the next newline.
+        loop {
+            let buf = match reader.fill_buf() {
+                Ok(b) if !b.is_empty() => b,
+                _ => break,
+            };
+            if let Some(pos) = buf.iter().position(|&c| c == b'\n') {
+                dropped += pos;
+                reader.consume(pos + 1);
+                break;
+            }
+            let len = buf.len();
+            dropped += len;
+            reader.consume(len);
+        }
+    }
+    Some((head, dropped))
+}
+
+/// Truncate to at most `max` bytes on a char boundary, marking the cut.
+fn clip(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    if s.len() <= max {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!("{}… [clipped {} bytes]", &s[..end], s.len() - end))
 }
 
 fn parse_id(v: &Value) -> Option<u64> {
@@ -275,5 +354,43 @@ mod tests {
         assert_eq!(r["args"]["input"]["startMs"], 5);
 
         assert!(sc.call("boom", json!({})).is_ok());
+    }
+
+    #[test]
+    fn clip_respects_char_boundaries() {
+        assert_eq!(clip("short", 10), "short");
+        let s = "ä".repeat(10); // 20 bytes, 2 per char
+        let c = clip(&s, 5); // byte 5 is mid-char -> cut back to 4
+        assert!(c.starts_with("ää…"), "{c}");
+        assert!(c.ends_with("[clipped 16 bytes]"), "{c}");
+    }
+
+    #[test]
+    fn bounded_line_reader_clips_and_counts_exactly() {
+        let data = format!("short\r\n{}\nnext\ntail-no-newline", "z".repeat(5000));
+        let mut r = BufReader::new(data.as_bytes());
+        let (l, d) = read_bounded_line(&mut r, 2048).unwrap();
+        assert_eq!((l.as_slice(), d), (&b"short\r"[..], 0)); // CR trimmed later by trim_end
+        let (l, d) = read_bounded_line(&mut r, 2048).unwrap();
+        assert_eq!((l.len(), d), (2048, 5000 - 2048));
+        let (l, d) = read_bounded_line(&mut r, 2048).unwrap();
+        assert_eq!((l.as_slice(), d), (&b"next"[..], 0));
+        let (l, d) = read_bounded_line(&mut r, 2048).unwrap();
+        assert_eq!((l.as_slice(), d), (&b"tail-no-newline"[..], 0));
+        assert!(read_bounded_line(&mut r, 2048).is_none());
+    }
+
+    #[test]
+    fn stderr_flood_does_not_block_the_sidecar() {
+        // Pre-fix, stderr was piped but never read: once the OS pipe buffer
+        // (~64 KiB) filled, the child blocked on write and stopped replying.
+        // 1 MiB to stderr first, then the protocol must still answer.
+        let script = "head -c 1048576 /dev/zero | tr '\\0' 'x' >&2; \
+                      n=0; while IFS= read -r l; do n=$((n+1)); \
+                      printf '{\"id\":%d,\"ok\":true,\"result\":1}\\n' \"$n\"; done";
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(script);
+        let sc = Sidecar::spawn(cmd).expect("spawn flooding sidecar");
+        assert!(sc.ping().is_ok(), "sidecar blocked behind an undrained stderr pipe");
     }
 }
