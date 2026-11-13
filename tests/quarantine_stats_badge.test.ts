@@ -20,6 +20,7 @@
 //   3. artifact: dist/sidecar.mjs (the bundle the Rust shell actually
 //      spawns) is not stale w.r.t. the stats contract.
 import { describe, expect, test, beforeEach, afterEach, vi } from "vitest";
+import { EndpointCache } from "../src/network/endpoint_bridge.ts";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -110,7 +111,7 @@ function makeCoreWithAllRowsResolved(): EventCore {
 function makeDispatch(core: EventCore): Dispatcher {
   const identity = loadOrCreateIdentity(dir);
   const sync = new SyncManager(core, identity, dir);
-  return makeSyncDispatcher(sync, core);
+  return makeSyncDispatcher(sync, core, { endpointCache: new EndpointCache() });
 }
 
 describe("TD-badge: quarantine_stats after ALL rows are resolved (source)", () => {
@@ -153,7 +154,7 @@ describe("TD-badge: quarantine_stats after ALL rows are resolved (source)", () =
     const core = new EventCore(join(dir, "core.db"), "d-self");
     const identity = loadOrCreateIdentity(dir);
     const sync = new SyncManager(core, identity, dir);
-    const dispatch: Dispatcher = makeSyncDispatcher(sync, core);
+    const dispatch: Dispatcher = makeSyncDispatcher(sync, core, { endpointCache: new EndpointCache() });
 
     const line = JSON.parse(
       await handleLine(

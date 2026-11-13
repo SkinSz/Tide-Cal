@@ -141,6 +141,64 @@ function log(msg: string): void {
   box.prepend(line);
 }
 
+// ---------------------------------------------------------------------------
+// DC-24 §6.4 (2026-10-12): Windows firewall degraded-mode notice + Try again.
+// The Rust shell emits tide://firewall-degraded when the firewall ruleset
+// could not be established; this surfaces a persistent, dismissible notice
+// in the Devices & Sync dialog with an explicit Try again button that
+// invokes the retry_firewall command. Never auto-retries (§6.4: re-attempts
+// only at the user's explicit action).
+// ---------------------------------------------------------------------------
+
+async function retryFirewall(): Promise<void> {
+  const notice = document.getElementById("firewall-notice");
+  const text = document.getElementById("firewall-notice-text");
+  const btn = document.getElementById("firewall-retry") as HTMLButtonElement | null;
+  setBusy(true);
+  if (btn) btn.disabled = true;
+  try {
+    if (!("__TAURI_INTERNALS__" in globalThis)) throw new Error("not in shell");
+    const { invoke } = await import("@tauri-apps/api/core");
+    const ok = (await invoke("retry_firewall")) as boolean;
+    if (ok) {
+      notice!.hidden = true;
+      log("Firewall: rules established — sync enabled.");
+    } else {
+      text!.textContent = FIREWALL_STILL_DEGRADED;
+    }
+  } catch (err) {
+    text!.textContent = `${FIREWALL_STILL_DEGRADED} (${String(err)})`;
+  } finally {
+    setBusy(false);
+    if (btn) btn.disabled = false;
+  }
+}
+
+const FIREWALL_STILL_DEGRADED =
+  "Windows Firewall rules could still not be created. Sync stays off until the rules exist.";
+
+function wireFirewallNotice(): void {
+  document
+    .getElementById("firewall-retry")
+    ?.addEventListener("click", () => void retryFirewall());
+  // Listen for the shell's degraded event; show the notice with the
+  // message text from the shell. Browser dev (no shell) never fires it.
+  if ("__TAURI_INTERNALS__" in globalThis) {
+    void import("@tauri-apps/api/event")
+      .then(({ listen }) =>
+        listen<string>("tide://firewall-degraded", (ev) => {
+          const notice = document.getElementById("firewall-notice");
+          const text = document.getElementById("firewall-notice-text");
+          if (notice && text) {
+            text.textContent = ev.payload;
+            notice.hidden = false;
+          }
+        }),
+      )
+      .catch((err) => console.warn("[tide] event listen unavailable:", err));
+  }
+}
+
 export function initDevices(): void {
   document
     .getElementById("btn-devices")
@@ -163,4 +221,5 @@ export function initDevices(): void {
   // Closing the dialog hides a pending offer's Cancel affordance; the offer
   // itself is still torn down server-side (stdin-EOF shutdown).
   dlg()?.addEventListener("close", () => setOfferPending(false));
+  wireFirewallNotice();
 }

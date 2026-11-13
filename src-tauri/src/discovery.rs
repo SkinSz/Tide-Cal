@@ -75,7 +75,14 @@ mod real {
                 port,
                 Some(props),
             )
-            .map_err(|e| format!("service info: {e}"))?;
+            .map_err(|e| format!("service info: {e}"))?
+            // Bug #1b follow-up (2026-11-13): the empty IP string above yields
+            // an EMPTY address set; without addr_auto mdns-sd announces on no
+            // interface at all (prepare_announce returns None everywhere) —
+            // the service existed but was invisible to any browser. addr_auto
+            // fills addresses from the host's live interfaces at announce
+            // time (and tracks changes, DC-21 §5.2).
+            .enable_addr_auto();
             let fullname = service_info.get_fullname().to_string();
             self.daemon
                 .register(service_info)

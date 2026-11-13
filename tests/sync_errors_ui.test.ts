@@ -3,6 +3,7 @@
 // database listing surface, and the pure display-shaping layer.
 // Read-only by design: no retry/delete op exists to test.
 import { describe, expect, test, beforeEach, afterEach } from "vitest";
+import { EndpointCache } from "../src/network/endpoint_bridge.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -96,7 +97,7 @@ describe("list_quarantine dispatcher op", () => {
     seedQuarantine(core.db); // the SyncManager reads core.db, not the outer db
     const identity = loadOrCreateIdentity(dir);
     const sync = new SyncManager(core, identity, dir);
-    const dispatch: Dispatcher = makeSyncDispatcher(sync, core);
+    const dispatch: Dispatcher = makeSyncDispatcher(sync, core, { endpointCache: new EndpointCache() });
 
     const res = dispatch("list_quarantine", {}) as {
       rows: Array<Record<string, unknown>>;

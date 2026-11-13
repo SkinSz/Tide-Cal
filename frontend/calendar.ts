@@ -736,21 +736,25 @@ function pad(n: number): string {
 function renderHourRuler(root: HTMLElement): void {
   const ruler = document.createElement("div");
   ruler.className = "hour-ruler";
-  // Owner layout (2026-08-31, refined): 24 slots, one label per bar —
-  // 01:00 centred in the FIRST bar, 24:00 in the last, right after 23:00.
-  // Slot-centred (not on the line) so the ruler starts at the top edge.
-  for (let h = 1; h <= 24; h++) {
+  // Owner layout v3 (2026-10-12, W2 follow-up): labels sit ON their hour
+  // line (Outlook-style) — h:00 centred at top = h/24 — instead of
+  // centred in the slot above. The old slot-centred placement made the
+  // "02:00" label float over the 01:00–02:00 band, so dblclicking "02:00"
+  // opened 01:00–02:00 and the "01:00" label landed in band 0 (midnight →
+  // 09:00 default). Labels ON the line remove the ambiguity.
+  for (let h = 0; h <= 24; h++) {
     const lbl = document.createElement("div");
     lbl.className = "hour-label";
     lbl.textContent = fmtRulerLabel(h);
-    lbl.style.top = `${((h - 0.5) / 24) * 100}%`;
+    lbl.style.top = `${(h / 24) * 100}%`;
     ruler.appendChild(lbl);
   }
   root.appendChild(ruler);
 }
 
-/** Ruler label for the h:00 line; h=24 is the day boundary (00:00/24:00). */
+/** Ruler label for the h:00 line; h=0 is 00:00, h=24 is the day boundary. */
 function fmtRulerLabel(h: number): string {
+  if (h === 0) return getTimeFormat() === "12h" ? "12:00 AM" : "00:00";
   if (h === 24) return getTimeFormat() === "12h" ? "12:00 AM" : "24:00";
   return fmtHour(h);
 }

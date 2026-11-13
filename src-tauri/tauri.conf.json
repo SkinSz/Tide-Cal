@@ -26,7 +26,8 @@
     "active": true,
     "targets": [
       "rpm",
-      "deb"
+      "deb",
+      "nsis"
     ],
     "publisher": "SkinS / Tide Project",
     "copyright": "Copyright © 2026 SkinS / Tide Project",
@@ -47,6 +48,8 @@
       "resources/better-sqlite3/": "node_modules/better-sqlite3/",
       "resources/bindings/": "node_modules/bindings/",
       "resources/file-uri-to-path/": "node_modules/file-uri-to-path/",
+      "resources/noise-c.wasm/": "node_modules/noise-c.wasm/",
+      "resources/runtime-node/node.exe": "node.exe",
       "../LICENSE.md": "LICENSE"
     },
     "linux": {
@@ -65,6 +68,11 @@
     },
     "android": {
       "debugApplicationIdSuffix": ".debug"
+    },
+    "windows": {
+      "nsis": {
+        "installerHooks": "./windows/uninstaller.nsh"
+      }
     }
   },
   "mainBinaryName": "tide"

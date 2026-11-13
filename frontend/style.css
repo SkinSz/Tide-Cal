@@ -28,6 +28,18 @@
 
 * { box-sizing: border-box; }
 
+/* Owner request 2026-11-12 (#2): the UI scales with the window. All text
+   in the app is sized in rem, so a single root-font-size rule scales the
+   whole UI. The clamp keeps extremes sane: at ~800px window width it sits
+   at 14px (the old fixed 16px default minus a small margin so dense views
+   don't clip), grows to 20px on wide windows, never below 12px so the UI
+   stays legible on tiny windows. 1vw + 8px at 800px = 16px... tuned to
+   0.9vw + 7px so an 800px window ≈ 14.2px, a 1600px window ≈ 21px (clamped
+   to 20px). No JS, no re-render: pure CSS, applies live on resize. */
+html {
+  font-size: clamp(12px, 0.9vw + 7px, 20px);
+}
+
 body {
   margin: 0;
   background: var(--bg);
@@ -141,7 +153,8 @@ main { flex: 1; overflow: auto; padding: 8px; }
 #calendar-grid {
   display: grid;
   grid-template-columns: repeat(7, 1fr);
-  grid-auto-rows: minmax(96px, auto);
+  /* rem so the floor scales with the root font (UI-scales-with-window). */
+  grid-auto-rows: minmax(6rem, auto);
   gap: 4px;
   height: 100%;
 }
@@ -265,26 +278,34 @@ dialog menu .spacer { flex: 1 1 auto; }
 /* Week view: time-grid with duration-proportional blocks */
 #calendar-grid.week {
   /* ruler + 7 day columns (root default is 7 cols total -> Sunday clipped) */
-  grid-template-columns: 44px repeat(7, 1fr);
+  /* rem: the hour-label gutter scales with the root font too. */
+  grid-template-columns: 2.75rem repeat(7, 1fr);
   grid-template-rows: auto auto 1fr;
   height: 100%;
 }
 #calendar-grid.week .weekday-head { grid-row: 1; }
 .hour-corner { grid-column: 1; }
+/* Labels sit ON their hour line (top = h/24 %, translateY(-50%)) —
+   Outlook-style (owner request 2026-10-12). The 00:00 and 24:00 edge
+   labels would poke outside the ruler's box, so the ruler gets tiny
+   vertical padding and the labels shift with it (top = pad + h/24 of
+   the padded height ≈ unchanged for interior lines). */
 .hour-ruler {
   grid-row: 3;
   grid-column: 1;
   position: relative;
+  padding: 0.45em 0;
 }
-/* Labels centre on their hour line (top = h/24 %, translated up half). */
 .hour-label {
   position: absolute;
   right: 0;
   transform: translateY(-50%);
   font-size: 0.68rem;
+  line-height: 1;
   color: var(--muted);
   text-align: right;
   padding-right: 4px;
+  pointer-events: none;
 }
 #calendar-grid.week .day-col {
   grid-row: 3;

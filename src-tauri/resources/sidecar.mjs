@@ -5474,8 +5474,46 @@ function localIpHint() {
 
 // src/network/discovery.ts
 import { createHash, randomBytes as randomBytes4 } from "node:crypto";
+var PROTOCOL_VERSION = "1";
+var MAX_TXT_VALUE_BYTES = 64;
+var TXT_KEY_PV = "pv";
+var TXT_KEY_DN = "dn";
 function instancePrefix(deviceId) {
   return createHash("sha256").update(deviceId, "utf8").digest("hex").slice(0, 8);
+}
+function buildInstanceName(deviceId) {
+  return `${instancePrefix(deviceId)}-${randomBytes4(2).toString("hex")}`;
+}
+function txtValueByteLength(value) {
+  return Buffer.byteLength(value, "utf8");
+}
+function findForbiddenTxtContent(value) {
+  if (value.length === 0) return "empty value";
+  if (txtValueByteLength(value) > MAX_TXT_VALUE_BYTES) {
+    return `value exceeds ${MAX_TXT_VALUE_BYTES} bytes`;
+  }
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(value)) return "looks like an IP address";
+  if (/^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+\.?$/.test(value)) {
+    return "looks like a hostname";
+  }
+  if (value.includes("@")) return "contains '@' (email/username material)";
+  if (/\d{4}-\d{2}-\d{2}/.test(value)) return "contains a calendar-style date/timestamp";
+  if (/^(?:events?|calendars?|collection)\b/i.test(value)) return "calendar metadata keyword";
+  if (/^\d+\s+(?:events?|calendars?|entries)/i.test(value)) return "event/collection count";
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) return "looks like a URL";
+  return null;
+}
+function buildTxtRecord(opts) {
+  const txt = { [TXT_KEY_PV]: PROTOCOL_VERSION };
+  const displayName = opts.displayName;
+  if (displayName !== void 0 && opts.displayNameOptIn === true) {
+    const reason = findForbiddenTxtContent(displayName);
+    if (reason !== null) {
+      throw new Error(`display name rejected as TXT value: ${reason}`);
+    }
+    txt[TXT_KEY_DN] = displayName;
+  }
+  return txt;
 }
 
 // src/network/endpoint_bridge.ts
@@ -8879,10 +8917,43 @@ function argsFor(strategy, fire, summary, body) {
         "int32:10000"
       ];
     default:
+      if (strategy === "powershell-toast") {
+        return case_powershell_toast_args(summary, body);
+      }
+      if (strategy === "powershell-messagebox") {
+        return case_powershell_messagebox_args(summary, body);
+      }
       return null;
   }
 }
-var STRATEGIES = ["notify-send", "gdbus", "dbus-send"];
+function xmlEscape(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+}
+function case_powershell_toast_args(summary, body) {
+  const toastXml = `<toast><visual><binding template="ToastText02"><text id="1">${xmlEscape(summary)}</text><text id="2">${xmlEscape(body)}</text></binding></visual></toast>`;
+  return [
+    "-NoProfile",
+    "-NonInteractive",
+    "-WindowStyle",
+    "Hidden",
+    "-Command",
+    `[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null;[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null;$x = New-Object Windows.Data.Xml.Dom.XmlDocument;$x.LoadXml('${toastXml.replace(/'/g, "''")}');$t = New-Object Windows.UI.Notifications.ToastNotification $x;[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Tide').Show($t)`
+  ];
+}
+function case_powershell_messagebox_args(summary, body) {
+  const q = (s) => s.replace(/'/g, "''");
+  return [
+    "-NoProfile",
+    "-NonInteractive",
+    "-WindowStyle",
+    "Hidden",
+    "-Command",
+    `Add-Type -AssemblyName System.Windows.Forms | Out-Null; [System.Windows.Forms.MessageBox]::Show('${q(body)}', '${q(summary)}')`
+  ];
+}
+var STRATEGIES_LINUX = ["notify-send", "gdbus", "dbus-send"];
+var STRATEGIES_WINDOWS = ["powershell-toast", "powershell-messagebox"];
+var STRATEGIES = process.platform === "win32" ? STRATEGIES_WINDOWS : STRATEGIES_LINUX;
 function deliverNotification(fire, onResult) {
   const { summary, body } = renderNotification(fire);
   let settled = false;
@@ -8913,7 +8984,8 @@ function deliverNotification(fire, onResult) {
     }
     console.log(`[tide] notify via ${strategy}`);
     try {
-      const child = spawn(strategy, args, { stdio: "ignore" });
+      const [exe, spawnArgs] = strategy === "powershell-toast" || strategy === "powershell-messagebox" ? ["powershell.exe", args] : [strategy, args];
+      const child = spawn(exe, spawnArgs, { stdio: "ignore" });
       child.on("error", (err2) => {
         deadStrategies.add(strategy);
         console.error(
@@ -10101,13 +10173,19 @@ function withTimeout(p, ms, message) {
     }
   })();
 }
-function makeSyncDispatcher(sync, core) {
+function makeSyncDispatcher(sync, core, endpoints) {
   return (op, args) => {
     switch (op) {
       case "device_info": {
         const peers = listTrustedPeers(core.db);
         return {
           device_id: sync.identity.deviceId,
+          // DC-21 §3.4: identity the shell needs to REGISTER this device on
+          // mDNS (instance_name must match the §3.3 prefilter the peer's
+          // browse cache applies; txt carries only pv [+ dn when opted in],
+          // DC-11 §2.3).
+          instance_name: buildInstanceName(sync.identity.deviceId),
+          txt: buildTxtRecord({}),
           paired_peers: peers.map((p) => ({
             device_id: p.device_id,
             display_name: p.display_name,
@@ -10116,6 +10194,35 @@ function makeSyncDispatcher(sync, core) {
           // DC-21 §3.4/D4: the shell registers mDNS on this port (and
           // re-registers goodbye-first on change).
           listening_port: sync.ensureListener()
+        };
+      }
+      // DC-21 §4.3/D7 (bug #1b fix, owner decision B): the shell's manual
+      // "Sync now" resolves each paired peer's endpoint through the SAME
+      // priority chain the scheduler uses (live mDNS cache first, then
+      // last-known from the peers table). No localhost fallback exists at
+      // this layer — an unresolvable peer is reported, never guessed.
+      case "sync_endpoints": {
+        const peers = listTrustedPeers(core.db);
+        const byDevice = new Map(peers.map((p) => [p.device_id, p]));
+        return {
+          endpoints: peers.map((p) => ({
+            device_id: p.device_id,
+            endpoint: resolveEndpoint(
+              endpoints.endpointCache,
+              {
+                deviceIds: () => peers.map((x) => x.device_id),
+                lastKnown: (deviceId) => {
+                  const row = byDevice.get(deviceId);
+                  return row?.last_endpoint_host != null && row.last_endpoint_port != null && row.last_endpoint_seen != null ? {
+                    host: row.last_endpoint_host,
+                    port: row.last_endpoint_port,
+                    seen: row.last_endpoint_seen
+                  } : null;
+                }
+              },
+              p.device_id
+            )?.endpoint ?? null
+          }))
         };
       }
       case "pairing_offer": {
@@ -10296,7 +10403,8 @@ function main() {
   const core = new EventCore(dbPath, syncIdentity.deviceId);
   const sync = new SyncManager(core, syncIdentity);
   const dispatch = makeDispatcher(core);
-  const syncDispatch = makeSyncDispatcher(sync, core);
+  const endpointCache = new EndpointCache();
+  const syncDispatch = makeSyncDispatcher(sync, core, { endpointCache });
   let schedulerHandle = null;
   const combined = (op, args) => op === "update_settings" ? (() => {
     if (schedulerHandle === null) {
@@ -10316,7 +10424,6 @@ function main() {
     schedulerHandle.updateSchedulerSettings(partial);
     return { applied: true, next_start_only: "max_incremental_backlog" };
   })() : op.startsWith("sync_") || op === "device_info" || op === "pairing_offer" || op === "pairing_accept" || op === "cancel_pairing_offer" || op === "list_quarantine" || op === "quarantine_stats" || op === "retry_quarantine" || op === "delete_quarantine" || op === "peer_state" || op === "list_paired_devices" || op === "reset_peer_state" || op === "unblock_peer" ? syncDispatch(op, args) : dispatch(op, args);
-  const endpointCache = new EndpointCache();
   const pairedDeviceIds = () => listTrustedPeers(core.db).map((p) => p.device_id);
   const expectedPrefixes = () => {
     const map = /* @__PURE__ */ new Map();

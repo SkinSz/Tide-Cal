@@ -3,6 +3,7 @@
 // tracker, fixed ids/seqs, no sleeps (transport polls resolve on queue
 // emptiness like tests/regression_td001.test.ts).
 import { describe, expect, test, beforeEach, afterEach } from "vitest";
+import { EndpointCache } from "../src/network/endpoint_bridge.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -529,7 +530,7 @@ describe("TD-006 dispatcher ops (peer_state / reset / unblock / list_paired_devi
     const core = new EventCore(join(dir, "core.db"), SELF);
     const identity = loadOrCreateIdentity(dir);
     const sync = new SyncManager(core, identity, dir);
-    return { core, sync, dispatch: makeSyncDispatcher(sync, core) };
+    return { core, sync, dispatch: makeSyncDispatcher(sync, core, { endpointCache: new EndpointCache() }) };
   }
 
   function seedPeer(database: Database): void {
