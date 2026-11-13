@@ -8,6 +8,13 @@ Status: DRAFT v2 — BACKLOGGED DESIGN CONTRACT, NOT APPROVED FOR
         migration plaintext-leakage handling; platform/build
         feasibility; key-handoff threat model; future verification
         checklist. NOT APPROVED; implementation intentionally deferred.
+Trigger: revisit together with DC-25 (OS keystore custody) after the
+        Windows port ships. The DB key lives in that keystore, so both
+        land as one Linux + Windows package. Until then, builds store the
+        database unencrypted (owner, 2026-11-13: deferred deliberately
+        while Tide is a work in progress, NOT an oversight). User-facing
+        text must not describe the database as encrypted until this
+        contract is implemented.
 Depends on: DC-05 (device identity, key custody in OS keystore);
             DC-07 (SQLite schema); DC-15 (sidecar in-bundle packaging,
             per-platform data layout, Windows/Android scope);

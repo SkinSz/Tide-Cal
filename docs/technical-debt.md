@@ -244,7 +244,7 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 - **ID:** TD-018
 - **Title:** transport error mapped to clean EOF + swallowed pump error → a peer RST mid-session reports a converged session
 - **Priority:** 6/10 — MEDIUM-HIGH (observability/correctness-of-reporting, not data loss)
-- **Status:** OPEN (created 2026-09-01, independent adversarial review F1 (sync))
+- **Status:** RESOLVED (2026-09-02, commit 550bbd1, pkg9 independent review). The framing layer now distinguishes carrier failure from clean FIN: a failed carrier makes `receive()` reject with FramingError, the feed loop turns that into a sentinel frame that fails AEAD and ends the session with a loud SessionError, FIN stays a clean EOF, and pump failures are logged. Paired with TD-017 (DC-08 Appendix A v2). Regression: `tests/td018_carrier_failure.test.ts` (RST shape and FIN shape tested together).
 - **Finding:** `noise_transport.ts` feed loop's `finally` close (correct for FIN) plus `sync_runtime`'s error/end/close → receive()=null mapping plus the outbound pump's `void pump.catch(() => {})` mean a dead carrier surfaces as clean session end; pre-fix it surfaced as a loud SyncIdleTimeoutError. DC-05 §6.3 requires transport failure to be terminal (SessionError).
 - **Fix direction:** distinguish FIN from error at the framing layer (error → SessionError, not null-EOF) and propagate pump failure to the session result; regression test with an error-injected carrier. Careful not to re-break the stall fix (FIN must stay clean EOF).
 - **Trigger:** next sync-layer work session (pairs with TD-017 in one package).
