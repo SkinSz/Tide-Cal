@@ -37,6 +37,7 @@ mod mdns_service;
 // module (cfg(windows) inside); check_rules() runs at startup, create_rules()
 // on first sync enablement with a single UAC elevation; degraded mode gates
 // sync only (§6.4). Deletion lives in the NSIS uninstaller (§6.5).
+mod firewall_script;
 #[cfg(windows)]
 mod firewall;
 #[cfg(not(windows))]
@@ -63,7 +64,7 @@ mod firewall_stub {
     pub fn check_rules() -> FirewallState {
         FirewallState::RulesPresent
     }
-    pub fn create_rules(_exe: std::path::PathBuf) -> Result<(), FirewallError> {
+    pub fn create_rules(_exe: std::path::PathBuf, _node: std::path::PathBuf) -> Result<(), FirewallError> {
         Ok(())
     }
     #[derive(Debug)]
@@ -806,6 +807,29 @@ fn effective_exe_path() -> std::path::PathBuf {
     std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("tide.exe"))
 }
 
+/// Program scope of the "Tide sync" rule (DC-24 §6.3 as amended
+/// 2026-11-14): the Node runtime that actually owns the sync listener.
+/// Falls back to node.exe next to tide.exe when the resolved runtime is a
+/// bare PATH name (dev builds), so the rule still names a concrete file.
+fn firewall_node_path(app: &AppHandle) -> std::path::PathBuf {
+    let node = std::path::PathBuf::from(resolve_node_command(app));
+    if node.is_absolute() {
+        return node;
+    }
+    // Review 2026-11-14 finding 3: a bare PATH name (dev/system node) has
+    // no file to scope the rule to. Name the expected bundled location and
+    // say so, rather than silently scoping to a file that may not exist.
+    let fallback = effective_exe_path()
+        .parent()
+        .map(|d| d.join("node.exe"))
+        .unwrap_or(node);
+    log::warn!(
+        "firewall: sidecar runs on a PATH node, not a bundled runtime; \"Tide sync\" rule scoped to {} (may not match the real listener)",
+        fallback.display()
+    );
+    fallback
+}
+
 /// Ensure the firewall ruleset is present (DC-24 §6.2/§6.3/§6.4). Called at
 /// app startup AND lazily at sync enablement. Returns true when sync may
 /// proceed (rules present); on failure enters degraded mode: sets the flag,
@@ -830,7 +854,7 @@ fn ensure_firewall(app: &AppHandle, allow_create: bool) -> bool {
                 log::info!("firewall check: rules missing at startup; deferring creation to first sync enablement (DC-24 §6.2, no launch-time UAC)");
                 return true;
             }
-            firewall::create_rules(effective_exe_path())
+            firewall::create_rules(effective_exe_path(), firewall_node_path(app))
         }
         firewall::FirewallState::CheckFailed => {
             // Fail-VISIBLE but not fail-closed at startup: log + surface the
@@ -920,6 +944,19 @@ fn trigger_sync_now(app: &AppHandle) -> Result<serde_json::Value, String> {
         return start(false, "no peers are paired");
     }
 
+    // DC-24 §6.2/§6.4: lazy firewall gate at sync enablement (allow_create
+    // = true: pressing Sync now IS the §6.2 "first sync use" moment). It
+    // must run BEFORE endpoint resolution (bug #1b, 2026-11-13): peers are
+    // only resolvable once inbound mDNS is allowed, so gating after the
+    // "no resolvable endpoints" early return meant the rules were never
+    // created. NOTE (pre-existing, tracked as debt): this call blocks its
+    // caller (tray menu thread / the async command worker) while the UAC
+    // prompt is open, so the UI is unresponsive until the user answers.
+    // Failure releases the in-flight flag via start(false, …).
+    if !ensure_firewall(app, true) {
+        return start(false, "sync unavailable: Windows Firewall rules could not be established (see notice; Try again to re-attempt)");
+    }
+
     // Bug #1b (owner decision B, 2026-11-13): resolve each paired peer's
     // endpoint through the sidecar's sync_endpoints op — the SAME live-mDNS /
     // last-known chain the scheduler uses (DC-21 §4.3/D7). The previous
@@ -970,15 +1007,6 @@ fn trigger_sync_now(app: &AppHandle) -> Result<serde_json::Value, String> {
             .join(", "),
         peers.len()
     );
-    // DC-24 §6.2/§6.4: lazy firewall gate at sync enablement. Creation is
-    // ALLOWED here (allow_create=true) — this is the §6.2 "first sync use"
-    // moment. This function is SYNC (not async), so the blocking call is
-    // legal here (review fix #6 applies to the async entry points only:
-    // retry_firewall + setup use spawn_blocking). On failure the manual
-    // pass aborts BEFORE any sidecar call.
-    if !ensure_firewall(app, true) {
-        return Err("sync unavailable: Windows Firewall rules could not be established (see notice; Try again to re-attempt)".into());
-    }
     let app2 = app.clone();
     tauri::async_runtime::spawn(async move {
         let result = tauri::async_runtime::spawn_blocking(move || {
@@ -1408,10 +1436,12 @@ pub fn run() {
                                             }
                                         }
                                     }
-                                    // Host label: opaque, not leaked into TXT
-                                    // (DC-11 §2.3). mdns-sd requires a
-                                    // hostname ending in a dot.
-                                    let host_label = format!("tide-{}.local.", info["device_id"].as_str().unwrap_or("unknown"));
+                                    // Host label: derived from the public,
+                                    // opaque instance name only (DC-11 §2.2),
+                                    // never the device_id. Bug #1b root cause:
+                                    // the device_id form was a 71-byte DNS
+                                    // label, so SRV/A were silently dropped.
+                                    let host_label = tide_discovery::host_label_for(&instance);
                                     if port == 0 || instance.is_empty() {
                                         log::warn!("mdns registration skipped: sidecar supplied no listening port/instance name");
                                     } else if let Err(e) = mdns_register_shared(

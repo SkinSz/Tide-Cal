@@ -409,3 +409,17 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 - 1. Reminders: NOT exported by design (DC-18 §3.5); VALARM mapping deferred to a future contract. Google itself is unreliable at VALARM import (double-import quirk) — worth remembering if VALARM export is ever added.
 - 2. VTIMEZONE horizon: exports carry two concrete transitions, no RRULE (handoff §4.6) — fine for mainstream consumers; revisit only if multi-year imports misbehave.
 - 3. Import planner determinism: foreign-UID Case C mints randomUUID() at PLAN time (handoff §4.5) — intentional per D2; move to applier only if pure-plan ever matters mechanically.
+
+## TD-028 — UI unresponsive while the Windows firewall UAC prompt is open
+- **ID:** TD-028
+- **Title:** Sync now blocks its caller (tray menu thread / async command worker) while the elevated firewall-rule creation waits for the UAC answer
+- **Priority:** 3/10 — LOW (once per machine; the prompt is modal anyway)
+- **Status:** OPEN (pre-existing; surfaced by the 2026-11-14 firewall review)
+- **Fix direction:** run `ensure_firewall(app, true)` on the blocking pool from both entry points and continue the sync pass from its completion.
+
+## TD-029 — Per-user NSIS uninstaller likely cannot remove the firewall rules
+- **ID:** TD-029
+- **Title:** DC-24 §6.5 assumes an elevated uninstaller; Tide installs per user under AppData\Local, so `netsh delete rule` from the uninstaller probably fails silently
+- **Priority:** 2/10 — LOW (leftover rules are inert once the program path is gone)
+- **Status:** OPEN (INFERRED, not yet verified on Windows)
+- **Verify:** uninstall on a test PC, then `netsh advfirewall firewall show rule name="Tide sync"`.

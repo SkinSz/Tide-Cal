@@ -21,6 +21,38 @@
 
 #![allow(dead_code)] // wired into lib.rs command registration separately
 
+/// RFC 1035 §2.3.4: one DNS label is at most 63 bytes.
+pub const MAX_DNS_LABEL_BYTES: usize = 63;
+
+/// mDNS host name announced in SRV/A records (bug #1b root cause, 2026-11-13).
+///
+/// Built from the instance name ONLY: that name is already public and opaque
+/// (DC-11 §2.2), so the host reveals nothing new. It previously embedded the
+/// full device_id: a 71-byte label that mdns-sd silently refuses to encode,
+/// which dropped SRV + A from every packet (peers saw PTR/TXT, never resolved)
+/// and would otherwise have broadcast the device_id LAN-wide.
+pub fn host_label_for(instance_name: &str) -> String {
+    format!("tide-{instance_name}.local.")
+}
+
+/// Fail-closed host check: mdns-sd drops over-long names silently on the
+/// wire, so reject them here where the error is logged instead.
+pub fn validate_host_label(host: &str) -> Result<(), String> {
+    let trimmed = host.strip_suffix('.').unwrap_or(host);
+    if trimmed.is_empty() {
+        return Err("empty mDNS host name".into());
+    }
+    for label in trimmed.split('.') {
+        if label.is_empty() || label.len() > MAX_DNS_LABEL_BYTES {
+            return Err(format!(
+                "mDNS host label of {} bytes (allowed 1..={MAX_DNS_LABEL_BYTES}, RFC 1035)",
+                label.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(feature = "mdns")]
 mod real {
     use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
@@ -66,6 +98,7 @@ mod real {
             } else {
                 format!("{host}.")
             };
+            super::validate_host_label(&host_label)?;
             let props: HashMap<String, String> = txt.clone();
             let service_info = ServiceInfo::new(
                 TIDE_SERVICE_TYPE,
@@ -204,5 +237,44 @@ mod tests {
             // Fallback path still validates the contract constant exists.
             assert!(super::fallback::TideMdnsUnavailable::reason().contains("disabled"));
         }
+    }
+
+    #[test]
+    fn host_label_fits_dns_and_hides_device_id() {
+        // Real shapes: 64-hex device_id, DC-11 §2.2 instance "8hex-4hex".
+        let device_id = format!("d-{}", "7178a859".repeat(8));
+        let instance = "8fa73ce0-2429";
+        let host = super::host_label_for(instance);
+        assert_eq!(host, "tide-8fa73ce0-2429.local.");
+        assert!(super::validate_host_label(&host).is_ok());
+        // Privacy by construction: the host is a pure function of the
+        // (already public) instance name; no device_id parameter exists.
+        // Even a pathological instance name can't reach the 63-byte cliff
+        // unnoticed: the old device_id-based host is rejected, loudly.
+        let old = format!("tide-{device_id}.local.");
+        assert_eq!(old.split('.').next().unwrap().len(), 71);
+        assert!(super::validate_host_label(&old).is_err());
+    }
+
+    #[test]
+    fn validate_host_label_edges() {
+        let ok63 = format!("{}.local.", "a".repeat(63));
+        let bad64 = format!("{}.local.", "a".repeat(64));
+        assert!(super::validate_host_label(&ok63).is_ok());
+        assert!(super::validate_host_label(&bad64).is_err());
+        assert!(super::validate_host_label("tide.local").is_ok());
+        assert!(super::validate_host_label(".").is_err());
+        assert!(super::validate_host_label("a..local.").is_err());
+    }
+
+    #[cfg(feature = "mdns")]
+    #[test]
+    fn register_rejects_overlong_host() {
+        let mut txt = std::collections::HashMap::new();
+        txt.insert("pv".to_string(), "1".to_string());
+        let mdns = super::real::TideMdns::new().expect("daemon");
+        let long = format!("tide-d-{}.local.", "7".repeat(64));
+        let err = mdns.register("abc12345-0001", 47999, &txt, &long).unwrap_err();
+        assert!(err.contains("71 bytes"), "{err}");
     }
 }

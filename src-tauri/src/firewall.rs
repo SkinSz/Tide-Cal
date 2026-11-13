@@ -7,10 +7,11 @@
 //        able to satisfy our check).
 //   §6.2 Timing: called at app startup (tray up); re-checked lazily at
 //        first sync enablement. Cheap (one netsh child), one log line.
-//   §6.3 Scope: exactly TWO inbound allow rules, scoped to the tide
-//        executable: "Tide mDNS" (inbound UDP 5353, DC-11 discovery) and
-//        "Tide sync" (inbound TCP 47471 = SYNC_DEFAULT_PORT imported from
-//        the shared constant — never re-hardcoded here). No outbound
+//   §6.3 Scope: exactly TWO inbound allow rules, each scoped to the
+//        process that owns the socket (amended 2026-11-14): "Tide mDNS"
+//        (inbound UDP 5353, DC-11 discovery) → tide.exe; "Tide sync"
+//        (inbound TCP 47471 = SYNC_DEFAULT_PORT imported from the shared
+//        constant — never re-hardcoded here) → bundled node.exe. No outbound
 //        rules (default outbound = allow), no modification of existing
 //        rules. Idempotent: create only when absent.
 //   §6.4 UAC: rule creation goes through ONE elevated child process
@@ -151,74 +152,90 @@ pub fn check_rules() -> FirewallState {
     }
 }
 
-/// Build the netsh arg vector for ONE marker rule (idempotent: the caller
-/// checks first; `new` naming is chosen so a duplicate create fails loudly
-/// rather than silently replacing a foreign rule).
-fn rule_args(name: &str, proto: &str, port: u16, exe: &PathBuf) -> Vec<String> {
-    vec![
-        "advfirewall".into(),
-        "firewall".into(),
-        "add".into(),
-        "rule".into(),
-        format!("name={name}"),
-        "dir=in".into(),
-        "action=allow".into(),
-        format!("program={}", exe.display()),
-        format!("protocol={proto}"),
-        format!("localport={port}"),
-        "enable=yes".into(),
-        "profile=any".into(),
-    ]
+/// Which marker rules exist right now: (mdns, sync). None = check failed.
+fn present_rules() -> Option<(bool, bool)> {
+    let mut cmd = std::process::Command::new("netsh");
+    cmd.args(["advfirewall", "firewall", "show", "rule", "name=all"]);
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    match cmd.output() {
+        Ok(o) if o.status.success() => Some(parse_rule_names(&String::from_utf8_lossy(&o.stdout))),
+        _ => None,
+    }
 }
 
-/// Create both marker rules through ONE UAC-elevated netsh invocation
-/// (DC-24 §6.4: a single elevation, not per-rule). Returns Ok(()) when the
-/// elevated child spawned AND the rules are subsequently present; any
-/// refusal/failure maps to Err → the caller enters degraded mode.
-pub fn create_rules(effective_exe: PathBuf) -> Result<(), FirewallError> {
+/// Create the MISSING marker rules through ONE UAC-elevated child
+/// (DC-24 §6.4). Scope (DC-24 §6.3 as amended 2026-11-14): "Tide mDNS" →
+/// tide.exe (the shell owns the mDNS sockets), "Tide sync" → the bundled
+/// node.exe (the sidecar owns the sync listener). Command construction is
+/// in firewall_script.rs (pure, unit-tested on every platform). Returns
+/// Ok(()) only when both rules are verified present afterwards; every
+/// failure logs the elevated child's exit code (fail-visible).
+pub fn create_rules(tide_exe: PathBuf, node_exe: PathBuf) -> Result<(), FirewallError> {
+    use crate::firewall_script::{elevated_script, encode_command, launcher_command, RuleSpec};
+    let (has_mdns, has_sync) = present_rules().unwrap_or((false, false));
     let port = sync_default_port();
-    let script = format!(
-        "netsh advfirewall firewall add rule {} && netsh advfirewall firewall add rule {}",
-        shell_quote_args(&rule_args(RULE_NAME_MDNS, "udp", 5353, &effective_exe)),
-        shell_quote_args(&rule_args(RULE_NAME_SYNC, "tcp", port, &effective_exe)),
-    );
-
-    // ShellExecuteW "runas" is the ONLY supported elevation prompt path.
-    // We route through PowerShell Start-Process -Verb RunAs: a single
-    // elevated cmd.exe running both netsh commands.
-    let ps_script = format!(
-        "Start-Process -FilePath 'cmd.exe' -ArgumentList '/c {}' -Verb RunAs -Wait -WindowStyle Hidden",
-        script.replace('\'', "''")
-    );
-    let status = std::process::Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-WindowStyle",
-            "Hidden",
-            "-Command",
-            &ps_script,
-        ])
-        .output();
-    match status {
-        Ok(o) if o.status.success() => {}
-        Ok(o) => {
-            log::warn!(
-                "firewall create: elevated child exited {:?} (UAC refused or netsh error); degraded mode (DC-24 §6.4)",
-                o.status.code()
-            );
-            return Err(FirewallError::ElevationRefused);
+    let mut specs = Vec::new();
+    if !has_mdns {
+        specs.push(RuleSpec { name: RULE_NAME_MDNS, protocol: "udp", port: 5353, program: &tide_exe });
+    }
+    if !has_sync {
+        specs.push(RuleSpec { name: RULE_NAME_SYNC, protocol: "tcp", port, program: &node_exe });
+    }
+    if specs.is_empty() {
+        return Ok(());
+    }
+    let script = match elevated_script(&specs) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("firewall create: {e}; degraded mode (DC-24 §6.4)");
+            return Err(FirewallError::CreateUnverified);
         }
+    };
+    let launcher = launcher_command(&encode_command(&script));
+    let mut cmd = std::process::Command::new("powershell.exe");
+    cmd.args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &launcher]);
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    match cmd.output() {
+        Ok(o) => match o.status.code() {
+            Some(0) => {}
+            Some(1223) => {
+                log::warn!("firewall create: UAC prompt cancelled or elevation unavailable; degraded mode (DC-24 §6.4)");
+                return Err(FirewallError::ElevationRefused);
+            }
+            Some(c) if c >= 10 && (c as usize) < 10 + specs.len() => {
+                log::warn!(
+                    "firewall create: netsh refused rule \"{}\" (elevated exit {c}); degraded mode (DC-24 §6.4)",
+                    specs[(c - 10) as usize].name
+                );
+                return Err(FirewallError::CreateUnverified);
+            }
+            other => {
+                let err = String::from_utf8_lossy(&o.stderr);
+                log::warn!(
+                    "firewall create: elevation launcher exited {other:?}: {}; degraded mode (DC-24 §6.4)",
+                    err.trim().chars().take(300).collect::<String>()
+                );
+                return Err(FirewallError::ElevationRefused);
+            }
+        },
         Err(e) => {
             log::warn!("firewall create: elevation spawn failed: {e}; degraded mode (DC-24 §6.4)");
             return Err(FirewallError::ElevationRefused);
         }
     }
 
-    // Verify post-create (fail-visible): re-check; report honestly if the
-    // rules STILL aren't there (some AV/endpoint tools block netsh writes).
+    // Verify post-create (fail-visible): some AV/endpoint tools block
+    // firewall writes even after a successful elevated netsh.
     if check_rules() != FirewallState::RulesPresent {
-        log::warn!("firewall create: elevation reported success but rules still absent; degraded mode (DC-24 §6.4)");
+        log::warn!("firewall create: elevated netsh reported success but rules still absent; degraded mode (DC-24 §6.4)");
         return Err(FirewallError::CreateUnverified);
     }
     log::info!("firewall create: both rules present; sync inbound allowed");
@@ -231,32 +248,4 @@ pub enum FirewallError {
     ElevationRefused,
     /// Elevation ran but verification found the rules absent.
     CreateUnverified,
-}
-
-/// Quote ONE argv vector for a cmd.exe /c line. cmd.exe metacharacters
-/// (& | < > ^ %) inside the quoted program path would be interpreted by
-/// cmd even inside double quotes (review fix #9): escape carets for every
-/// cmd metachar, and double the double-quote per MSVCRT rules. Our arg
-/// vectors are all self-generated constants except `program=<path>` —
-/// this keeps a path with spaces (e.g. C:\Program Files\Tide\tide.exe)
-/// or cmd-hostile characters intact as ONE argument.
-fn shell_quote_args(args: &[String]) -> String {
-    args.iter()
-        .map(|a| {
-            if a.is_empty() || a.contains(' ') || a.contains('"') {
-                let inner = a
-                    .replace('^', "^^")
-                    .replace('&', "^&")
-                    .replace('|', "^|")
-                    .replace('<', "^<")
-                    .replace('>', "^>")
-                    .replace('%', "^%")
-                    .replace('"', "\\\"");
-                format!("\"{inner}\"")
-            } else {
-                a.clone()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
