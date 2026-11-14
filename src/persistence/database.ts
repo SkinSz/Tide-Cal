@@ -3,6 +3,7 @@
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import { DDL, SCHEMA_VERSION } from "./schema.ts";
+import { announcedNameFromPeer } from "../domain/device_names.ts";
 import {
   changeId,
   type ChangeRecord,
@@ -60,31 +61,14 @@ function initializeSchema(db: Database.Database): void {
     // reminder/all-day columns were added to it, so some DBs are stamped v7
     // but lack the columns. Re-run the v7 column-adds (guarded, idempotent)
     // when they are missing. A v8 stamp would not fix DBs already at 7.
-    const remCols = db
-      .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='reminders'")
-      .get() !== undefined
-      ? (db.prepare("PRAGMA table_info(reminders)").all() as Array<{ name: string }>).map((c) => c.name)
-      : [];
-    if (remCols.length > 0 && !remCols.includes("enabled")) {
-      const tx = db.transaction(() => {
-        db.exec("ALTER TABLE reminders ADD COLUMN enabled INTEGER CHECK (enabled IN (0, 1))");
-      });
-      tx();
-    }
-    const evCols = db
-      .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'")
-      .get() !== undefined
-      ? (db.prepare("PRAGMA table_info(events)").all() as Array<{ name: string }>).map((c) => c.name)
-      : [];
-    if (evCols.length > 0 && !evCols.includes("all_day_reminder_time")) {
-      const tx = db.transaction(() => {
-        db.exec("ALTER TABLE events ADD COLUMN all_day_reminder_time TEXT");
-      });
-      tx();
-    }
+    db.transaction(() => ensureReminderColumnsV7(db))();
     // DC-27 v9 repair (idempotent): a DB stamped v9 must carry the
     // revocation cutoff column and the ACK store.
     db.transaction(() => ensureRevocationSchemaV9(db))();
+    // DC-28 v10 repair (idempotent): a DB stamped v10 without the column
+    // gets it, and only THEN its one-time name move (the column is absent,
+    // so no nickname can have been set through it yet).
+    db.transaction(() => ensurePeerNamesSchemaV10(db))();
   } else if (row.version < SCHEMA_VERSION) {
     // Forward migrations (run oldest-first, inside one transaction).
     const tx = db.transaction(() => {
@@ -177,30 +161,7 @@ function initializeSchema(db: Database.Database): void {
         // NOT to this migration path, so existing DBs hit
         // "table reminders has no column named enabled" on the first
         // set_reminder. Guards keep re-runs safe.
-        const remCols = db
-          .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='reminders'")
-          .get() !== undefined
-          ? (
-              db.prepare("PRAGMA table_info(reminders)").all() as Array<
-                { name: string }
-              >
-            ).map((c) => c.name)
-          : [];
-        if (remCols.length > 0 && !remCols.includes("enabled")) {
-          db.exec("ALTER TABLE reminders ADD COLUMN enabled INTEGER CHECK (enabled IN (0, 1))");
-        }
-        const evCols = db
-          .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'")
-          .get() !== undefined
-          ? (
-              db.prepare("PRAGMA table_info(events)").all() as Array<
-                { name: string }
-              >
-            ).map((c) => c.name)
-          : [];
-        if (evCols.length > 0 && !evCols.includes("all_day_reminder_time")) {
-          db.exec("ALTER TABLE events ADD COLUMN all_day_reminder_time TEXT");
-        }
+        ensureReminderColumnsV7(db);
       }
       if (row!.version < 8) {
         // GATE-2026-09-22 all-day end_date repair (data-only, no DDL).
@@ -234,13 +195,46 @@ function initializeSchema(db: Database.Database): void {
           `);
         }
       }
-      if (row!.version < 9) {
+      // Drift repairs for EVERY stamp below the current version (review
+      // m-1): before v10 a v8/v9-stamped DB got the v7 column repair from
+      // the == SCHEMA_VERSION branch on its first open; since v10 it takes
+      // this branch instead, so the guarded, idempotent repair runs here
+      // too, and the FIRST open repairs it.
+      ensureReminderColumnsV7(db);
+      if (row!.version <= 9) {
         // DC-27 P5/P12 (DC-07 Appendix X.1, DC-05 Appendix A): additive.
+        // "<= 9", not "< 9": since v10 a v9-stamped DB no longer takes the
+        // == SCHEMA_VERSION repair branch, so the idempotent v9 repair runs
+        // here for it (DDL/migration drift, smoke round 5 lesson).
         ensureRevocationSchemaV9(db);
+      }
+      if (row!.version < 10) {
+        // DC-28 §4.9 (DC-07 amendment O1): announced_name + one-time move.
+        ensurePeerNamesSchemaV10(db);
       }
       db.prepare("UPDATE schema_version SET version = ?").run(SCHEMA_VERSION);
     });
     tx();
+  }
+}
+
+/**
+ * Smoke round 5 v7 pieces, guarded and idempotent: reminders.enabled and
+ * events.all_day_reminder_time, added only when the table exists and the
+ * column is missing (minimal hand-built test DBs may lack the tables).
+ */
+function ensureReminderColumnsV7(db: Database.Database): void {
+  const colsOf = (table: string): string[] =>
+    db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table) !== undefined
+      ? (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((c) => c.name)
+      : [];
+  const remCols = colsOf("reminders");
+  if (remCols.length > 0 && !remCols.includes("enabled")) {
+    db.exec("ALTER TABLE reminders ADD COLUMN enabled INTEGER CHECK (enabled IN (0, 1))");
+  }
+  const evCols = colsOf("events");
+  if (evCols.length > 0 && !evCols.includes("all_day_reminder_time")) {
+    db.exec("ALTER TABLE events ADD COLUMN all_day_reminder_time TEXT");
   }
 }
 
@@ -277,6 +271,39 @@ function ensureRevocationSchemaV9(db: Database.Database): void {
     acked_at             INTEGER NOT NULL,
     PRIMARY KEY (peer_device_id, revoked_device_id, revoked_by_device_id,
                  revoked_at_hlc))`);
+}
+
+/**
+ * DC-28 §4.9 (P9) v10 schema piece + one-time data migration, shared by the
+ * < 10 migration and the == v10 repair. Before DC-28 every display_name
+ * held what PAIRING stored (S3: the peer's suggestion or the 12-character
+ * id placeholder), never a user choice. So, only in the open that ADDS the
+ * column:
+ *   announced_name = display_name, when it passes §4.8 and is not a prefix
+ *                    of the device id (the placeholder; §4.5 rule), else NULL
+ *   display_name   = ""  (no nickname yet)
+ * Idempotent: once the column exists this is a no-op, so a nickname set
+ * after the migration is never moved or wiped by a later open. Returns
+ * true when it migrated.
+ */
+export function ensurePeerNamesSchemaV10(db: Database.Database): boolean {
+  const hasPeers =
+    db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='peers'").get() !== undefined;
+  if (!hasPeers) return false;
+  const cols = (db.prepare("PRAGMA table_info(peers)").all() as Array<{ name: string }>).map(
+    (c) => c.name,
+  );
+  if (cols.includes("announced_name")) return false;
+  db.exec("ALTER TABLE peers ADD COLUMN announced_name TEXT");
+  const rows = db.prepare("SELECT device_id, display_name FROM peers").all() as Array<{
+    device_id: string;
+    display_name: string | null;
+  }>;
+  const upd = db.prepare("UPDATE peers SET announced_name = ?, display_name = '' WHERE device_id = ?");
+  for (const r of rows) {
+    upd.run(announcedNameFromPeer(r.display_name, r.device_id).name, r.device_id);
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------

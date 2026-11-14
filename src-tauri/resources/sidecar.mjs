@@ -10,7 +10,7 @@ import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 
 // src/persistence/schema.ts
-var SCHEMA_VERSION = 9;
+var SCHEMA_VERSION = 10;
 var DDL = `
 CREATE TABLE calendars (
     calendar_id   TEXT PRIMARY KEY,
@@ -200,7 +200,11 @@ CREATE TABLE peers (
     last_known_clock TEXT NOT NULL DEFAULT '{}',
     last_endpoint_host TEXT,
     last_endpoint_port INTEGER,
-    last_endpoint_seen INTEGER
+    last_endpoint_seen INTEGER,
+    -- DC-28 \xA74.9: what the peer called itself at pairing (validated, or
+    -- NULL). display_name keeps its DC-05 \xA73.1 meaning: the label the
+    -- user assigned on THIS device (the nickname); "" = none.
+    announced_name   TEXT
 );
 
 CREATE TABLE revocation_records (
@@ -298,6 +302,97 @@ CREATE INDEX idx_cparticipants_change ON conflict_participants(change_id);
 CREATE INDEX idx_events_calendar ON events(calendar_id, utc_start_ms);
 CREATE INDEX idx_overrides_series ON occurrence_overrides(series_id);
 `;
+
+// src/domain/device_names.ts
+var NAME_MAX_CODE_POINTS = 32;
+var NAME_MAX_UTF8_BYTES = 64;
+var EDGE_ZS = /^\p{Zs}+|\p{Zs}+$/gu;
+var RUN_ZS = /\p{Zs}+/gu;
+var CC = /\p{Cc}/u;
+var ZL_ZP = /[\p{Zl}\p{Zp}]/u;
+var CO = /\p{Co}/u;
+var CS = /\p{Cs}/u;
+var CF_EXCEPT_ZWJ = /(?![‌‍])\p{Cf}/u;
+function utf8Length(s) {
+  let n = 0;
+  for (const ch of s) {
+    const cp = ch.codePointAt(0);
+    n += cp < 128 ? 1 : cp < 2048 ? 2 : cp < 65536 ? 3 : 4;
+  }
+  return n;
+}
+function codePointLength(s) {
+  let n = 0;
+  for (const _ of s) n++;
+  return n;
+}
+function validateName(input) {
+  if (typeof input !== "string") return { ok: false, rule: "not_string" };
+  if (CS.test(input)) return { ok: false, rule: "surrogate" };
+  const s = input.normalize("NFC").replace(EDGE_ZS, "").replace(RUN_ZS, " ");
+  if (s === "") return { ok: true, name: null };
+  if (CC.test(s)) return { ok: false, rule: "control" };
+  if (ZL_ZP.test(s)) return { ok: false, rule: "line_separator" };
+  if (CO.test(s)) return { ok: false, rule: "private_use" };
+  if (CF_EXCEPT_ZWJ.test(s)) return { ok: false, rule: "format" };
+  if (codePointLength(s) > NAME_MAX_CODE_POINTS) return { ok: false, rule: "too_many_characters" };
+  if (utf8Length(s) > NAME_MAX_UTF8_BYTES) return { ok: false, rule: "too_many_bytes" };
+  return { ok: true, name: s };
+}
+function announcedNameFromPeer(raw, senderDeviceId) {
+  if (raw === void 0 || raw === null) return { name: null };
+  const r = validateName(raw);
+  if (!r.ok) return { name: null, ignored: r.rule };
+  if (r.name === null) return { name: null };
+  if (senderDeviceId.startsWith(r.name)) return { name: null, ignored: "id_prefix" };
+  return { name: r.name };
+}
+var SYNC_DEVICE_ID = /^d-[0-9a-f]{64}$/;
+function shortId(deviceId) {
+  const id = typeof deviceId === "string" ? deviceId : "";
+  return SYNC_DEVICE_ID.test(id) ? id.slice(2, 10) : id.slice(0, 8);
+}
+var SELF_LABEL = "This device";
+function usable(v) {
+  if (v === null || v === void 0 || v === "") return null;
+  const r = validateName(v);
+  return r.ok ? r.name : null;
+}
+function deviceLabel(p) {
+  if (p.self_device_id && p.device_id === p.self_device_id) return SELF_LABEL;
+  return usable(p.nickname) ?? usable(p.announced_name) ?? `Device ${shortId(p.device_id)}`;
+}
+function disambiguateLabels(items) {
+  const idsByLabel = /* @__PURE__ */ new Map();
+  for (const it of items) {
+    let ids = idsByLabel.get(it.label);
+    if (ids === void 0) idsByLabel.set(it.label, ids = /* @__PURE__ */ new Set());
+    ids.add(it.device_id);
+  }
+  return items.map(
+    (it) => (idsByLabel.get(it.label)?.size ?? 0) > 1 ? `${it.label} (${shortId(it.device_id)})` : it.label
+  );
+}
+function deviceNameViews(rows, selfDeviceId) {
+  const base = rows.map((r) => {
+    const nickname = usable(r.display_name);
+    const announced = usable(r.announced_name);
+    return {
+      device_id: r.device_id,
+      short_id: shortId(r.device_id),
+      announced_name: announced,
+      nickname,
+      label: deviceLabel({
+        device_id: r.device_id,
+        self_device_id: selfDeviceId,
+        nickname,
+        announced_name: announced
+      })
+    };
+  });
+  const labels = disambiguateLabels(base);
+  return base.map((b, i) => ({ ...b, label: labels[i] }));
+}
 
 // src/sync/change_record.ts
 function changeId(deviceId, localSeq) {
@@ -574,21 +669,9 @@ function initializeSchema(db) {
       `database schema_version ${row.version} newer than supported ${SCHEMA_VERSION}`
     );
   } else if (row.version === SCHEMA_VERSION) {
-    const remCols = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='reminders'").get() !== void 0 ? db.prepare("PRAGMA table_info(reminders)").all().map((c) => c.name) : [];
-    if (remCols.length > 0 && !remCols.includes("enabled")) {
-      const tx = db.transaction(() => {
-        db.exec("ALTER TABLE reminders ADD COLUMN enabled INTEGER CHECK (enabled IN (0, 1))");
-      });
-      tx();
-    }
-    const evCols = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").get() !== void 0 ? db.prepare("PRAGMA table_info(events)").all().map((c) => c.name) : [];
-    if (evCols.length > 0 && !evCols.includes("all_day_reminder_time")) {
-      const tx = db.transaction(() => {
-        db.exec("ALTER TABLE events ADD COLUMN all_day_reminder_time TEXT");
-      });
-      tx();
-    }
+    db.transaction(() => ensureReminderColumnsV7(db))();
     db.transaction(() => ensureRevocationSchemaV9(db))();
+    db.transaction(() => ensurePeerNamesSchemaV10(db))();
   } else if (row.version < SCHEMA_VERSION) {
     const tx = db.transaction(() => {
       if (row.version < 2) {
@@ -644,14 +727,7 @@ function initializeSchema(db) {
         if (!cols.includes("last_endpoint_seen")) {
           db.exec("ALTER TABLE peers ADD COLUMN last_endpoint_seen INTEGER");
         }
-        const remCols = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='reminders'").get() !== void 0 ? db.prepare("PRAGMA table_info(reminders)").all().map((c) => c.name) : [];
-        if (remCols.length > 0 && !remCols.includes("enabled")) {
-          db.exec("ALTER TABLE reminders ADD COLUMN enabled INTEGER CHECK (enabled IN (0, 1))");
-        }
-        const evCols = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").get() !== void 0 ? db.prepare("PRAGMA table_info(events)").all().map((c) => c.name) : [];
-        if (evCols.length > 0 && !evCols.includes("all_day_reminder_time")) {
-          db.exec("ALTER TABLE events ADD COLUMN all_day_reminder_time TEXT");
-        }
+        ensureReminderColumnsV7(db);
       }
       if (row.version < 8) {
         const hasEvents = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").get() !== void 0;
@@ -671,12 +747,27 @@ function initializeSchema(db) {
           `);
         }
       }
-      if (row.version < 9) {
+      ensureReminderColumnsV7(db);
+      if (row.version <= 9) {
         ensureRevocationSchemaV9(db);
+      }
+      if (row.version < 10) {
+        ensurePeerNamesSchemaV10(db);
       }
       db.prepare("UPDATE schema_version SET version = ?").run(SCHEMA_VERSION);
     });
     tx();
+  }
+}
+function ensureReminderColumnsV7(db) {
+  const colsOf = (table) => db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table) !== void 0 ? db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name) : [];
+  const remCols = colsOf("reminders");
+  if (remCols.length > 0 && !remCols.includes("enabled")) {
+    db.exec("ALTER TABLE reminders ADD COLUMN enabled INTEGER CHECK (enabled IN (0, 1))");
+  }
+  const evCols = colsOf("events");
+  if (evCols.length > 0 && !evCols.includes("all_day_reminder_time")) {
+    db.exec("ALTER TABLE events ADD COLUMN all_day_reminder_time TEXT");
   }
 }
 function ensureRevocationSchemaV9(db) {
@@ -704,6 +795,21 @@ function ensureRevocationSchemaV9(db) {
     acked_at             INTEGER NOT NULL,
     PRIMARY KEY (peer_device_id, revoked_device_id, revoked_by_device_id,
                  revoked_at_hlc))`);
+}
+function ensurePeerNamesSchemaV10(db) {
+  const hasPeers = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='peers'").get() !== void 0;
+  if (!hasPeers) return false;
+  const cols = db.prepare("PRAGMA table_info(peers)").all().map(
+    (c) => c.name
+  );
+  if (cols.includes("announced_name")) return false;
+  db.exec("ALTER TABLE peers ADD COLUMN announced_name TEXT");
+  const rows = db.prepare("SELECT device_id, display_name FROM peers").all();
+  const upd = db.prepare("UPDATE peers SET announced_name = ?, display_name = '' WHERE device_id = ?");
+  for (const r of rows) {
+    upd.run(announcedNameFromPeer(r.display_name, r.device_id).name, r.device_id);
+  }
+  return true;
 }
 function backfillEntityVersions(db) {
   const rows = db.prepare(
@@ -5581,13 +5687,13 @@ function makeJsonChannel(raw) {
     }
   };
 }
-function makePairingPayload(identity, port, name) {
+function makePairingPayload(identity, port) {
   return {
     v: 1,
     device_id: identity.deviceId,
     public_key: Buffer.from(identity.publicKey).toString("base64"),
-    connect: { ip: localIpHint(), port },
-    ...name !== void 0 ? { name } : {}
+    connect: { ip: localIpHint(), port }
+    // DC-28 P5: no "name" — the code travels through screens/clipboards.
   };
 }
 function localIpHint() {
@@ -7392,11 +7498,15 @@ async function unpairLocal(db, opts) {
 }
 function listRemovedDevices(db, selfDeviceId) {
   const revoked = db.prepare(
-    "SELECT device_id, display_name FROM peers WHERE status = 'revoked' ORDER BY device_id"
+    "SELECT device_id, display_name, announced_name FROM peers WHERE status = 'revoked' ORDER BY device_id"
   ).all();
   const trusted = db.prepare(
-    "SELECT device_id, display_name FROM peers WHERE status = 'trusted' ORDER BY paired_at, device_id"
+    "SELECT device_id, display_name, announced_name FROM peers WHERE status = 'trusted' ORDER BY paired_at, device_id"
   ).all();
+  const removedLabels = deviceNameViews(revoked, selfDeviceId);
+  const toldLabels = new Map(
+    deviceNameViews(trusted, selfDeviceId).map((v) => [v.device_id, v.label])
+  );
   const removedAt = db.prepare(
     `SELECT COALESCE(
         (SELECT MIN(revoked_at_hlc) FROM revocation_records
@@ -7412,13 +7522,13 @@ function listRemovedDevices(db, selfDeviceId) {
       AND r.revoked_at_hlc = a.revoked_at_hlc
      WHERE a.peer_device_id = ? AND r.revoked_device_id = ? LIMIT 1`
   );
-  return revoked.map((p) => ({
+  return revoked.map((p, i) => ({
     device_id: p.device_id,
-    label: p.display_name,
+    label: removedLabels[i].label,
     removed_at: removedAt.get({ d: p.device_id, self: selfDeviceId })?.t ?? 0,
     told: trusted.filter((t) => t.device_id !== p.device_id).map((t) => ({
       device_id: t.device_id,
-      label: t.display_name,
+      label: toldLabels.get(t.device_id),
       done: acked.get(t.device_id, p.device_id) !== void 0
     }))
   }));
@@ -7434,22 +7544,22 @@ var PairingRefusedError = class extends Error {
 };
 function sqlPeerStore(db) {
   return {
-    store({ deviceId, publicKey, displayName, pairedAtMs }) {
+    store({ deviceId, publicKey, announcedName, pairedAtMs }) {
       if (isKnownRevoked(db, deviceId)) throw new PairingRefusedError();
       const info = db.prepare(
-        `INSERT INTO peers (device_id, public_key, display_name, paired_at,
-                              status, last_known_clock)
-           VALUES (?, ?, ?, ?, 'trusted', '{}')
+        `INSERT INTO peers (device_id, public_key, display_name, announced_name,
+                              paired_at, status, last_known_clock)
+           VALUES (?, ?, '', ?, ?, 'trusted', '{}')
            ON CONFLICT(device_id) DO UPDATE SET
              public_key = excluded.public_key,
-             display_name = excluded.display_name,
+             announced_name = excluded.announced_name,
              paired_at = excluded.paired_at,
              status = 'trusted'
            WHERE peers.status = 'trusted'`
       ).run(
         deviceId,
         Buffer.from(publicKey),
-        displayName,
+        announcedName,
         Math.floor(pairedAtMs / 1e3)
       );
       if (info.changes === 0) throw new PairingRefusedError();
@@ -7462,7 +7572,7 @@ function sqlPeerStore(db) {
 }
 function listTrustedPeers(db) {
   return db.prepare(
-    `SELECT device_id, display_name, paired_at,
+    `SELECT device_id, display_name, announced_name, paired_at,
               last_endpoint_host, last_endpoint_port, last_endpoint_seen
        FROM peers
        WHERE status = 'trusted' ORDER BY paired_at`
@@ -7475,7 +7585,40 @@ function recordPeerEndpoint(db, deviceId, host, port, seenMs) {
      WHERE device_id = ?`
   ).run(host, port, seenMs, deviceId);
 }
+function ownNameForPayload(name) {
+  if (name === void 0 || name === null) return void 0;
+  const r = validateName(name);
+  if (!r.ok) {
+    console.error(`[tide] pairing: own name not sent (${r.rule})`);
+    return void 0;
+  }
+  return r.name ?? void 0;
+}
+function sessionKeyMatchesCode(remoteStatic, edPublicKeyB64) {
+  try {
+    const x = ed25519ToX25519PublicKey(Buffer.from(edPublicKeyB64, "base64"));
+    return Buffer.from(x).equals(Buffer.from(remoteStatic));
+  } catch {
+    return false;
+  }
+}
+function localCeremonyPayload(identity, nonce, name) {
+  const p = {
+    v: 1,
+    device_id: identity.deviceId,
+    public_key: Buffer.from(identity.publicKey).toString("base64"),
+    nonce
+  };
+  if (name !== void 0) p.name = name;
+  return p;
+}
+function receivedAnnouncedName(raw, senderDeviceId) {
+  const r = announcedNameFromPeer(raw, senderDeviceId);
+  if (r.ignored !== void 0) console.error(`[tide] pairing: peer name ignored (${r.ignored})`);
+  return r.name;
+}
 async function createPairingOffer(opts) {
+  const ownName = ownNameForPayload(opts.name);
   let resolveOuter;
   let rejectOuter;
   const result = new Promise(
@@ -7491,13 +7634,11 @@ async function createPairingOffer(opts) {
   });
   async function runDisplayerSide(session) {
     try {
-      const localPayload = {
-        v: 1,
-        device_id: opts.identity.deviceId,
-        public_key: Buffer.from(opts.identity.publicKey).toString("base64"),
-        nonce: Buffer.from(freshNonce()).toString("base64"),
-        name: opts.name
-      };
+      const localPayload = localCeremonyPayload(
+        opts.identity,
+        Buffer.from(freshNonce()).toString("base64"),
+        ownName
+      );
       await session.json.send(localPayload);
       const remoteRaw = await session.json.receive();
       if (typeof remoteRaw?.device_id === "string" && opts.store.isRevoked?.(remoteRaw.device_id) === true) {
@@ -7514,7 +7655,10 @@ async function createPairingOffer(opts) {
         () => opts.store.store({
           deviceId: remoteRaw.device_id,
           publicKey: Buffer.from(remoteRaw.public_key, "base64"),
-          displayName: remoteRaw.name ?? remoteRaw.device_id.slice(0, 12),
+          // DC-28 §4.5: from the encrypted payload; the 12-char id
+          // placeholder default is gone (older builds' placeholder is
+          // dropped by the id-prefix rule).
+          announcedName: receivedAnnouncedName(remoteRaw.name, remoteRaw.device_id),
           pairedAtMs: Date.now()
         })
       );
@@ -7531,11 +7675,7 @@ async function createPairingOffer(opts) {
   const { actualPort } = await new Promise((res) => {
     setImmediate(() => res({ actualPort: host.actualPort }));
   });
-  const base = makePairingPayload(
-    opts.identity,
-    actualPort,
-    opts.name
-  );
+  const base = makePairingPayload(opts.identity, actualPort);
   const qrText = encodePairingPayload({
     ...base,
     nonce: Buffer.from(freshNonce()).toString("base64")
@@ -7566,6 +7706,7 @@ async function createPairingOffer(opts) {
   return { qrText, result, cancel };
 }
 async function acceptPairingPayload(opts) {
+  const ownName = ownNameForPayload(opts.name);
   const remote = decodePairingPayload(opts.qrText);
   if (!remote.connect) throw new Error("payload has no connect hint");
   if (opts.store.isRevoked?.(remote.device_id) === true) {
@@ -7578,13 +7719,15 @@ async function acceptPairingPayload(opts) {
   );
   const json = conn.json;
   try {
-    const localPayload = {
-      v: 1,
-      device_id: opts.identity.deviceId,
-      public_key: Buffer.from(opts.identity.publicKey).toString("base64"),
-      nonce: Buffer.from(randomBytes6(16)).toString("base64"),
-      name: opts.name
-    };
+    const sessionIsPastedDevice = sessionKeyMatchesCode(
+      conn.raw.remoteStaticKey(),
+      remote.public_key
+    );
+    const localPayload = localCeremonyPayload(
+      opts.identity,
+      Buffer.from(randomBytes6(16)).toString("base64"),
+      sessionIsPastedDevice ? ownName : void 0
+    );
     const firstRaw = await json.receive();
     const remoteRaw = firstRaw;
     await json.send(localPayload);
@@ -7598,7 +7741,13 @@ async function acceptPairingPayload(opts) {
       () => opts.store.store({
         deviceId: remote.device_id,
         publicKey: Buffer.from(remote.public_key, "base64"),
-        displayName: remote.name ?? remote.device_id.slice(0, 12),
+        // DC-28 §4.5 (fixes S2): the name from the ENCRYPTED payload, never
+        // from the pasted code. Accepted only when the session key is the
+        // pasted code's key AND the encrypted payload names the same
+        // identity (V2 here checks the encrypted payload's key, not the
+        // pasted one: TD-049), so another sender's name is never attached
+        // to the pasted device.
+        announcedName: sessionIsPastedDevice && remoteRaw?.device_id === remote.device_id && remoteRaw?.public_key === remote.public_key ? receivedAnnouncedName(remoteRaw.name, remote.device_id) : null,
         pairedAtMs: Date.now()
       })
     );
@@ -10475,13 +10624,22 @@ var ConflictsViewModel = class {
     ).get(changeId2);
     return row?.hlc_timestamp ?? 0;
   }
-  /** §3.2b device attribution through paired-device display names. */
+  /**
+   * §3.2b device attribution, DC-28 §4.7 label rule: "This device" for
+   * self, else nickname > announced name > "Device <short id>" (never the
+   * full id). Duplicate labels among one conflict's candidates are
+   * disambiguated by the dialog (P7).
+   */
   deviceName(deviceId) {
-    if (deviceId === this.selfDeviceId) return "This device";
     const row = this.db.prepare(
-      "SELECT display_name FROM peers WHERE device_id = ?"
+      "SELECT device_id, display_name, announced_name FROM peers WHERE device_id = ?"
     ).get(deviceId);
-    return row?.display_name ?? deviceId;
+    return deviceLabel({
+      device_id: deviceId,
+      self_device_id: this.selfDeviceId,
+      nickname: row?.display_name ?? null,
+      announced_name: row?.announced_name ?? null
+    });
   }
 };
 
@@ -10518,6 +10676,18 @@ var SyncRefusedError = class extends Error {
   }
   decision;
 };
+function nameRefusal(rule) {
+  switch (rule) {
+    case "too_many_characters":
+      return "This name is too long. Use at most 32 characters.";
+    case "too_many_bytes":
+      return "This name is too long. Use fewer characters.";
+    case "not_string":
+      return "This name could not be read.";
+    default:
+      return "This name contains invisible or control characters. Remove them and try again.";
+  }
+}
 var SyncManager = class {
   constructor(core, identity, dataDir) {
     this.core = core;
@@ -10555,6 +10725,43 @@ var SyncManager = class {
    * memory only: it is a hint, cleared by the next successful session.
    */
   refusedBy = /* @__PURE__ */ new Set();
+  /**
+   * DC-28 §4.2/§4.3: this device's own name, validated (§4.8), or null.
+   * Held in memory only; the shell owns its persistence (config.toml
+   * "device_name", P9) and pushes it at start and on every save. It leaves
+   * the device ONLY inside the encrypted pairing payload (P3), never in the
+   * pasted code (P5), mDNS (D2), sync messages (P6) or logs.
+   */
+  ownName = null;
+  get ownDeviceName() {
+    return this.ownName;
+  }
+  /**
+   * Validate and hold the own name ("" / null clears it). Throws a plain
+   * sentence (no name text: the shell logs failed calls) when invalid.
+   */
+  setOwnName(raw) {
+    const r = validateName(raw === null || raw === void 0 ? "" : raw);
+    if (!r.ok) throw new Error(nameRefusal(r.rule));
+    this.ownName = r.name;
+    return this.ownName;
+  }
+  /**
+   * DC-28 §4.4/P1: set (or clear with "") the local nickname of a paired
+   * device. Stored in peers.display_name (DC-05 §3.1 user-assigned label);
+   * never sent anywhere. Returns the device's new §4.9 view.
+   */
+  setPeerNickname(deviceId, raw) {
+    if (typeof deviceId !== "string" || deviceId.length === 0) {
+      throw new Error("device_id required");
+    }
+    const r = validateName(raw === null || raw === void 0 ? "" : raw);
+    if (!r.ok) throw new Error(nameRefusal(r.rule));
+    const info = this.core.db.prepare("UPDATE peers SET display_name = ? WHERE device_id = ? AND status = 'trusted'").run(r.name ?? "", deviceId);
+    if (info.changes === 0) throw new Error("This device is not paired.");
+    const row = this.core.db.prepare("SELECT device_id, display_name, announced_name FROM peers WHERE device_id = ?").get(deviceId);
+    return deviceNameViews([row], this.identity.deviceId)[0];
+  }
   get deviceId() {
     return this.identity.deviceId;
   }
@@ -10840,7 +11047,7 @@ var SyncManager = class {
    * Devices). Merge of: paired peers, live Tier-1 ladder state, Tier-2
    * durable hard blocks, and the §2.3 durable invalid tally (history).
    */
-  peerStateSnapshot() {
+  peerStateSnapshot(onlyPaired = false) {
     const peers = listTrustedPeers(this.core.db);
     const blocks = new Map(listHardBlocks(this.core.db).map((b) => [b.producer_device_id, b]));
     const tally = new Map(
@@ -10853,9 +11060,15 @@ var SyncManager = class {
       ...tally.keys()
     ]);
     const out = [];
-    for (const id of Array.from(known).sort()) {
+    const ids = Array.from(known).sort().filter((id) => !onlyPaired || peers.some((p) => p.device_id === id));
+    const names = deviceNameViews(
+      ids.map((id) => peers.find((p) => p.device_id === id) ?? { device_id: id }),
+      this.identity.deviceId
+    );
+    for (const [i, id] of ids.entries()) {
       const paired = peers.some((p) => p.device_id === id);
       const peer = peers.find((p) => p.device_id === id);
+      const { device_id: _id, ...name } = names[i];
       const t1 = this.misbehavior.getState(id);
       const b = blocks.get(id) ?? null;
       const tl = tally.get(id) ?? null;
@@ -10863,7 +11076,7 @@ var SyncManager = class {
         ...t1,
         paired,
         refused_us: this.refusedBy.has(id),
-        display_name: peer?.display_name ?? null,
+        ...name,
         paired_at: peer ? peer.paired_at * 1e3 : null,
         ladder_label: LADDER_LABELS[t1.level],
         hard_block: b ? {
@@ -11270,10 +11483,11 @@ function makeSyncDispatcher(sync, core, endpoints) {
           // DC-11 §2.3).
           instance_name: buildInstanceName(sync.identity.deviceId),
           txt: buildTxtRecord({}),
-          paired_peers: peers.map((p) => ({
-            device_id: p.device_id,
-            display_name: p.display_name,
-            paired_at: p.paired_at * 1e3
+          // DC-28 §4.9: { device_id, label, nickname, announced_name,
+          // short_id } per peer; label per §4.7, disambiguated in this list.
+          paired_peers: deviceNameViews(peers, sync.identity.deviceId).map((v, i) => ({
+            ...v,
+            paired_at: peers[i].paired_at * 1e3
           })),
           // DC-21 §3.4/D4: the shell registers mDNS on this port (and
           // re-registers goodbye-first on change).
@@ -11292,7 +11506,10 @@ function makeSyncDispatcher(sync, core, endpoints) {
         const offerPromise = createPairingOffer({
           identity: sync.identity,
           port: typeof args.port === "number" ? args.port : void 0,
-          name: typeof args.name === "string" ? args.name : sync.identity.deviceId.slice(0, 12),
+          // DC-28 P3: only the SAVED own name is sent (saving = consent);
+          // a caller-supplied args.name is ignored, and the 12-character id
+          // placeholder default is gone (no name set -> no "name" key).
+          name: sync.ownDeviceName ?? void 0,
           store: sqlPeerStore(core.db)
         });
         void offerPromise.then((o) => {
@@ -11317,7 +11534,8 @@ function makeSyncDispatcher(sync, core, endpoints) {
           identity: sync.identity,
           qr_text_text: void 0,
           qrText: args.qr_text,
-          name: typeof args.name === "string" ? args.name : void 0,
+          name: sync.ownDeviceName ?? void 0,
+          // DC-28 P3 (see pairing_offer)
           store: sqlPeerStore(core.db)
         }).then((r) => ({
           peer_device_id: r.peerDeviceId,
@@ -11397,7 +11615,7 @@ function makeSyncDispatcher(sync, core, endpoints) {
       case "list_paired_devices": {
         return {
           self_device_id: sync.identity.deviceId,
-          devices: sync.peerStateSnapshot().filter((p) => p.paired)
+          devices: sync.peerStateSnapshot(true)
         };
       }
       // §4.2 Tier-1: "Reset peer state" — one click, no confirmation.
@@ -11424,6 +11642,17 @@ function makeSyncDispatcher(sync, core, endpoints) {
       // DC-27 §4.11 / P8: Removed devices + per-peer "told" state.
       case "list_removed_devices": {
         return { removed: sync.removedDevices() };
+      }
+      // DC-28 §4.2/P9: the shell pushes the saved own name (at start and on
+      // every save) and persists the normalized value this returns. Not in
+      // the shell's sync_op allow-list: only the shell's own set/get device
+      // name commands call it.
+      case "set_device_name": {
+        return { device_name: sync.setOwnName(args.name) };
+      }
+      // DC-28 §4.4/P1: local nickname for a paired device ("" clears).
+      case "set_peer_nickname": {
+        return sync.setPeerNickname(args.device_id, args.nickname);
       }
       default:
         throw new Error(`unknown op: ${op}`);
@@ -11498,7 +11727,8 @@ function main() {
     }
     schedulerHandle.updateSchedulerSettings(partial);
     return { applied: true, next_start_only: "max_incremental_backlog" };
-  })() : op.startsWith("sync_") || op === "device_info" || op === "pairing_offer" || op === "pairing_accept" || op === "cancel_pairing_offer" || op === "list_quarantine" || op === "quarantine_stats" || op === "retry_quarantine" || op === "delete_quarantine" || op === "peer_state" || op === "list_paired_devices" || op === "reset_peer_state" || op === "unblock_peer" || op === "unpair_device" || op === "list_removed_devices" ? syncDispatch(op, args) : dispatch(op, args);
+  })() : op.startsWith("sync_") || op === "device_info" || op === "pairing_offer" || op === "pairing_accept" || op === "cancel_pairing_offer" || op === "list_quarantine" || op === "quarantine_stats" || op === "retry_quarantine" || op === "delete_quarantine" || op === "peer_state" || op === "list_paired_devices" || op === "reset_peer_state" || op === "unblock_peer" || op === "unpair_device" || op === "list_removed_devices" || // DC-28: own name (shell-only) + local nickname
+  op === "set_device_name" || op === "set_peer_nickname" ? syncDispatch(op, args) : dispatch(op, args);
   const pairedDeviceIds = () => listTrustedPeers(core.db).map((p) => p.device_id);
   const expectedPrefixes = () => {
     const map = /* @__PURE__ */ new Map();

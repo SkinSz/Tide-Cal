@@ -7,6 +7,8 @@
 type Json = Record<string, unknown>;
 
 import { invoke } from "@tauri-apps/api/core";
+import { shortId, type PairedDeviceEntry } from "./device-label.ts";
+import { createNameEditor } from "./name_editor.ts";
 
 /** Tauri `sync_op` passthrough; shared by the Devices and Sync Errors views. */
 export async function syncOp<T = Json>(op: string, args: Json = {}): Promise<T> {
@@ -20,12 +22,72 @@ export async function syncOp<T = Json>(op: string, args: Json = {}): Promise<T> 
 
 interface DeviceInfo {
   device_id: string;
-  paired_peers: Array<{
-    device_id: string;
-    display_name: string;
-    paired_at: number;
-  }>;
+  /** DC-28 §4.9 views (label computed by the sidecar, §4.7). */
+  paired_peers: Array<PairedDeviceEntry & { short_id: string; paired_at: number }>;
   listening_port: number;
+}
+
+/** DC-28 own name as the shell stores it (config.toml "device_name", P9). */
+export interface OwnDeviceName {
+  device_name: string | null;
+  /** P2: OS-family suggestion ("Linux PC", "Windows PC"); never the hostname. */
+  suggestion: string;
+}
+
+/** DC-28 §4.3 (P3): the help text IS the consent statement. */
+export const OWN_NAME_HELP = "Shown on devices you pair with from now on.";
+
+/** Text of the "This device:" line's name part (P11: only place it shows). */
+export function ownNameLineText(name: string | null): string {
+  return name ?? "No name yet";
+}
+
+async function getOwnName(): Promise<OwnDeviceName> {
+  if (!("__TAURI_INTERNALS__" in globalThis)) {
+    throw new Error("not running inside the Tide desktop shell");
+  }
+  return (await invoke("get_device_name")) as OwnDeviceName;
+}
+
+async function renderOwnName(): Promise<void> {
+  const nameEl = el<HTMLElement>("self-device-name");
+  try {
+    const own = await getOwnName();
+    nameEl.textContent = ownNameLineText(own.device_name);
+    nameEl.classList.toggle("muted", own.device_name === null);
+  } catch (err) {
+    console.warn("[tide] get_device_name unavailable:", err);
+    nameEl.textContent = ownNameLineText(null);
+  }
+}
+
+/**
+ * DC-28 §4.4: edit the own name in place. Pre-filled with the saved name,
+ * or with the P2 OS-family SUGGESTION, which is saved only on Save.
+ */
+async function openOwnNameEditor(): Promise<void> {
+  const host = el<HTMLDivElement>("self-name-editor");
+  if (host.childElementCount > 0) return; // already open
+  let own: OwnDeviceName = { device_name: null, suggestion: "" };
+  try {
+    own = await getOwnName();
+  } catch (err) {
+    log(`rename unavailable: ${String(err)}`);
+    return;
+  }
+  const editor = createNameEditor({
+    initial: own.device_name ?? own.suggestion,
+    help: OWN_NAME_HELP,
+    save: async (value) => {
+      await invoke("set_device_name", { name: value });
+    },
+    close: () => {
+      host.textContent = "";
+      void renderOwnName();
+    },
+  });
+  host.appendChild(editor);
+  editor.querySelector("input")?.focus();
 }
 
 function dlg(): HTMLDialogElement {
@@ -61,29 +123,32 @@ async function cancelPairingOffer(): Promise<void> {
 
 async function renderDeviceInfo(): Promise<void> {
   try {
+    void renderOwnName();
     const info = await syncOp<DeviceInfo>("device_info");
-    (
-      el<HTMLElement>("self-device-id") as HTMLElement
-    ).textContent = `${info.device_id.slice(0, 18)}…`;
+    // DC-28 §4.7: the short id, a complete token (no "...", TD-032).
+    el<HTMLElement>("self-device-id").textContent = shortId(info.device_id);
     // Owner (smoke test 2026-08-27): the listening port is dev noise —
     // hidden from the UI (still available in logs/debug).
     const portEl = el<HTMLElement>("self-listen-port");
     if (portEl.parentElement) portEl.parentElement.hidden = true;
     const list = el<HTMLDivElement>("peers-list");
-    list.innerHTML = "";
+    list.textContent = "";
     if (info.paired_peers.length === 0) {
-      list.innerHTML =
-        '<p class="muted">No paired devices yet. Use “Show pairing code” on one device and paste it here on the other.</p>';
+      const p = document.createElement("p");
+      p.className = "muted";
+      p.textContent =
+        "No paired devices yet. Use “Show pairing code” on one device and paste it here on the other.";
+      list.appendChild(p);
       return;
     }
     for (const p of info.paired_peers) {
       const row = document.createElement("div");
       row.className = "peer-row";
       const name = document.createElement("strong");
-      name.textContent = p.display_name;
+      name.textContent = p.label; // DC-28 §4.8: untrusted text, textContent only
       const id = document.createElement("span");
       id.className = "muted";
-      id.textContent = p.device_id.slice(0, 16) + "…";
+      id.textContent = `id ${shortId(p.device_id)}`;
       row.append(name, id);
       list.appendChild(row);
     }
@@ -120,10 +185,9 @@ async function acceptPairing(): Promise<void> {
       { qr_text: text },
     );
     // Same human sees both screens on one machine in practice; still verify
-    // numbers match when both sides run locally.
-    log(
-      `paired with ${res.peer_device_id.slice(0, 16)}… (safety ${res.safety_number})`,
-    );
+    // numbers match when both sides run locally. DC-28 §4.10: the label of
+    // the new peer, never a truncated id.
+    log(`paired with ${await peerLabel(res.peer_device_id)} (safety ${res.safety_number})`);
     input.value = "";
     setOfferPending(false); // successful pair closes the offer side too
     await renderDeviceInfo();
@@ -135,6 +199,18 @@ async function acceptPairing(): Promise<void> {
   } finally {
     setBusy(false);
   }
+}
+
+/** DC-28 §4.7 label of one paired peer; "Device <short id>" if unknown. */
+async function peerLabel(deviceId: string): Promise<string> {
+  try {
+    const info = await syncOp<DeviceInfo>("device_info");
+    const hit = info.paired_peers.find((p) => p.device_id === deviceId);
+    if (hit && hit.label) return hit.label;
+  } catch {
+    /* fall through to the short id */
+  }
+  return `Device ${shortId(deviceId)}`;
 }
 
 /** DC-27 §4.13 P10 wording (mirrors REVOKED_REPAIR_MESSAGE in the sidecar). */
@@ -225,8 +301,15 @@ export function initDevices(): void {
   document
     .getElementById("btn-pairing-cancel")
     ?.addEventListener("click", () => void cancelPairingOffer());
+  document
+    .getElementById("btn-rename-self")
+    ?.addEventListener("click", () => void openOwnNameEditor());
   // Closing the dialog hides a pending offer's Cancel affordance; the offer
   // itself is still torn down server-side (stdin-EOF shutdown).
-  dlg()?.addEventListener("close", () => setOfferPending(false));
+  dlg()?.addEventListener("close", () => {
+    setOfferPending(false);
+    const host = document.getElementById("self-name-editor");
+    if (host) host.textContent = ""; // an unsaved rename is discarded
+  });
   wireFirewallNotice();
 }

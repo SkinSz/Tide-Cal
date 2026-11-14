@@ -32,9 +32,10 @@ describe("runtime migration proof on a copy of the real production DB", () => {
       expect(core.reminderFor(first.id)).toEqual({ minutesBefore: 15, enabled: true });
       core.clearReminder(first.id);
       expect(core.reminderFor(first.id)).toBeNull();
-      // Schema at 9 (v9 = DC-27 revocation cutoff + ACK store).
+      // Schema at 10 (v9 = DC-27 revocation cutoff + ACK store; v10 =
+      // DC-28 peers.announced_name).
       const v = (core.db.prepare("SELECT version FROM schema_version").get() as { version: number }).version;
-      expect(v).toBe(9);
+      expect(v).toBe(10);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

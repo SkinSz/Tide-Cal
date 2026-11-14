@@ -6,6 +6,7 @@
 //
 // Logging (DC-27 P9 / §4.12): one info line per event, short ids only. Never
 // logged: keys, signatures, record bytes, display names, addresses.
+import { deviceNameViews } from "../domain/device_names.ts";
 import type { Database } from "better-sqlite3";
 import {
   canonicalRevocationBytes,
@@ -455,16 +456,23 @@ export interface RemovedDevice {
  * when that peer ACKed any record naming the removed device (DC-10 §3).
  */
 export function listRemovedDevices(db: Database, selfDeviceId: string): RemovedDevice[] {
+  type NameRow = { device_id: string; display_name: string; announced_name: string | null };
   const revoked = db
     .prepare(
-      "SELECT device_id, display_name FROM peers WHERE status = 'revoked' ORDER BY device_id",
+      "SELECT device_id, display_name, announced_name FROM peers WHERE status = 'revoked' ORDER BY device_id",
     )
-    .all() as Array<{ device_id: string; display_name: string }>;
+    .all() as NameRow[];
   const trusted = db
     .prepare(
-      "SELECT device_id, display_name FROM peers WHERE status = 'trusted' ORDER BY paired_at, device_id",
+      "SELECT device_id, display_name, announced_name FROM peers WHERE status = 'trusted' ORDER BY paired_at, device_id",
     )
-    .all() as Array<{ device_id: string; display_name: string }>;
+    .all() as NameRow[];
+  // DC-28 §4.7/§4.10: revoked peers keep their label; each list (removed
+  // devices, devices told) is disambiguated on its own (P7).
+  const removedLabels = deviceNameViews(revoked, selfDeviceId);
+  const toldLabels = new Map(
+    deviceNameViews(trusted, selfDeviceId).map((v) => [v.device_id, v.label]),
+  );
   const removedAt = db.prepare(
     `SELECT COALESCE(
         (SELECT MIN(revoked_at_hlc) FROM revocation_records
@@ -480,16 +488,16 @@ export function listRemovedDevices(db: Database, selfDeviceId: string): RemovedD
       AND r.revoked_at_hlc = a.revoked_at_hlc
      WHERE a.peer_device_id = ? AND r.revoked_device_id = ? LIMIT 1`,
   );
-  return revoked.map((p) => ({
+  return revoked.map((p, i) => ({
     device_id: p.device_id,
-    label: p.display_name,
+    label: removedLabels[i]!.label,
     removed_at:
       (removedAt.get({ d: p.device_id, self: selfDeviceId }) as { t: number | null } | undefined)?.t ?? 0,
     told: trusted
       .filter((t) => t.device_id !== p.device_id)
       .map((t) => ({
         device_id: t.device_id,
-        label: t.display_name,
+        label: toldLabels.get(t.device_id)!,
         done: acked.get(t.device_id, p.device_id) !== undefined,
       })),
   }));

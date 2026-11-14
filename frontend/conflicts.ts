@@ -25,6 +25,7 @@ import type {
   ListFilter,
   ResolutionOption,
 } from "../src/application/conflicts_ui.ts";
+import { disambiguateLabels, shortId } from "../src/domain/device_names.ts";
 import { syncOp } from "./devices.ts";
 import { formatTimeLabel, getTimeFormat, type TimeFormat } from "./theme.ts";
 
@@ -599,27 +600,43 @@ function isLocalCandidate(detail: ConflictDetailView, c: CandidateView): boolean
 }
 
 /**
- * A.4 short device token: the first 8 characters of the device id. Sync
- * device ids carry a "d-" type prefix ("d-2ee25c62…"); A.1's example
- * ("Device 2ee25c62") counts from after it, so the prefix is skipped.
- * Any other id shape uses its first 8 characters verbatim.
+ * A.4 short device token = DC-28 §4.7 shortId: the 8 hex characters after
+ * "d-" of a sync device id ("Device 2ee25c62", as in the A.1 example); the
+ * first 8 characters of any other id shape. One implementation for every
+ * surface (src/domain/device_names.ts).
  */
 export function shortDeviceId(deviceId: string): string {
-  const id = deviceId ?? "";
-  return /^d-[0-9a-f]/i.test(id) ? id.slice(2, 10) : id.slice(0, 8);
+  return shortId(deviceId ?? "");
+}
+
+/** One side's label before P7 disambiguation. */
+function rawCandidateSide(detail: ConflictDetailView, c: CandidateView): string {
+  if (isLocalCandidate(detail, c)) return "This device (local)";
+  // DC-28 §4.7 (retires the A.4 interim rule): the sidecar's label -
+  // nickname > announced name > "Device <short id>" - for this device id.
+  const name = typeof c.device_name === "string" ? c.device_name : "";
+  if (name.length > 0) return name;
+  const short = shortDeviceId(c.device_id);
+  return short.length > 0 ? `Device ${short}` : "Another device";
 }
 
 /**
- * A.4 interim device label: "This device (local)" for self, otherwise
- * "Device " + the short id. Never the full id, never truncated with "…".
+ * A.4 device label: "This device (local)" for self, otherwise the DC-28
+ * label. Never the full id, never truncated with "…". DC-28 P7: when two
+ * devices among this conflict's candidates would read the same (also a
+ * peer that calls itself "This device (local)"), both get " (<short id>)".
  */
 export function describeCandidateSide(
   detail: ConflictDetailView,
   candidate: CandidateView,
 ): string {
-  if (isLocalCandidate(detail, candidate)) return "This device (local)";
-  const short = shortDeviceId(candidate.device_id);
-  return short.length > 0 ? `Device ${short}` : "Another device";
+  const all = detail.candidates.includes(candidate)
+    ? detail.candidates
+    : [...detail.candidates, candidate];
+  const labels = disambiguateLabels(
+    all.map((c) => ({ device_id: c.device_id, label: rawCandidateSide(detail, c) })),
+  );
+  return labels[all.indexOf(candidate)]!;
 }
 
 /** A.6 button wording: "Keep this device's" / "Keep Device 2ee25c62's". */

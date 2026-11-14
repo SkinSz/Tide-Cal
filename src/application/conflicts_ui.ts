@@ -24,6 +24,7 @@
 // keep_theirs -> resolved_keep_incoming, keep_both/custom ->
 // resolved_custom (+resolved_value), skip -> NO WRITE (TR-2).
 
+import { deviceLabel } from "../domain/device_names.ts";
 import type { Database } from "better-sqlite3";
 import { createLocalChange } from "../persistence/database.ts";
 import type { ChangeRecord, VectorClock } from "../sync/change_record.ts";
@@ -689,15 +690,24 @@ export class ConflictsViewModel {
     return row?.hlc_timestamp ?? 0;
   }
 
-  /** §3.2b device attribution through paired-device display names. */
+  /**
+   * §3.2b device attribution, DC-28 §4.7 label rule: "This device" for
+   * self, else nickname > announced name > "Device <short id>" (never the
+   * full id). Duplicate labels among one conflict's candidates are
+   * disambiguated by the dialog (P7).
+   */
   private deviceName(deviceId: string): string {
-    if (deviceId === this.selfDeviceId) return "This device";
     const row = this.db
-      .prepare<[string], { display_name: string }>(
-        "SELECT display_name FROM peers WHERE device_id = ?",
+      .prepare<[string], { device_id: string; display_name: string; announced_name: string | null }>(
+        "SELECT device_id, display_name, announced_name FROM peers WHERE device_id = ?",
       )
       .get(deviceId);
-    return row?.display_name ?? deviceId;
+    return deviceLabel({
+      device_id: deviceId,
+      self_device_id: this.selfDeviceId,
+      nickname: row?.display_name ?? null,
+      announced_name: row?.announced_name ?? null,
+    });
   }
 }
 

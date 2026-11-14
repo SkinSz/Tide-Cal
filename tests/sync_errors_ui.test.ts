@@ -122,7 +122,7 @@ describe("list_quarantine dispatcher op", () => {
 });
 
 describe("Sync Errors display shaping (pure layer)", () => {
-  test("truncated producer, parsed seq, verbatim reason, raw passthrough", () => {
+  test("short-id producer, parsed seq, verbatim reason, raw passthrough", () => {
     const rows: QuarantineRow[] = [
       {
         quarantine_id: 11,
@@ -145,7 +145,7 @@ describe("Sync Errors display shaping (pure layer)", () => {
     const views = shapeQuarantineRows(rows);
     expect(views).toHaveLength(2);
     // Producer id truncated for display.
-    expect(views[0]!.producer).toBe("x519deadbeef0123…");
+    expect(views[0]!.producer).toBe("x519dead"); // DC-28 short id, no "…"
     expect(views[0]!.seq).toBe(2);
     // Reason code shown VERBATIM — never interpreted or reworded.
     expect(views[0]!.reason).toBe("invalid_change_record:bad_operation");
@@ -223,11 +223,12 @@ describe("Sync-Errors card redesign helpers", () => {
 // Device-label helper (owner-approved UX package): adopted across sync surfaces
 // ---------------------------------------------------------------------------
 describe("resolveDeviceLabel", () => {
+  // DC-28 §4.9: paired entries carry the sidecar-computed label.
   const paired = [
-    { device_id: "dev-paired-abcdef", display_name: "Laptop" },
+    { device_id: "dev-paired-abcdef", label: "Laptop" },
   ];
 
-  test("paired display_name wins", () => {
+  test("paired label wins", () => {
     expect(resolveDeviceLabel("dev-paired-abcdef", paired)).toBe("Laptop");
   });
 
@@ -237,20 +238,20 @@ describe("resolveDeviceLabel", () => {
     );
   });
 
-  test("fallback: truncated id, never invented names", () => {
+  test("fallback: 'Device <short id>', never a truncated id or an invented name", () => {
     expect(resolveDeviceLabel("dev-f6d77e6c-156abcdef", paired, "dev-self")).toBe(
-      "dev-f6d77e6c-156…",
+      "Device dev-f6d7",
     );
-    expect(resolveDeviceLabel("short-id")).toBe("short-id");
+    expect(resolveDeviceLabel("d-" + "2ee25c62".padEnd(64, "a"))).toBe("Device 2ee25c62");
   });
 
-  test("empty paired display_name falls through to the id", () => {
+  test("empty paired label falls through to the short id", () => {
     expect(
       resolveDeviceLabel(
         "dev-x",
-        [{ device_id: "dev-x", display_name: "" }],
+        [{ device_id: "dev-x", label: "" }],
         "dev-self",
       ),
-    ).toBe("dev-x");
+    ).toBe("Device dev-x");
   });
 });

@@ -180,7 +180,10 @@
       <div class="dlg-body devices-dlg">
         <h2>Devices &amp; Sync</h2>
         <div class="devices-self">
-          <span>This device: <code id="self-device-id">…</code></span>
+          <span class="devices-self-line">This device: <strong id="self-device-name">…</strong>
+            <button type="button" id="btn-rename-self">Rename</button>
+            <span class="muted">(id <span id="self-device-id">…</span>)</span></span>
+          <div id="self-name-editor"></div>
           <span class="muted">listening on port <span id="self-listen-port">…</span></span>
         </div>
         <div class="pairing-grid">

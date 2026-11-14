@@ -498,6 +498,13 @@ input[type="time"]::-webkit-time-picker-indicator { display: none; }
 .devices-dlg { min-width: 620px; }
 .devices-self { display: flex; gap: 16px; margin-bottom: 12px; font-size: 0.85rem; }
 .devices-self code { font-size: 0.8rem; color: var(--accent); }
+/* Friendly device names: own-name line + in-place rename editor */
+.devices-self { flex-wrap: wrap; align-items: center; }
+.devices-self-line button { margin-left: 6px; }
+#self-name-editor { flex-basis: 100%; }
+.name-editor { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 6px 0; }
+.name-editor-input { flex: 1 1 14em; min-width: 0; }
+.name-editor-help, .name-editor-error { flex-basis: 100%; font-size: 0.8rem; }
 .pairing-grid { display: flex; gap: 14px; }
 .pairing-grid fieldset {
   flex: 1;

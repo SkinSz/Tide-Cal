@@ -343,7 +343,6 @@ function makeJsonChannel(raw: RawSessionHandle): JsonChannel {
 export function makePairingPayload(
   identity: DeviceIdentity,
   port: number,
-  name?: string,
 ): {
   v: 1;
   device_id: string;
@@ -355,7 +354,7 @@ export function makePairingPayload(
     device_id: identity.deviceId,
     public_key: Buffer.from(identity.publicKey).toString("base64"),
     connect: { ip: localIpHint(), port },
-    ...(name !== undefined ? { name } : {}),
+    // DC-28 P5: no "name" — the code travels through screens/clipboards.
   };
 }
 

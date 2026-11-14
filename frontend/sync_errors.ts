@@ -5,7 +5,12 @@
 // Reason codes are shown VERBATIM; raw metadata is expandable via <details>.
 // Data comes through the Tauri `sync_op` passthrough (no new Rust commands).
 import { syncOp } from "./devices.ts";
-import { resolveDeviceLabel, type PairedDeviceEntry } from "./device-label.ts";
+import {
+  fallbackDeviceLabel,
+  resolveDeviceLabel,
+  shortId,
+  type PairedDeviceEntry,
+} from "./device-label.ts";
 
 export interface QuarantineRow {
   quarantine_id: number;
@@ -22,7 +27,7 @@ export interface QuarantineRow {
 /** One display row of the Sync Errors dialog. */
 export interface SyncErrorView {
   quarantine_id: number;
-  /** producer id truncated for display ("" when unparsable) */
+  /** producer short id ("<8 hex>", DC-28 §4.7; "(unknown)" when unparsable) */
   producer: string;
   /** producer local_seq parsed out of raw_record (-1 when unparsable) */
   seq: number;
@@ -212,7 +217,7 @@ export function shapeQuarantineRows(rows: QuarantineRow[]): SyncErrorView[] {
     }
     return {
       quarantine_id: r.quarantine_id,
-      producer: producer ? producer.slice(0, 16) + "…" : "(unknown)",
+      producer: producer ? shortId(producer) : "(unknown)",
       seq,
       sender: r.sender_device_id,
       reason: r.quarantine_reason,
@@ -249,7 +254,11 @@ export interface PeerStateRow {
   window_ratio: number;
   dropped_while_throttled: number;
   paired: boolean;
-  display_name: string | null;
+  /** DC-28 §4.9: label computed by the sidecar (§4.7, P7 per list). */
+  label: string;
+  short_id: string;
+  nickname: string | null;
+  announced_name: string | null;
   paired_at: number | null;
   ladder_label: string;
   hard_block: {
@@ -301,9 +310,7 @@ export function shapePeerStates(rows: PeerStateRow[]): PeerStateView[] {
     }
     return {
       device_id: r.device_id,
-      display:
-        r.display_name ??
-        (r.device_id.length > 16 ? r.device_id.slice(0, 16) + "…" : r.device_id),
+      display: r.label && r.label.length > 0 ? r.label : fallbackDeviceLabel(r.device_id),
       level: r.level,
       label: r.ladder_label,
       notable,
@@ -443,8 +450,8 @@ function renderList(rows: QuarantineRow[]): void {
 /**
  * Owner-approved card redesign (2026-08-27): cards under an "Active (N)"
  * header, resolved rows collapsed below. Device labels come from
- * device_info (paired display names + our own id); on failure the label
- * helper degrades to truncated ids.
+ * device_info (paired labels + our own id); on failure the label helper
+ * degrades to "Device <short id>" (DC-28 §4.7).
  */
 async function renderListAsync(rows: QuarantineRow[]): Promise<void> {
   const list = el<HTMLDivElement>("sync-errors-list");
@@ -459,7 +466,7 @@ async function renderListAsync(rows: QuarantineRow[]): Promise<void> {
     paired = info.paired_peers;
     selfId = info.device_id;
   } catch {
-    /* label degrade: truncated ids instead of display names */
+    /* label degrade: "Device <short id>" instead of names */
   }
   const label = (id: string): string => resolveDeviceLabel(id, paired, selfId);
   if (rows.length === 0) {

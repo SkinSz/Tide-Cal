@@ -128,7 +128,11 @@ function row(over: Record<string, unknown> = {}): Record<string, unknown> {
     device_id: W,
     paired: true,
     refused_us: false,
-    display_name: "Windows PC",
+    // DC-28 §4.9 name fields (label computed by the sidecar)
+    label: "Windows PC",
+    short_id: "7178aa55",
+    nickname: null,
+    announced_name: "Windows PC",
     paired_at: 1,
     level: 0,
     ladder_label: "observe",

@@ -19,6 +19,7 @@ import {
 } from "../security/pairing.ts";
 import { ed25519ToX25519PublicKey } from "../network/noise_transport.ts";
 import { isKnownRevoked } from "../security/revocation_store.ts";
+import { announcedNameFromPeer, validateName } from "../domain/device_names.ts";
 import {
   serveSync,
   connectSync,
@@ -31,7 +32,12 @@ export interface TrustedPeerStore {
   store(peer: {
     deviceId: string;
     publicKey: Uint8Array;
-    displayName: string;
+    /**
+     * DC-28 §4.5: the name the peer announced in its ENCRYPTED payload,
+     * already validated (§4.8) — or null. Display-only (D1). A re-pair
+     * replaces it; the local nickname (display_name) is never touched.
+     */
+    announcedName: string | null;
     pairedAtMs: number;
   }): boolean;
   /**
@@ -55,7 +61,7 @@ export class PairingRefusedError extends Error {
 /** SQL-backed store over the DC-07 peers table. */
 export function sqlPeerStore(db: Database): TrustedPeerStore {
   return {
-    store({ deviceId, publicKey, displayName, pairedAtMs }): boolean {
+    store({ deviceId, publicKey, announcedName, pairedAtMs }): boolean {
       // DC-27 P10 (S8): the upsert can never flip a 'revoked' row back to
       // trusted — the WHERE guard makes it a no-op, and a no-op is refused.
       // An id named by a stored valid record is refused too (no peers row
@@ -63,12 +69,12 @@ export function sqlPeerStore(db: Database): TrustedPeerStore {
       if (isKnownRevoked(db, deviceId)) throw new PairingRefusedError();
       const info = db
         .prepare(
-          `INSERT INTO peers (device_id, public_key, display_name, paired_at,
-                              status, last_known_clock)
-           VALUES (?, ?, ?, ?, 'trusted', '{}')
+          `INSERT INTO peers (device_id, public_key, display_name, announced_name,
+                              paired_at, status, last_known_clock)
+           VALUES (?, ?, '', ?, ?, 'trusted', '{}')
            ON CONFLICT(device_id) DO UPDATE SET
              public_key = excluded.public_key,
-             display_name = excluded.display_name,
+             announced_name = excluded.announced_name,
              paired_at = excluded.paired_at,
              status = 'trusted'
            WHERE peers.status = 'trusted'`,
@@ -76,7 +82,7 @@ export function sqlPeerStore(db: Database): TrustedPeerStore {
         .run(
           deviceId,
           Buffer.from(publicKey),
-          displayName,
+          announcedName,
           Math.floor(pairedAtMs / 1000),
         );
       if (info.changes === 0) throw new PairingRefusedError();
@@ -90,7 +96,9 @@ export function sqlPeerStore(db: Database): TrustedPeerStore {
 
 export function listTrustedPeers(db: Database): Array<{
   device_id: string;
+  /** DC-28: the local nickname ("" = none). Render via deviceNameViews. */
   display_name: string;
+  announced_name: string | null;
   paired_at: number;
   last_endpoint_host: string | null;
   last_endpoint_port: number | null;
@@ -98,7 +106,7 @@ export function listTrustedPeers(db: Database): Array<{
 }> {
   return db
     .prepare(
-      `SELECT device_id, display_name, paired_at,
+      `SELECT device_id, display_name, announced_name, paired_at,
               last_endpoint_host, last_endpoint_port, last_endpoint_seen
        FROM peers
        WHERE status = 'trusted' ORDER BY paired_at`,
@@ -106,6 +114,7 @@ export function listTrustedPeers(db: Database): Array<{
     .all() as Array<{
     device_id: string;
     display_name: string;
+    announced_name: string | null;
     paired_at: number;
     last_endpoint_host: string | null;
     last_endpoint_port: number | null;
@@ -133,6 +142,59 @@ export function recordPeerEndpoint(
      SET last_endpoint_host = ?, last_endpoint_port = ?, last_endpoint_seen = ?
      WHERE device_id = ?`,
   ).run(host, port, seenMs, deviceId);
+}
+
+// ---------------------------------------------------------------------------
+// DC-28 §4.3/§4.5: names in the ceremony. The own name leaves the device
+// ONLY inside the encrypted payload, never in the QR / pasted code (P5).
+// ---------------------------------------------------------------------------
+
+/** The own name as it may go into our encrypted payload (§4.8), or undefined. */
+export function ownNameForPayload(name: unknown): string | undefined {
+  if (name === undefined || name === null) return undefined;
+  const r = validateName(name);
+  if (!r.ok) {
+    console.error(`[tide] pairing: own name not sent (${r.rule})`);
+    return undefined;
+  }
+  return r.name ?? undefined;
+}
+
+/** True when a Noise remote static is the bound X25519 form of `edPublicKeyB64`. */
+function sessionKeyMatchesCode(remoteStatic: Uint8Array, edPublicKeyB64: string): boolean {
+  try {
+    const x = ed25519ToX25519PublicKey(Buffer.from(edPublicKeyB64, "base64"));
+    return Buffer.from(x).equals(Buffer.from(remoteStatic));
+  } catch {
+    return false;
+  }
+}
+
+/** Our encrypted-channel payload; carries "name" only when one is set. */
+function localCeremonyPayload(
+  identity: { deviceId: string; publicKey: Uint8Array },
+  nonce: string,
+  name: string | undefined,
+): PairingPayload {
+  const p: PairingPayload = {
+    v: 1,
+    device_id: identity.deviceId,
+    public_key: Buffer.from(identity.publicKey).toString("base64"),
+    nonce,
+  };
+  if (name !== undefined) p.name = name;
+  return p;
+}
+
+/**
+ * §4.5 on receive (both sides): validate the ENCRYPTED payload's name; an
+ * invalid one is dropped and pairing still succeeds. The debug line carries
+ * the rule only, never any part of the name (TR-4).
+ */
+export function receivedAnnouncedName(raw: unknown, senderDeviceId: string): string | null {
+  const r = announcedNameFromPeer(raw, senderDeviceId);
+  if (r.ignored !== undefined) console.error(`[tide] pairing: peer name ignored (${r.ignored})`);
+  return r.name;
 }
 
 // ---------------------------------------------------------------------------
@@ -168,9 +230,11 @@ export async function createPairingOffer(opts: {
     privateKey: Uint8Array;
   };
   port?: number;
+  /** DC-28: the saved own name (validated again here); undefined = none. */
   name?: string;
   store: TrustedPeerStore;
 }): Promise<PairingOffer> {
+  const ownName = ownNameForPayload(opts.name);
   let resolveOuter!: (v: { peerDeviceId: string; safetyNumber: string }) => void;
   let rejectOuter!: (e: Error) => void;
   const result = new Promise<{ peerDeviceId: string; safetyNumber: string }>(
@@ -191,13 +255,11 @@ export async function createPairingOffer(opts: {
       // We are INITIATOR of the app-level exchange: send our payload first
       // over the encrypted JSON channel (pairing has its own framing; the
       // DC-08 SyncMessage union stays reserved for the engine).
-      const localPayload: PairingPayload = {
-        v: 1,
-        device_id: opts.identity.deviceId,
-        public_key: Buffer.from(opts.identity.publicKey).toString("base64"),
-        nonce: Buffer.from(freshNonce()).toString("base64"),
-        name: opts.name,
-      };
+      const localPayload = localCeremonyPayload(
+        opts.identity,
+        Buffer.from(freshNonce()).toString("base64"),
+        ownName,
+      );
       await session.json.send(localPayload);
       const remoteRaw = (await session.json.receive()) as PairingPayload;
       // DC-27 P10: refuse a revoked id as soon as it is known, before any
@@ -226,7 +288,10 @@ export async function createPairingOffer(opts: {
         opts.store.store({
           deviceId: remoteRaw.device_id,
           publicKey: Buffer.from(remoteRaw.public_key, "base64"),
-          displayName: remoteRaw.name ?? remoteRaw.device_id.slice(0, 12),
+          // DC-28 §4.5: from the encrypted payload; the 12-char id
+          // placeholder default is gone (older builds' placeholder is
+          // dropped by the id-prefix rule).
+          announcedName: receivedAnnouncedName(remoteRaw.name, remoteRaw.device_id),
           pairedAtMs: Date.now(),
         }),
       );
@@ -248,11 +313,9 @@ export async function createPairingOffer(opts: {
     // enough for this call chain; poll once via address probe:
     setImmediate(() => res({ actualPort: (host as { actualPort: number }).actualPort }));
   });
-  const base = makePairingPayload(
-    opts.identity,
-    actualPort,
-    opts.name,
-  );
+  // DC-28 P5: the QR / pasted code carries NO name (it travels through
+  // screens and clipboards; the peer gets it from the encrypted payload).
+  const base = makePairingPayload(opts.identity, actualPort);
   const qrText = encodePairingPayload({
     ...(base as unknown as PairingPayload),
     nonce: Buffer.from(freshNonce()).toString("base64"),
@@ -308,9 +371,14 @@ export interface ScanResult {
 export async function acceptPairingPayload(opts: {
   identity: { deviceId: string; publicKey: Uint8Array; privateKey: Uint8Array };
   qrText: string;
+  /** DC-28: the saved own name (validated again here); undefined = none. */
   name?: string;
   store: TrustedPeerStore;
 }): Promise<ScanResult> {
+  const ownName = ownNameForPayload(opts.name);
+  // decodePairingPayload still ACCEPTS "name" (older builds put it in the
+  // code), but DC-28 §4.5 never stores it: the name comes only from the
+  // encrypted payload below.
   const remote = decodePairingPayload(opts.qrText); // strict validation + TR-9
   if (!remote.connect) throw new Error("payload has no connect hint");
   // DC-27 P10: the remote id is known from the code itself — refuse before
@@ -327,13 +395,20 @@ export async function acceptPairingPayload(opts: {
   const json = conn.json;
 
   try {
-    const localPayload: PairingPayload = {
-      v: 1,
-      device_id: opts.identity.deviceId,
-      public_key: Buffer.from(opts.identity.publicKey).toString("base64"),
-      nonce: Buffer.from(randomBytes(16)).toString("base64"),
-      name: opts.name,
-    };
+    // DC-28 §4.3: the own name goes ONLY to "the one device being paired".
+    // The session key must be the pasted code's key (its bound X25519
+    // form) before our name is put in the payload; otherwise someone else
+    // answered at the hinted address, and our payload carries no name.
+    // (Trust decisions are unchanged here: TD-049.)
+    const sessionIsPastedDevice = sessionKeyMatchesCode(
+      conn.raw.remoteStaticKey(),
+      remote.public_key,
+    );
+    const localPayload = localCeremonyPayload(
+      opts.identity,
+      Buffer.from(randomBytes(16)).toString("base64"),
+      sessionIsPastedDevice ? ownName : undefined,
+    );
 
     // Displayer side speaks first (app-level convention); payload arrives
     // as a parsed object over the encrypted JSON channel.
@@ -354,7 +429,18 @@ export async function acceptPairingPayload(opts: {
       opts.store.store({
         deviceId: remote.device_id,
         publicKey: Buffer.from(remote.public_key, "base64"),
-        displayName: remote.name ?? remote.device_id.slice(0, 12),
+        // DC-28 §4.5 (fixes S2): the name from the ENCRYPTED payload, never
+        // from the pasted code. Accepted only when the session key is the
+        // pasted code's key AND the encrypted payload names the same
+        // identity (V2 here checks the encrypted payload's key, not the
+        // pasted one: TD-049), so another sender's name is never attached
+        // to the pasted device.
+        announcedName:
+          sessionIsPastedDevice &&
+          remoteRaw?.device_id === remote.device_id &&
+          remoteRaw?.public_key === remote.public_key
+            ? receivedAnnouncedName(remoteRaw.name, remote.device_id)
+            : null,
         pairedAtMs: Date.now(),
       }),
     );

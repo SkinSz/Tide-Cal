@@ -337,13 +337,200 @@ fn load_settings_pub() -> TideSettings {
 }
 
 fn persist_settings(app: &tauri::AppHandle, s: &TideSettings) -> Result<(), String> {
-    let path = config_path(app)?;
+    save_settings_file(&config_path(app)?, s)
+}
+
+/// DC-28 V4: the Options window Save-all and the Devices dialog Rename both
+/// write config.toml. One lock serializes the two read-modify-write cycles,
+/// and Save-all carries "device_name" over from the file, so neither writer
+/// clobbers the other's key.
+fn save_settings_file(path: &std::path::Path, s: &TideSettings) -> Result<(), String> {
+    let _guard = CONFIG_WRITE_LOCK
+        .lock()
+        .map_err(|_| "config lock poisoned".to_string())?;
+    let existing = std::fs::read_to_string(path).ok();
+    let text = settings_text_keeping_device_name(existing.as_deref(), s)?;
+    write_config_atomic(path, &text)
+}
+
+/// DC-28 V4: the Rename read-modify-write under the same lock. `normalize`
+/// is the sidecar's validator (it also makes the sidecar hold the value);
+/// `restore` puts the sidecar back to the old value if the file write fails.
+fn rename_device_name_file(
+    path: &std::path::Path,
+    raw: &str,
+    normalize: impl FnOnce(&str) -> Result<Option<String>, String>,
+    restore: impl FnOnce(Option<&str>),
+) -> Result<Option<String>, String> {
+    let _guard = CONFIG_WRITE_LOCK
+        .lock()
+        .map_err(|_| "config lock poisoned".to_string())?;
+    let existing = match std::fs::read_to_string(path) {
+        Ok(t) => Some(t),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("read config: {e}")),
+    };
+    let old = device_name_in(existing.as_deref());
+    let normalized = normalize(raw)?;
+    let written = config_text_with_device_name(existing.as_deref(), normalized.as_deref())
+        .and_then(|text| write_config_atomic(path, &text));
+    if let Err(e) = written {
+        restore(old.as_deref());
+        return Err(e);
+    }
+    Ok(normalized)
+}
+
+// ---------------------------------------------------------------------------
+// DC-28 friendly device names: the own name (config.toml "device_name", P9).
+// Display-only (D1). The ONE validator (§4.8) is the sidecar's: the shell
+// never judges a name itself, it pushes the raw value and persists the
+// normalized result. The name is never logged.
+// ---------------------------------------------------------------------------
+
+/// DC-28 P9: config.toml key of this device's own name.
+const DEVICE_NAME_KEY: &str = "device_name";
+
+/// DC-28 V4: serializes every config.toml read-modify-write cycle.
+static CONFIG_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Write temp + rename in the config dir, so a reader never sees a torn file.
+fn write_config_atomic(path: &std::path::Path, text: &str) -> Result<(), String> {
     let dir = path
         .parent()
         .ok_or_else(|| "config path has no parent".to_string())?;
     std::fs::create_dir_all(dir).map_err(|e| format!("create config dir: {e}"))?;
-    let text = toml::to_string_pretty(s).map_err(|e| format!("toml serialize: {e}"))?;
-    std::fs::write(&path, text).map_err(|e| format!("write config: {e}"))
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, text).map_err(|e| format!("write config: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("replace config: {e}"))
+}
+
+/// The "device_name" value of a config text, if it parses and is a string.
+fn device_name_in(text: Option<&str>) -> Option<String> {
+    text.and_then(|t| t.parse::<toml::Table>().ok())
+        .and_then(|t| t.get(DEVICE_NAME_KEY).and_then(|v| v.as_str()).map(str::to_string))
+}
+
+/// Save-all text: the settings struct plus the file's existing device_name.
+fn settings_text_keeping_device_name(
+    existing: Option<&str>,
+    s: &TideSettings,
+) -> Result<String, String> {
+    let mut table = match toml::Value::try_from(s).map_err(|e| format!("toml serialize: {e}"))? {
+        toml::Value::Table(t) => t,
+        _ => return Err("toml serialize: settings are not a table".to_string()),
+    };
+    if let Some(name) = device_name_in(existing) {
+        table.insert(DEVICE_NAME_KEY.to_string(), toml::Value::String(name));
+    }
+    toml::to_string_pretty(&table).map_err(|e| format!("toml serialize: {e}"))
+}
+
+/// Rename text: the existing file with ONLY "device_name" set (Some) or
+/// removed (None); every other key is kept as it is. An unreadable file is
+/// refused, never replaced (that would reset the other settings).
+fn config_text_with_device_name(existing: Option<&str>, name: Option<&str>) -> Result<String, String> {
+    let mut table = match existing {
+        None => toml::Table::new(),
+        Some(text) => text
+            .parse::<toml::Table>()
+            .map_err(|_| "The settings file could not be read, so the name was not saved.".to_string())?,
+    };
+    match name {
+        Some(n) => {
+            table.insert(DEVICE_NAME_KEY.to_string(), toml::Value::String(n.to_string()));
+        }
+        None => {
+            table.remove(DEVICE_NAME_KEY);
+        }
+    }
+    toml::to_string_pretty(&table).map_err(|e| format!("toml serialize: {e}"))
+}
+
+/// DC-28 P2 / V3: the rename field's SUGGESTION, from the OS family only
+/// (compile-time target). Never the hostname. Saved only on the user's Save.
+fn os_family_suggestion() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Windows PC"
+    } else if cfg!(target_os = "macos") {
+        "Mac"
+    } else if cfg!(target_os = "linux") {
+        "Linux PC"
+    } else {
+        ""
+    }
+}
+
+/// Push a raw own name to the sidecar (its §4.8 validator) and return the
+/// normalized value it now holds; None = no name. Invalid -> Err(sentence).
+fn sidecar_set_device_name(sc: &sidecar::Sidecar, raw: Option<&str>) -> Result<Option<String>, String> {
+    let v = proxy(sc, "set_device_name", json!({ "name": raw.unwrap_or("") }))?;
+    Ok(v["device_name"].as_str().map(str::to_string))
+}
+
+/// Startup / re-sync: hand the SAVED own name to the sidecar so pairing can
+/// send it (P3). An invalid hand-edited value is ignored (not sent, not
+/// shown); the log line never carries the text.
+fn push_saved_device_name(app: &tauri::AppHandle, sc: &sidecar::Sidecar) -> Option<String> {
+    // Same lock as the writers: never push a value a concurrent Rename is
+    // replacing (the sidecar would end up holding the old one).
+    let _guard = CONFIG_WRITE_LOCK.lock().ok()?;
+    let saved = config_path(app)
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok());
+    let raw = device_name_in(saved.as_deref());
+    match sidecar_set_device_name(sc, raw.as_deref()) {
+        Ok(name) => name,
+        Err(_) => {
+            // invalid hand-edited value, or the call failed: not sent, not shown
+            log::warn!("device_name in config.toml not applied (invalid or sidecar call failed)");
+            let _ = sidecar_set_device_name(sc, None);
+            None
+        }
+    }
+}
+
+/// DC-28 §4.4: the own name for the "This device:" line, plus the P2
+/// suggestion. Re-pushes the saved value (idempotent), so a restarted
+/// sidecar holds it again before the user can start a pairing.
+#[tauri::command]
+async fn get_device_name(
+    app: tauri::AppHandle,
+    sc: State<'_, SidecarState>,
+) -> Result<serde_json::Value, String> {
+    let handle = sidecar_handle(&sc)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let name = push_saved_device_name(&app, &handle);
+        Ok(json!({ "device_name": name, "suggestion": os_family_suggestion() }))
+    })
+    .await
+    .map_err(|e| format!("join sidecar task: {e}"))?
+}
+
+/// DC-28 §4.4/P3/P9: save the own name ("" clears it). Order: the sidecar
+/// validates and holds it, then config.toml is rewritten with only this key
+/// changed; if the write fails the sidecar is put back to the old value.
+#[tauri::command(rename_all = "snake_case")]
+async fn set_device_name(
+    app: tauri::AppHandle,
+    sc: State<'_, SidecarState>,
+    name: String,
+) -> Result<serde_json::Value, String> {
+    let handle = sidecar_handle(&sc)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = config_path(&app)?;
+        let normalized = rename_device_name_file(
+            &path,
+            &name,
+            |raw| sidecar_set_device_name(&handle, Some(raw)),
+            |old| {
+                let _ = sidecar_set_device_name(&handle, old);
+            },
+        )?;
+        Ok(json!({ "device_name": normalized }))
+    })
+    .await
+    .map_err(|e| format!("join sidecar task: {e}"))?
 }
 
 /// DC-20 §4.2: read the effective settings (env > file > default).
@@ -695,7 +882,7 @@ async fn sync_op(
     op: String,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    const ALLOWED: [&str; 26] = [
+    const ALLOWED: [&str; 27] = [
         "device_info",
         "pairing_offer",
         "pairing_accept",
@@ -715,6 +902,10 @@ async fn sync_op(
         // read-only Removed devices listing.
         "unpair_device",
         "list_removed_devices",
+        // DC-28 §4.4: local nickname of a paired device (never sent). The
+        // own name is NOT here: it goes through set_device_name, which
+        // persists it in config.toml.
+        "set_peer_nickname",
         "list_series",
         // DC-22: reminder member write path (event dialog "Remind me").
         "get_reminder",
@@ -1489,6 +1680,16 @@ pub fn run() {
                                 svc.push_snapshot(Arc::new(mdns_service::PingSink { sc: Arc::clone(&sc_arc) }));
                                 app.manage(SidecarState(Mutex::new(Some(Arc::clone(&sc_arc)))));
 
+                                // DC-28 P3/P9: hand the saved own name to the
+                                // sidecar (pairing sends only that value).
+                                {
+                                    let app2 = app.handle().clone();
+                                    let sc2 = Arc::clone(&sc_arc);
+                                    let _ = tauri::async_runtime::spawn_blocking(move || {
+                                        let _ = push_saved_device_name(&app2, &sc2);
+                                    });
+                                }
+
                                 // DC-21 §3.4 (bug #1b follow-up, 2026-11-13):
                                 // REGISTER this device on mDNS. Until now
                                 // TideMdns::register was never called — both
@@ -1672,6 +1873,8 @@ pub fn run() {
             quit_tide,
             get_settings,
             set_settings,
+            get_device_name,
+            set_device_name,
             get_reminder,
             set_reminder,
             clear_reminder,
@@ -1777,5 +1980,144 @@ max_incremental_backlog = 1000.0
         let s: TideSettings = toml::from_str(text).expect("parse");
         assert_eq!(s.general_theme, "dark");
         assert_eq!(s.general_time_format, "24h");
+    }
+}
+
+#[cfg(test)]
+mod dc28_device_name_config_tests {
+    use super::*;
+
+    const EXISTING: &str = "sync_debounce_seconds = 10.0\nsweep_interval_minutes = 10.0\nmax_concurrent_sessions = 3.0\nmax_incremental_backlog = 1000.0\n\"general.theme\" = \"light\"\ndevice_name = \"Windows PC\"\n";
+
+    #[test]
+    fn v4_save_all_keeps_the_device_name_from_the_file() {
+        // Options window Save-all sends TideSettings, which has no
+        // device_name: the key must be carried over, not dropped.
+        let mut s = TideSettings::default();
+        s.general_theme = "dark".to_string();
+        let out = settings_text_keeping_device_name(Some(EXISTING), &s).expect("text");
+        let t: toml::Table = out.parse().expect("parse");
+        assert_eq!(t["device_name"].as_str(), Some("Windows PC"));
+        assert_eq!(t["general.theme"].as_str(), Some("dark"));
+        // and a file without a name gains none
+        let out = settings_text_keeping_device_name(None, &s).expect("text");
+        assert!(!out.contains("device_name"));
+    }
+
+    #[test]
+    fn v4_rename_changes_only_the_device_name_key() {
+        let out = config_text_with_device_name(Some(EXISTING), Some("Office \"laptop\"")).expect("text");
+        let t: toml::Table = out.parse().expect("parse");
+        assert_eq!(t["device_name"].as_str(), Some("Office \"laptop\""));
+        assert_eq!(t["general.theme"].as_str(), Some("light"));
+        assert_eq!(t["max_incremental_backlog"].as_float(), Some(1000.0));
+        let cleared = config_text_with_device_name(Some(&out), None).expect("text");
+        let t: toml::Table = cleared.parse().expect("parse");
+        assert!(t.get("device_name").is_none());
+        assert_eq!(t["general.theme"].as_str(), Some("light"));
+    }
+
+    #[test]
+    fn v4_rename_refuses_an_unreadable_file_instead_of_replacing_it() {
+        let err = config_text_with_device_name(Some("this is = = not toml"), Some("X")).unwrap_err();
+        assert!(!err.contains('X'), "the refusal must not echo the name");
+    }
+
+    #[test]
+    fn v4_settings_load_ignores_the_device_name_key() {
+        let s: TideSettings = toml::from_str(EXISTING).expect("unknown key ignored");
+        assert_eq!(s.general_theme, "light");
+        assert_eq!(device_name_in(Some(EXISTING)).as_deref(), Some("Windows PC"));
+        assert_eq!(device_name_in(Some("device_name = 5")), None);
+        assert_eq!(device_name_in(None), None);
+    }
+
+    /// Scratch dir under the crate's target/ (never /tmp).
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("dc28-test-{tag}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn v4_concurrent_writers_keep_both_keys_on_disk() {
+        // Rename and Save-all race on real threads, released together by a
+        // barrier, through the SAME functions the commands use. Without the
+        // shared lock one writer's read-modify-write can overwrite the
+        // other's key (lost update); with it, both keys always survive.
+        let dir = scratch_dir("race");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        const ROUNDS: usize = 200;
+        for round in 0..ROUNDS {
+            std::fs::remove_file(&path).ok();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let (p1, b1) = (path.clone(), barrier.clone());
+            let renamer = std::thread::spawn(move || {
+                b1.wait();
+                rename_device_name_file(
+                    &p1,
+                    "Laptop",
+                    |raw| {
+                        // widen the race window inside the critical section
+                        std::thread::yield_now();
+                        Ok(Some(raw.to_string()))
+                    },
+                    |_| {},
+                )
+                .unwrap();
+            });
+            let (p2, b2) = (path.clone(), barrier.clone());
+            let saver = std::thread::spawn(move || {
+                let mut s = TideSettings::default();
+                s.general_theme = "light".to_string();
+                b2.wait();
+                save_settings_file(&p2, &s).unwrap();
+            });
+            renamer.join().unwrap();
+            saver.join().unwrap();
+            let t: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+            assert_eq!(t.get("device_name").and_then(|v| v.as_str()), Some("Laptop"), "round {round}");
+            assert_eq!(t.get("general.theme").and_then(|v| v.as_str()), Some("light"), "round {round}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn v4_failed_rename_write_restores_the_old_name() {
+        let dir = scratch_dir("restore");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "device_name = \"Old\"\n").unwrap();
+        // make the temp-file write fail: a directory where the temp file goes
+        std::fs::create_dir_all(path.with_extension("toml.tmp")).unwrap();
+        let mut restored: Option<String> = None;
+        let r = rename_device_name_file(&path, "New", |raw| Ok(Some(raw.to_string())), |old| {
+            restored = old.map(str::to_string)
+        });
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(r.is_err());
+        assert_eq!(restored.as_deref(), Some("Old"));
+    }
+
+    #[test]
+    fn v3_suggestion_is_the_os_family_only() {
+        let s = os_family_suggestion();
+        if cfg!(target_os = "linux") {
+            assert_eq!(s, "Linux PC");
+        }
+        if cfg!(target_os = "windows") {
+            assert_eq!(s, "Windows PC");
+        }
+    }
+
+    #[test]
+    fn dc28_seams_registered() {
+        // three seams: set_peer_nickname in ALLOWED; both commands in
+        // generate_handler; set_device_name with snake_case args.
+        let src = include_str!("lib.rs");
+        assert!(src.contains("\"set_peer_nickname\","));
+        assert!(src.contains("            get_device_name,\n            set_device_name,"));
+        assert!(src.contains("#[tauri::command(rename_all = \"snake_case\")]\nasync fn set_device_name("));
     }
 }

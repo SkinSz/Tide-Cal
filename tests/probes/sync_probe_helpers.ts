@@ -142,7 +142,7 @@ export async function pairDevices(a: Device, b: Device): Promise<void> {
       sqlPeerStore(self.db as never).store({
         deviceId: remoteDeviceId,
         publicKey: Buffer.from(remote.public_key, "base64"),
-        displayName: remote.device_id.slice(0, 10),
+        announcedName: null,
         pairedAtMs: Date.now(),
       }),
     );

@@ -441,7 +441,7 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 - **ID:** TD-032
 - **Title:** Device ids are cut off; the paired-devices list should show either the short id or a friendly name
 - **Priority:** 4/10 — MEDIUM
-- **Status:** OPEN — depends on the friendly-device-name design (future contract)
+- **Status:** RESOLVED (2026-11-14, DC-28 friendly device names): every Devices / Sync surface shows one label (local nickname, else the name the device announced at pairing, else "Device <8 hex short id>"), never a truncated id with "…". Shared rule: `src/domain/device_names.ts`; regression: `tests/dc28_surfaces_dom.test.ts` (TR-6 / TR-9, one DOM test per surface) and `tests/dc28_device_names.test.ts`.
 
 ## TD-033 — Layout breaks in small windows
 - **ID:** TD-033
@@ -542,8 +542,52 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 - **Priority:** 5/10 — MEDIUM (data loss; within a session the Noise transport's in-order nonces rule out third-party replay, so it needs a faulty or hostile paired peer or a future code path that delivers `final` alone)
 - **Status:** OPEN. PROVEN by an uncommitted review probe (2026-11-14): sender with 600 events in 3 messages; the receiver held 600 after the full stream and 89 after the same `final` message was delivered once more (same result when it is duplicated inside one session). Related observations from the same review: `receiveAndApplySnapshots` (src/sync/sync_engine.ts) reads from the transport without draining the stashed-message queue first (HYPOTHESIS: an earlier message sitting in the stash would be left out of the commit; no conforming sequence found); `SnapshotStream.discard()` keeps its head after a declined or malformed message (safe today, since the engine discards the object); staging has no size limit; a database closed mid-stream makes the clean-up in the session `finally` throw and hide the session's own error. Fix needs a wire change (stream id and message index or count, checked before commit) and a DC-08/DC-09 amendment.
 
+
+## TD-049 — Pairing scanner checks the session key against the other side's own payload, not the pasted code
+- **ID:** TD-049
+- **Title:** In `acceptPairingPayload` (src/network/pairing_manager.ts:403-405) the scanner runs DC-05 §6.1 V2 against the payload the connected party sent over the encrypted channel (`exchangePayloads(localPayload, remoteRaw)`, `verifyRemoteStatic`), not against the `public_key` of the pasted code, and `connectSync` is given no expected key. Trust is then stored for the PASTED id and key (line 411). DC-05 §6.1 V2 says the scanner verifies the session key against the QR payload `public_key` (the authoritative out-of-band binding). Related: neither side runs the received encrypted payload through `decodePairingPayload`, and the displayer (line 279) stores `remoteRaw.device_id` without checking that it is derived from `remoteRaw.public_key`.
+- **Priority:** 5/10 — MEDIUM (pairing ceremony binding; INFERRED impact: whoever answers at the pasted address can complete the ceremony with the scanner, which then stores trust in the pasted device's key; the safety-number comparison is still auto-confirmed, see the TODO(ui) in the same file)
+- **Status:** OPEN (OBSERVED by source reading during DC-28, 2026-11-14; no exploit probe written). DC-28 does not depend on the fix: the scanner stores the peer's announced name only when the encrypted payload names the same id and key as the pasted code, so a mismatching sender's name is never attached to the pasted device. A fix changes the pairing ceremony and needs its own review.
+
+## TD-050 — A peer can announce a name that reads like another label
+- **ID:** TD-050
+- **Title:** DC-28 §4.8 allows any visible text, so a peer can announce "This device", "This device (local)" or "Device <another device's short id>". DC-28 P7 adds " (<short id>)" only when two entries in the SAME list collide (the conflict dialog includes this device, so a spoof there is disambiguated); in lists without this device (Paired Devices, Sync Errors), or across lists, such a name is shown as is, with only the muted "id <short id>" next to it in Paired Devices and Devices & sync.
+- **Priority:** 2/10 — LOW (display only, D1: names never affect identity or trust; the peer is already paired)
+- **Status:** OPEN (INFERRED from the DC-28 rules, 2026-11-14). Options: reserve the label forms "This device…" / "Device <8 hex>" in validateName for received names, or always show the short id next to announced names. Either is a DC-28 amendment.
+
+## TD-051 — The offering device sends its own name to whoever connects first
+- **ID:** TD-051
+- **Title:** In the pairing ceremony the displayer (the device showing the code) sends its encrypted payload first (DC-05 §5.2 order, `createPairingOffer` in src/network/pairing_manager.ts), before it knows who connected: the offer listener has no expected key. With DC-28 that payload carries the saved own name, so any device that reaches the open offer port while the code is shown receives the name, even without the code. The scanner side does not have this gap (it checks the session key against the pasted code before adding its name).
+- **Priority:** 2/10 — LOW (the name is display text the user chose to share when pairing, P3; the window is the open offer only; no identity or trust impact)
+- **Status:** OPEN (INFERRED from the ceremony order, 2026-11-14). Fix options: the displayer sends its name only after it received the scanner's payload, or the code carries a one-time secret the scanner must prove. Both change the ceremony (DC-05) and need their own review. Owner decision (2026-11-14): fix before v0.2 with a one-time secret in the pairing code, which the scanner must prove before the displayer sends anything (a DC-05 ceremony amendment, drafted separately; not part of DC-28).
+
 ## TD-052 — A snapshot from a lagging sender deletes history it never held
 - **ID:** TD-052
 - **Title:** The absence rule (DC-09 §5.2) deletes a receiver's live entity that is absent from a full-state snapshot when the entity's version is dominated by the sender's snapshot_clock. snapshot_clock comes from the sender's device_clock, which takes in causal context (DC-27 Appendix B.1 e): a sender whose applied_upto[W] lags below an entity's seq, but which applied another producer's change that cites that seq, covers the entity without holding it. The receiver then tombstones legitimate history, including a removed device's changes at or below the revocation cutoff (against DC-27 §4.4 KEPT and TR-7). DC-09 Appendix A.2 accepts such a sender, since its declared applied_upto[W] is at or below the cutoff, and A.3 clamps applied_upto only. The apply also deletes when neither device holds any record (PROVEN at the apply level); whether a real session reaches that sender state is INFERRED, so the defect is INFERRED to be independent of revocation.
 - **Priority:** 6/10 — MEDIUM (data loss on the receiver; snapshots are rare today: Trigger A only fires on persistent gaps and `sweep()` has no production caller)
 - **Status:** OPEN. PROVEN 2026-11-14 by seven `test.fails` probes in `tests/dc27_unpair.test.ts` ("TD-045 (iii) KNOWN DATA LOSS (TD-052) ..."), with a passing control ("TD-045 (iii) control"). Setup: W writes W-1 (seq up to 2), S applies W through 2, W writes W-2 (seq 3); L, P and X apply W through 3; P creates an event whose clock cites W:3; L unpairs W (cutoff 3). S then lags (applied_upto[W] 2) while its snapshot_clock[W] is 3, in three ways: no record and an interrupted pull from P (P's records only), the same plus L's record (cutoff 3), or its own record (cutoff 2, so a real session with P does not apply W's seq 3). For each, a receiver holding the cutoff (L) and one holding none (X) accept the snapshot and lose W-2. Literal output, sender with a lower cutoff to L: `k1=2 k2(W-2)=3 cutoff=3 receiver=L receiver.cutoff=3 S.applied_upto[W]=2 S.declared[W]=2 S.snapshot_clock={"S":1,"W":3,"P":2,"L":1} receiver.version(W-2)={"W":3,"S":1} declined=false absenceTombstones=1 receiver titles after=["P-CITES-W","W-1"] tombstones(W-2)=1`. The other five direct-apply cases print the same values, except `receiver=X receiver.cutoff=none` for X. Through L's session engine (S relays its record first, L holds both, highest cutoff 3): `L cutoff=3 records on L=2 snapshotsDeclined=0 L titles after=["P-CITES-W","W-1"] tombstones(W-2)=1`. Control (S never applied P's records, snapshot_clock[W] 2): W-2 stays on both receivers. The clean evidence is receiver L (direct apply and session engine). The lower-cutoff sender to X case is apply-level only: in a real session S's record arrives before data, so X would hold cutoff 2 and W-2 would be above X's cutoff. Not established: whether a real session can deliver a snapshot from S while S still lags (the interrupted-pull state is set up through the change-apply path, not a dropped session). Fix needs a contract decision first (DC-09 §5.2 and §7.1; candidate: judge absence against the sender's applied frontier rather than device_clock). No code change made.
+
+## TD-054 — Lookalike names are not disambiguated
+- **ID:** TD-054
+- **Title:** DC-28 P7 (`disambiguateLabels` in src/domain/device_names.ts) compares labels as raw strings. Two names that render the same but differ in invisible or confusable characters (for example "Laptop" and "Laptop" + a trailing U+200D ZWJ, which §4.8 allows; or Latin/Cyrillic lookalikes) count as different labels, so neither gets " (<short id>)".
+- **Priority:** 2/10 — LOW (display only, D1; the peer must already be paired)
+- **Status:** OPEN (found by the DC-28 blind review, 2026-11-14). Options: compare a display skeleton (strip ZWJ/ZWNJ, case fold, Unicode confusables) when deciding duplicates. Needs a DC-28 amendment of P7.
+
+## TD-055 — Names that render blank pass the name rule
+- **ID:** TD-055
+- **Title:** §4.8 rejects controls and format characters, but names made only of characters that render as nothing or as blank space pass: U+3164 HANGUL FILLER, U+FFA0 HALFWIDTH HANGUL FILLER, U+2800 BRAILLE PATTERN BLANK, combining marks without a base, unassigned code points. Such a peer shows an empty-looking label. Paired Devices and Devices & sync show the muted "id <short id>" next to it, but the Sync Errors "From:" line and the conflict dialog's side label / Keep button do not.
+- **Priority:** 3/10 — LOW (display only; a paired peer can make itself hard to recognize on those two surfaces). Related: TD-050 (names that read like another label).
+- **Status:** OPEN (contract gap in DC-28 §4.8, found by the DC-28 blind review, 2026-11-14). Options: reject names with no visible base character, or show the short id beside every peer label on every surface. Either is a DC-28 amendment.
+
+## TD-056 — Any announced name that is a prefix of the sender's id is dropped
+- **ID:** TD-056
+- **Title:** DC-28 §4.5 drops a received name that is a prefix of the sender's device id (meant for the 12-character placeholder older builds send). `announcedNameFromPeer` applies it literally, so real but short names such as "d" or "d-7" are dropped too (the one-time migration uses the same rule).
+- **Priority:** 1/10 — LOW (such names are implausible; the user can set a nickname)
+- **Status:** OPEN (as specified by §4.5; found by the DC-28 blind review, 2026-11-14). Option: only drop prefixes of the placeholder length (12) or of at least "d-" + 8 hex.
+
+## TD-057 — The name field's "Room left" counts spaces that saving removes
+- **ID:** TD-057
+- **Title:** `remainingRoomText` (frontend/name_editor.ts) measures the NFC input as typed. Leading/trailing spaces and runs of spaces, which validateName trims and collapses on save, are counted, so the field can show less room (or "Too long") than the saved name will use.
+- **Priority:** 1/10 — LOW (cosmetic; Save still validates the normalized name)
+- **Status:** OPEN (found by the DC-28 blind review, 2026-11-14). Fix: measure the trimmed/collapsed form.
+

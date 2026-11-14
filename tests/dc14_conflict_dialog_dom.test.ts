@@ -166,7 +166,8 @@ function makeDetail(id: string, remoteValue: unknown) {
       {
         change_id: "c-remote",
         device_id: OTHER,
-        device_name: "Other",
+        // DC-28 §4.7: what the sidecar sends for a device with no name.
+        device_name: "Device 2ee25c62",
         deleted: false,
         value: remoteValue,
         hlc_timestamp: Date.UTC(2026, 10, 14, 23, 30),

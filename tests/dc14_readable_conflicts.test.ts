@@ -165,11 +165,12 @@ describe("TR-A2 Date & time rendering (12h / 24h / locales, no epoch)", () => {
     const d = detailOf("schedule", LOCAL_SCHEDULE, REMOTE_SCHEDULE);
     const v = presentConflict(d, H24, EV);
     expect(v.header).toBe('"Test-Windoof" — Date & time was changed on two devices at the same time.');
-    expect(v.candidates.map((c) => c.side)).toEqual(["This device (local)", "Device 2ee25c62"]);
+    // DC-28 §4.7 supersedes the A.4 interim rule: the sidecar label shows.
+    expect(v.candidates.map((c) => c.side)).toEqual(["This device (local)", "Other Tablet"]);
     expect(v.candidates[0]!.lines.map((l) => l.text)).toEqual(["Sun 15 Nov 2026, 09:00 – 10:00"]);
     expect(v.candidates[1]!.lines.map((l) => l.text)).toEqual(["Sun 15 Nov 2026, 19:00 – 20:00"]);
     expect(v.candidates.map((c) => c.changed)).toEqual(["changed today 00:23", "changed today 00:30"]);
-    expect(v.candidates.map((c) => c.keepLabel)).toEqual(["Keep this device's", "Keep Device 2ee25c62's"]);
+    expect(v.candidates.map((c) => c.keepLabel)).toEqual(["Keep this device's", "Keep Other Tablet's"]);
   });
 
   test("12h setting", () => {
@@ -235,10 +236,15 @@ describe("TR-A3 whole-record (Appointment): only differing sub-fields (P1)", () 
 });
 
 describe("TR-A4 device attribution: never a full device id", () => {
-  test("remote side is 'Device <8 chars>' even when a display name exists", () => {
+  // DC-28 §4.7 (DC-14 A.4 amended v3): a named device shows its label;
+  // without one, the sidecar sends "Device <8 chars>" (fallback here too).
+  test("remote side shows its DC-28 label, else 'Device <8 chars>'", () => {
     const d = detailOf("title", "a", "b");
-    expect(describeCandidateSide(d, d.candidates[1]!)).toBe("Device 2ee25c62");
+    expect(describeCandidateSide(d, d.candidates[1]!)).toBe("Other Tablet");
     expect(describeCandidateSide(d, d.candidates[0]!)).toBe("This device (local)");
+    expect(keepButtonLabel(d, d.candidates[1]!)).toBe("Keep Other Tablet's");
+    d.candidates[1]!.device_name = "";
+    expect(describeCandidateSide(d, d.candidates[1]!)).toBe("Device 2ee25c62");
     expect(keepButtonLabel(d, d.candidates[1]!)).toBe("Keep Device 2ee25c62's");
     const v = presentConflict(d, H24, EV);
     const all = visibleText(d, H24) + v.candidates.map((c) => c.raw).join("\n");
@@ -253,6 +259,7 @@ describe("TR-A4 device attribution: never a full device id", () => {
     expect(shortDeviceId("dev-f6d77e6c-156a-4b7e")).toBe("dev-f6d7");
     const d = detailOf("title", "a", "b");
     d.candidates[1]!.device_id = "dev-f6d77e6c-156a-4b7e";
+    d.candidates[1]!.device_name = "";
     expect(describeCandidateSide(d, d.candidates[1]!)).toBe("Device dev-f6d7");
   });
 

@@ -2,7 +2,7 @@
 // One source of truth for table creation. Encryption-at-rest is applied at
 // connection level (SQLCipher key pragma) by the caller, not here.
 
-export const SCHEMA_VERSION = 9; // v2: TD-001 skipped_seqs; v3: TD-005 quarantine lifecycle (resolved_at_hlc, resolved_reason); v4: TD-006/DC-16 hard_blocks + peer_invalid_tally; v5: TD-005 quarantine_prune_stats (retention-cap bookkeeping); v6: Pkg1 entity_versions (durable per-entity version vectors, compaction-proof snapshots); v7: DC-21 peers.last_endpoint_host/port/seen (non-authoritative last-known endpoints); v8: GATE-2026-09-22 all-day end_date repair (exclusive-ms -> inclusive date, DC-07 'inclusive' semantics restored; no DDL change, data-only); v9: DC-27 revocation_records.revoked_after_seq (DC-05 Appendix A cutoff) + revocation_acks (DC-07 Appendix X.1 persisted ACK store)
+export const SCHEMA_VERSION = 10; // v2: TD-001 skipped_seqs; v3: TD-005 quarantine lifecycle (resolved_at_hlc, resolved_reason); v4: TD-006/DC-16 hard_blocks + peer_invalid_tally; v5: TD-005 quarantine_prune_stats (retention-cap bookkeeping); v6: Pkg1 entity_versions (durable per-entity version vectors, compaction-proof snapshots); v7: DC-21 peers.last_endpoint_host/port/seen (non-authoritative last-known endpoints); v8: GATE-2026-09-22 all-day end_date repair (exclusive-ms -> inclusive date, DC-07 'inclusive' semantics restored; no DDL change, data-only); v9: DC-27 revocation_records.revoked_after_seq (DC-05 Appendix A cutoff) + revocation_acks (DC-07 Appendix X.1 persisted ACK store); v10: DC-28 peers.announced_name (the name a peer announced at pairing; display_name becomes the local nickname, "" = none)
 
 export const DDL = `
 CREATE TABLE calendars (
@@ -193,7 +193,11 @@ CREATE TABLE peers (
     last_known_clock TEXT NOT NULL DEFAULT '{}',
     last_endpoint_host TEXT,
     last_endpoint_port INTEGER,
-    last_endpoint_seen INTEGER
+    last_endpoint_seen INTEGER,
+    -- DC-28 §4.9: what the peer called itself at pairing (validated, or
+    -- NULL). display_name keeps its DC-05 §3.1 meaning: the label the
+    -- user assigned on THIS device (the nickname); "" = none.
+    announced_name   TEXT
 );
 
 CREATE TABLE revocation_records (

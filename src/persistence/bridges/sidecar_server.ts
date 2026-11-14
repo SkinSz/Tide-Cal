@@ -77,6 +77,12 @@ import { deliverNotification } from "../../application/notification_delivery.ts"
 // (id `<base>#<recurrence_id>`), so per-occurrence reminders work without
 // touching the replicated reminder member (still one per event, DC-22 D5).
 import { expandOccurrences } from "../../domain/recurrence_conflicts.ts";
+import {
+  deviceNameViews,
+  validateName,
+  type DeviceNameView,
+  type NameRule,
+} from "../../domain/device_names.ts";
 
 /** Local wall "YYYYMMDDTHHMMSS" -> epoch ms (same math as calendar.ts). */
 function msFromWallId(id: string): number {
@@ -182,6 +188,23 @@ export class SyncRefusedError extends Error {
  * Sync runtime state for one sidecar process: identity + optional listener.
  * Data dir defaults to beside the DB (identity key must persist per install).
  */
+/**
+ * DC-28 §4.8: the user-facing refusal for an invalid name. Plain sentences,
+ * never the name itself (the shell logs failed calls).
+ */
+function nameRefusal(rule: Exclude<NameRule, "id_prefix">): string {
+  switch (rule) {
+    case "too_many_characters":
+      return "This name is too long. Use at most 32 characters.";
+    case "too_many_bytes":
+      return "This name is too long. Use fewer characters.";
+    case "not_string":
+      return "This name could not be read.";
+    default:
+      return "This name contains invisible or control characters. Remove them and try again.";
+  }
+}
+
 export class SyncManager {
   readonly identity;
   /**
@@ -212,6 +235,50 @@ export class SyncManager {
    * memory only: it is a hint, cleared by the next successful session.
    */
   private readonly refusedBy = new Set<string>();
+  /**
+   * DC-28 §4.2/§4.3: this device's own name, validated (§4.8), or null.
+   * Held in memory only; the shell owns its persistence (config.toml
+   * "device_name", P9) and pushes it at start and on every save. It leaves
+   * the device ONLY inside the encrypted pairing payload (P3), never in the
+   * pasted code (P5), mDNS (D2), sync messages (P6) or logs.
+   */
+  private ownName: string | null = null;
+
+  get ownDeviceName(): string | null {
+    return this.ownName;
+  }
+
+  /**
+   * Validate and hold the own name ("" / null clears it). Throws a plain
+   * sentence (no name text: the shell logs failed calls) when invalid.
+   */
+  setOwnName(raw: unknown): string | null {
+    const r = validateName(raw === null || raw === undefined ? "" : raw);
+    if (!r.ok) throw new Error(nameRefusal(r.rule));
+    this.ownName = r.name;
+    return this.ownName;
+  }
+
+  /**
+   * DC-28 §4.4/P1: set (or clear with "") the local nickname of a paired
+   * device. Stored in peers.display_name (DC-05 §3.1 user-assigned label);
+   * never sent anywhere. Returns the device's new §4.9 view.
+   */
+  setPeerNickname(deviceId: unknown, raw: unknown): DeviceNameView {
+    if (typeof deviceId !== "string" || deviceId.length === 0) {
+      throw new Error("device_id required");
+    }
+    const r = validateName(raw === null || raw === undefined ? "" : raw);
+    if (!r.ok) throw new Error(nameRefusal(r.rule));
+    const info = this.core.db
+      .prepare("UPDATE peers SET display_name = ? WHERE device_id = ? AND status = 'trusted'")
+      .run(r.name ?? "", deviceId);
+    if (info.changes === 0) throw new Error("This device is not paired.");
+    const row = this.core.db
+      .prepare("SELECT device_id, display_name, announced_name FROM peers WHERE device_id = ?")
+      .get(deviceId) as { device_id: string; display_name: string; announced_name: string | null };
+    return deviceNameViews([row], this.identity.deviceId)[0]!;
+  }
 
   constructor(
     private readonly core: EventCore,
@@ -634,12 +701,11 @@ export class SyncManager {
    * Devices). Merge of: paired peers, live Tier-1 ladder state, Tier-2
    * durable hard blocks, and the §2.3 durable invalid tally (history).
    */
-  peerStateSnapshot(): Array<
+  peerStateSnapshot(onlyPaired = false): Array<
     PeerTier1State & {
       paired: boolean;
       /** DC-27 P6: our last session attempt was refused after the handshake. */
       refused_us: boolean;
-      display_name: string | null;
       paired_at: number | null;
       ladder_label: string;
       hard_block:
@@ -650,7 +716,7 @@ export class SyncManager {
           }
         | null;
       tally: { total_invalid: number; last_invalid_at: number } | null;
-    }
+    } & Omit<DeviceNameView, "device_id">
   > {
     const peers = listTrustedPeers(this.core.db);
     const blocks = new Map(listHardBlocks(this.core.db).map((b) => [b.producer_device_id, b]));
@@ -664,9 +730,18 @@ export class SyncManager {
       ...tally.keys(),
     ]);
     const out = [];
-    for (const id of Array.from(known).sort()) {
+    const ids = Array.from(known)
+      .sort()
+      .filter((id) => !onlyPaired || peers.some((p) => p.device_id === id));
+    // DC-28 §4.7/§4.9: labels computed here, disambiguated within THIS list (P7).
+    const names = deviceNameViews(
+      ids.map((id) => peers.find((p) => p.device_id === id) ?? { device_id: id }),
+      this.identity.deviceId,
+    );
+    for (const [i, id] of ids.entries()) {
       const paired = peers.some((p) => p.device_id === id);
       const peer = peers.find((p) => p.device_id === id);
+      const { device_id: _id, ...name } = names[i]!;
       const t1 = this.misbehavior.getState(id);
       const b = blocks.get(id) ?? null;
       const tl = tally.get(id) ?? null;
@@ -674,7 +749,7 @@ export class SyncManager {
         ...t1,
         paired,
         refused_us: this.refusedBy.has(id),
-        display_name: peer?.display_name ?? null,
+        ...name,
         paired_at: peer ? peer.paired_at * 1000 : null,
         ladder_label: LADDER_LABELS[t1.level],
         hard_block: b
@@ -1229,10 +1304,11 @@ export function makeSyncDispatcher(
           // DC-11 §2.3).
           instance_name: buildInstanceName(sync.identity.deviceId),
           txt: buildTxtRecord({}),
-          paired_peers: peers.map((p) => ({
-            device_id: p.device_id,
-            display_name: p.display_name,
-            paired_at: p.paired_at * 1000,
+          // DC-28 §4.9: { device_id, label, nickname, announced_name,
+          // short_id } per peer; label per §4.7, disambiguated in this list.
+          paired_peers: deviceNameViews(peers, sync.identity.deviceId).map((v, i) => ({
+            ...v,
+            paired_at: peers[i]!.paired_at * 1000,
           })),
           // DC-21 §3.4/D4: the shell registers mDNS on this port (and
           // re-registers goodbye-first on change).
@@ -1257,8 +1333,10 @@ export function makeSyncDispatcher(
         const offerPromise = createPairingOffer({
           identity: sync.identity,
           port: typeof args.port === "number" ? args.port : undefined,
-          name:
-            typeof args.name === "string" ? args.name : sync.identity.deviceId.slice(0, 12),
+          // DC-28 P3: only the SAVED own name is sent (saving = consent);
+          // a caller-supplied args.name is ignored, and the 12-character id
+          // placeholder default is gone (no name set -> no "name" key).
+          name: sync.ownDeviceName ?? undefined,
           store: sqlPeerStore(core.db),
         });
         void offerPromise
@@ -1287,7 +1365,7 @@ export function makeSyncDispatcher(
           identity: sync.identity,
           qr_text_text: undefined,
           qrText: args.qr_text,
-          name: typeof args.name === "string" ? args.name : undefined,
+          name: sync.ownDeviceName ?? undefined, // DC-28 P3 (see pairing_offer)
           store: sqlPeerStore(core.db),
         } as never).then((r) => ({
           peer_device_id: r.peerDeviceId,
@@ -1388,7 +1466,7 @@ export function makeSyncDispatcher(
       case "list_paired_devices": {
         return {
           self_device_id: sync.identity.deviceId,
-          devices: sync.peerStateSnapshot().filter((p) => p.paired),
+          devices: sync.peerStateSnapshot(true),
         };
       }
       // §4.2 Tier-1: "Reset peer state" — one click, no confirmation.
@@ -1415,6 +1493,17 @@ export function makeSyncDispatcher(
       // DC-27 §4.11 / P8: Removed devices + per-peer "told" state.
       case "list_removed_devices": {
         return { removed: sync.removedDevices() };
+      }
+      // DC-28 §4.2/P9: the shell pushes the saved own name (at start and on
+      // every save) and persists the normalized value this returns. Not in
+      // the shell's sync_op allow-list: only the shell's own set/get device
+      // name commands call it.
+      case "set_device_name": {
+        return { device_name: sync.setOwnName(args.name) };
+      }
+      // DC-28 §4.4/P1: local nickname for a paired device ("" clears).
+      case "set_peer_nickname": {
+        return sync.setPeerNickname(args.device_id, args.nickname);
       }
       default:
         throw new Error(`unknown op: ${op}`);
@@ -1536,7 +1625,9 @@ function main(): void {
     op === "retry_quarantine" || op === "delete_quarantine" ||
     op === "peer_state" || op === "list_paired_devices" ||
     op === "reset_peer_state" || op === "unblock_peer" ||
-    op === "unpair_device" || op === "list_removed_devices"
+    op === "unpair_device" || op === "list_removed_devices" ||
+    // DC-28: own name (shell-only) + local nickname
+    op === "set_device_name" || op === "set_peer_nickname"
       ? syncDispatch(op, args)
       : dispatch(op, args);
   // DC-21 §3.2/D2: the ONE endpoint cache (declared above with the sync

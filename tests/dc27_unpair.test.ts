@@ -847,12 +847,12 @@ describe("TR-11 same-id re-pair refused", () => {
     const store = sqlPeerStore(T.core.db);
     expect(store.isRevoked!(W.identity.deviceId)).toBe(true);
     expect(() =>
-      store.store({ deviceId: W.identity.deviceId, publicKey: Buffer.from(W.identity.publicKey), displayName: "W", pairedAtMs: Date.now() }),
+      store.store({ deviceId: W.identity.deviceId, publicKey: Buffer.from(W.identity.publicKey), announcedName: "W", pairedAtMs: Date.now() }),
     ).toThrow(PairingRefusedError);
     expect(statusOf(T, W)).toBeUndefined();
     // and on L the revoked row can never be flipped back by the upsert
     expect(() =>
-      sqlPeerStore(L.core.db).store({ deviceId: W.identity.deviceId, publicKey: Buffer.from(W.identity.publicKey), displayName: "W", pairedAtMs: Date.now() }),
+      sqlPeerStore(L.core.db).store({ deviceId: W.identity.deviceId, publicKey: Buffer.from(W.identity.publicKey), announcedName: "W", pairedAtMs: Date.now() }),
     ).toThrow(PairingRefusedError);
     expect(statusOf(L, W)).toBe("revoked");
   });
@@ -1121,8 +1121,9 @@ describe("schema v9 migration", () => {
     const path = v8Copy(dir);
     const db = openDatabase({ path });
     try {
-      expect(SCHEMA_VERSION).toBe(9);
-      expect((db.prepare("SELECT version FROM schema_version").get() as { version: number }).version).toBe(9);
+      // v10 (DC-28) is the current version; the v9 pieces must be present.
+      expect(SCHEMA_VERSION).toBe(10);
+      expect((db.prepare("SELECT version FROM schema_version").get() as { version: number }).version).toBe(SCHEMA_VERSION);
       expect(cols(db, "revocation_records")).toContain("revoked_after_seq");
       expect(cols(db, "revocation_acks")).toEqual([
         "peer_device_id",
