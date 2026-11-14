@@ -1515,14 +1515,14 @@ describe("TD-041 snapshot vs revoked-producer cutoff", () => {
     buildSnapshot(d.core.db, (s) => chunks.push(s));
     return {
       snapshot_clock: chunks[0]!.snapshot_clock,
+      applied_upto: chunks[0]!.applied_upto,
       entities: chunks.flatMap((c) => c.entities),
       tombstones: chunks.flatMap((c) => c.tombstones),
     };
   }
 
-  // TD-041 OPEN (PROVEN): fails today; flips to a hard failure once a rule
-  // from DC-27 Appendix B lands. Then turn test.fails back into test.
-  test.fails("TD-041 repro: a snapshot from P delivers W's above-cutoff event onto L, which holds W's revocation record", { timeout: 60_000 }, async () => {
+  // TD-041 RESOLVED: DC-27 Appendix B option a) (DC-09 Appendix A.2).
+  test("TD-041 repro: a snapshot from P delivers W's above-cutoff event onto L, which holds W's revocation record", { timeout: 60_000 }, async () => {
     const { L, W, P, cutoff, wAfterId } = await setup();
     const snap = snapshotOf(P);
     const entry = snap.entities.find((e) => e.entity_id === wAfterId)!;
@@ -1531,7 +1531,10 @@ describe("TD-041 snapshot vs revoked-producer cutoff", () => {
         `entry.producer_seq=${entry.producer_seq} entry.clock[W]=${entry.causality_clock[W.identity.deviceId]} ` +
         `snapshot_clock[W]=${snap.snapshot_clock[W.identity.deviceId]}`,
     );
-    applySnapshot(L.core.db, snap, loadKnowledgeFromDb(L.core.db));
+    // The refusal must come from the declared frontier, not a missing field.
+    expect(snap.applied_upto![W.identity.deviceId]).toBeGreaterThan(cutoff);
+    const r = applySnapshot(L.core.db, snap, loadKnowledgeFromDb(L.core.db));
+    expect(r.declined).toBe(true);
     const lApplied = appliedThrough(L, W.identity.deviceId) ?? 0;
     console.error(`[td041] after snapshot: L titles=${JSON.stringify(titles(L))} L applied_upto[W]=${lApplied}`);
     // DC-27 TR-8 / DC-05 Appendix A.2 intent:
@@ -1539,9 +1542,8 @@ describe("TD-041 snapshot vs revoked-producer cutoff", () => {
     expect(lApplied).toBeLessThanOrEqual(cutoff);
   });
 
-  // TD-041 OPEN (PROVEN): fails today; flips to a hard failure once a rule
-  // from DC-27 Appendix B lands. Then turn test.fails back into test.
-  test.fails("TD-041 repro (engine): an aware, trusted P's FULL_STATE_SNAPSHOT in a session with L lands W's above-cutoff event on L", { timeout: 60_000 }, async () => {
+  // TD-041 RESOLVED: DC-27 Appendix B option a) (DC-09 Appendix A.2).
+  test("TD-041 repro (engine): an aware, trusted P's FULL_STATE_SNAPSHOT in a session with L lands W's above-cutoff event on L", { timeout: 60_000 }, async () => {
     const { L, W, P, cutoff } = await setup();
     const t = scriptedTransport();
     const engine = createSyncEngine({
@@ -1561,20 +1563,21 @@ describe("TD-041 snapshot vs revoked-producer cutoff", () => {
     t.push({ v: 1, type: "HELLO", device_clock: {} });
     await waitFor(() => t.sent.some((m) => m.type === "CHANGES_ACK"));
     const snap = snapshotOf(P);
+    expect(snap.applied_upto![W.identity.deviceId]).toBeGreaterThan(cutoff);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    t.push({ v: 1, type: "FULL_STATE_SNAPSHOT", snapshot_clock: snap.snapshot_clock, entities: snap.entities, tombstones: snap.tombstones, final: true } as any);
+    t.push({ v: 1, type: "FULL_STATE_SNAPSHOT", snapshot_clock: snap.snapshot_clock, applied_upto: snap.applied_upto, entities: snap.entities, tombstones: snap.tombstones, final: true } as any);
     t.push({ v: 1, type: "CHANGES_ACK", applied_upto: {} });
     t.push(null);
-    await run;
+    const stats = await run;
+    expect(stats.snapshotsDeclined).toBe(1);
     const lApplied = appliedThrough(L, W.identity.deviceId) ?? 0;
     console.error(`[td041-engine] L titles=${JSON.stringify(titles(L))} L applied_upto[W]=${lApplied} cutoff=${cutoff}`);
     expect(titles(L)).not.toContain("W-AFTER");
     expect(lApplied).toBeLessThanOrEqual(cutoff);
   });
 
-  // TD-041 OPEN (PROVEN): fails today; flips to a hard failure once a rule
-  // from DC-27 Appendix B lands. Then turn test.fails back into test.
-  test.fails("TD-041 repro (delete): W's above-cutoff DELETE must not reach L by snapshot absence", { timeout: 60_000 }, async () => {
+  // TD-041 RESOLVED: DC-27 Appendix B option a) (DC-09 Appendix A.2).
+  test("TD-041 repro (delete): W's above-cutoff DELETE must not reach L by snapshot absence", { timeout: 60_000 }, async () => {
     const L = makeDev("L");
     const W = makeDev("W");
     const P = makeDev("P");
@@ -1594,12 +1597,15 @@ describe("TD-041 snapshot vs revoked-producer cutoff", () => {
     expect(titles(L)).toContain("W-BEFORE");
     const snap = snapshotOf(P);
     const ptomb = snap.tombstones.filter((t) => t.entity_id === id);
+    expect(snap.applied_upto![W.identity.deviceId]).toBeGreaterThan(cutoff);
     const r = applySnapshot(L.core.db, snap, loadKnowledgeFromDb(L.core.db));
     console.error(
       `[td041-delete] cutoff=${cutoff} snapshot tombstones for the entity=${ptomb.length} ` +
         `absenceTombstones=${r.absenceTombstones} L titles after=${JSON.stringify(titles(L))}`,
     );
     // Desired (DC-27 TR-8 intent): L keeps its legitimate copy.
+    expect(r.declined).toBe(true);
+    expect(r.absenceTombstones).toBe(0);
     expect(titles(L)).toContain("W-BEFORE");
   });
 
@@ -1655,5 +1661,258 @@ describe("TD-041 snapshot vs revoked-producer cutoff", () => {
     // context, not provenance), so a version-vector filter would drop it:
     expect(pOnly.producer_device_id).toBe(P.identity.deviceId);
     expect(pOnly.causality_clock[wid]).toBeGreaterThan(cutoff);
+  });
+
+  // -------------------------------------------------------------------------
+  // DC-27 Appendix B option a) / DC-09 Appendix A: TR-16 and the guards
+  // -------------------------------------------------------------------------
+
+  function lEngine(self: Dev, peer: Dev) {
+    return createSyncEngine({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      db: self.core.db as any,
+      selfDeviceId: self.identity.deviceId,
+      mutateEntity: makeEntityMutator(),
+      peerDeviceId: peer.identity.deviceId,
+      revocations: makeDbRevocationChannel(self.core.db, {
+        selfDeviceId: self.identity.deviceId,
+        selfPublicKey: self.identity.publicKey,
+        hlcNow: () => self.core.hlcNow(),
+        log: () => {},
+      }),
+    });
+  }
+
+  /** A fresh device R that trusts L and holds L's record for W (no data). */
+  async function recordHolder(L: Dev): Promise<Dev> {
+    const R = makeDev("R");
+    addPeer(R, L);
+    const rec = storedRecord(L);
+    const ch = makeDbRevocationChannel(R.core.db, {
+      selfDeviceId: R.identity.deviceId,
+      selfPublicKey: R.identity.publicKey,
+      hlcNow: () => R.core.hlcNow(),
+      log: () => {},
+    });
+    expect(await ch.acceptInbound({ record: rec.record, signature: rec.signature }, L.identity.deviceId)).toBe(true);
+    return R;
+  }
+
+  /**
+   * setup(), then P creates P-ONLY after applying W's seq 3 and L pulls it:
+   * L stays untainted (applied_upto[W] = cutoff) while its snapshot_clock[W]
+   * is above the cutoff (causal context, Appendix B.1 e).
+   */
+  async function setupUntainted() {
+    const base = await setup();
+    const { L, W, P, cutoff } = base;
+    addEvent(P, "P-ONLY");
+    await dial(L, P);
+    expect(titles(L)).toContain("P-ONLY");
+    expect(appliedThrough(L, W.identity.deviceId)).toBe(cutoff);
+    const snap = snapshotOf(L);
+    expect(snap.snapshot_clock[W.identity.deviceId]).toBeGreaterThan(cutoff);
+    expect(snap.applied_upto![W.identity.deviceId]).toBe(cutoff);
+    return { ...base, snap };
+  }
+
+  test("TR-16 a snapshot from an untainted peer delivers W's at-or-below-cutoff state and other producers' state; applied_upto[W] stays at or below the cutoff", { timeout: 60_000 }, async () => {
+    const { L, W, P, cutoff, snap } = await setupUntainted();
+    const R = await recordHolder(L);
+    const k = loadKnowledgeFromDb(R.core.db);
+    const r = applySnapshot(R.core.db, snap, k);
+    expect(r.declined).toBe(false);
+    expect(titles(R)).toContain("W-BEFORE");
+    expect(titles(R)).toContain("P-ONLY");
+    expect(titles(R)).not.toContain("W-AFTER");
+    // DC-09 Appendix A.3 clamp: durable row AND in-memory knowledge. The
+    // sender is clean and declares exactly C, so the frontier is C itself.
+    expect(snap.applied_upto![W.identity.deviceId]).toBe(cutoff);
+    expect(appliedThrough(R, W.identity.deviceId)).toBe(cutoff);
+    expect(k.appliedUpto[W.identity.deviceId]).toBe(cutoff);
+    // Other producers are not clamped (unchanged DC-09 §5.4).
+    expect(appliedThrough(R, P.identity.deviceId)).toBe(snap.snapshot_clock[P.identity.deviceId]);
+    // Monotone (DC-06 §3.4): a later snapshot declaring less for W (here:
+    // nothing, counts as 0) never lowers the durable frontier.
+    const r2 = applySnapshot(R.core.db, { ...snap, applied_upto: {} }, loadKnowledgeFromDb(R.core.db));
+    expect(r2.declined).toBe(false);
+    expect(appliedThrough(R, W.identity.deviceId)).toBe(cutoff);
+  });
+
+  test("TR-16 fail closed: a receiver holding a cutoff declines a snapshot whose declaration is missing or malformed; an absent entry for W counts as 0", { timeout: 60_000 }, async () => {
+    const { L, W, snap, cutoff } = await setupUntainted();
+    const R = await recordHolder(L);
+    const w = W.identity.deviceId;
+    const variants: Array<[string, unknown]> = [
+      ["missing", undefined],
+      ["array", []],
+      ["string value", { [w]: "1" }],
+      ["fraction", { [w]: 1.5 }],
+      ["negative", { [w]: -1 }],
+    ];
+    for (const [name, declared] of variants) {
+      const r = applySnapshot(R.core.db, { ...snap, applied_upto: declared as never }, loadKnowledgeFromDb(R.core.db));
+      expect({ name, declined: r.declined }).toEqual({ name, declined: true });
+      expect(titles(R)).toEqual([]);
+      expect(appliedThrough(R, w)).toBeUndefined();
+    }
+    // A declaration without an entry for W counts as 0 (DC-02 §2.4, §5):
+    // the sender never applied W, so it is untainted and the content applies.
+    expect(applySnapshot(R.core.db, { ...snap, applied_upto: {} }, loadKnowledgeFromDb(R.core.db)).declined).toBe(false);
+    expect(titles(R)).toContain("W-BEFORE");
+    // Appendix A.3: the frontier never rises above the declaration (0).
+    expect(appliedThrough(R, w) ?? 0).toBe(0);
+    expect(cutoff).toBeGreaterThan(0);
+  });
+
+  test("TR-16 a receiver holding no cutoff is unaffected: older snapshots without the field, and any declaration, apply as before", { timeout: 60_000 }, async () => {
+    const { L, W, snap } = await setupUntainted();
+    const w = W.identity.deviceId;
+    const R1 = makeDev("R1");
+    const r1 = applySnapshot(R1.core.db, { ...snap, applied_upto: undefined }, loadKnowledgeFromDb(R1.core.db));
+    expect(r1.declined).toBe(false);
+    expect(titles(R1)).toEqual(titles(L));
+    // No cutoff held: no clamp, unchanged DC-09 §5.4.
+    expect(appliedThrough(R1, w)).toBe(snap.snapshot_clock[w]);
+    const R2 = makeDev("R2");
+    const r2 = applySnapshot(R2.core.db, { ...snap, applied_upto: { [w]: 999 } }, loadKnowledgeFromDb(R2.core.db));
+    expect(r2.declined).toBe(false);
+    expect(titles(R2)).toEqual(titles(L));
+  });
+
+  test("TR-16 the sender declares its applied frontier (not device_clock) on the offer and on every snapshot message", { timeout: 60_000 }, async () => {
+    const { L, P, W, cutoff } = await setupUntainted();
+    const t = scriptedTransport();
+    const run = lEngine(L, P).runSession(t.transport);
+    t.push({ v: 1, type: "HELLO", device_clock: {} });
+    // P asks for L's full state (Trigger A request), then accepts L's offer.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    t.push({ v: 1, type: "FULL_STATE_OFFER", snapshot_clock: {}, reason: "GAP_ROUNDS", sender_device_id: P.identity.deviceId } as any);
+    t.push({ v: 1, type: "FULL_STATE_ACCEPT" });
+    t.push({ v: 1, type: "CHANGES_ACK", applied_upto: {} });
+    t.push(null);
+    await run;
+    const expected = Object.fromEntries(
+      (L.core.db.prepare("SELECT producer_device_id AS d, applied_through AS a FROM applied_upto").all() as Array<{ d: string; a: number }>).map((r) => [r.d, r.a]),
+    );
+    expect(expected[W.identity.deviceId]).toBe(cutoff);
+    const offers = t.sent.filter((m) => m.type === "FULL_STATE_OFFER");
+    const snaps = t.sent.filter((m) => m.type === "FULL_STATE_SNAPSHOT");
+    expect(offers).toHaveLength(1);
+    expect(snaps.length).toBeGreaterThan(0);
+    for (const m of [...offers, ...snaps]) {
+      expect((m as { applied_upto?: unknown }).applied_upto).toEqual(expected);
+    }
+  });
+
+  test("TR-16 once one message of a snapshot stream is declined, the rest of that stream is declined; the next stream is judged afresh", { timeout: 60_000 }, async () => {
+    const { L, snap } = await setupUntainted();
+    const R = await recordHolder(L);
+    const t = scriptedTransport();
+    const run = lEngine(R, L).runSession(t.transport);
+    t.push({ v: 1, type: "HELLO", device_clock: {} });
+    // Stream 1: the first message has no declaration (declined); its valid
+    // `final` message is declined with it, and `final` ends the stream.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    t.push({ v: 1, type: "FULL_STATE_SNAPSHOT", snapshot_clock: snap.snapshot_clock, entities: [], tombstones: [], final: false } as any);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    t.push({ v: 1, type: "FULL_STATE_SNAPSHOT", snapshot_clock: snap.snapshot_clock, applied_upto: snap.applied_upto, entities: snap.entities, tombstones: snap.tombstones, final: true } as any);
+    // Stream 2, same session: valid, judged afresh, applies.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    t.push({ v: 1, type: "FULL_STATE_SNAPSHOT", snapshot_clock: snap.snapshot_clock, applied_upto: snap.applied_upto, entities: snap.entities, tombstones: snap.tombstones, final: true } as any);
+    t.push({ v: 1, type: "CHANGES_ACK", applied_upto: {} });
+    t.push(null);
+    const stats = await run;
+    expect(stats.snapshotsDeclined).toBe(2);
+    expect(titles(R)).toContain("W-BEFORE");
+  });
+
+  test("TR-16 a declined one-message stream (final) does not latch: the next stream in the same session is judged afresh", { timeout: 60_000 }, async () => {
+    const { L, snap } = await setupUntainted();
+    const R = await recordHolder(L);
+    const t = scriptedTransport();
+    const run = lEngine(R, L).runSession(t.transport);
+    t.push({ v: 1, type: "HELLO", device_clock: {} });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    t.push({ v: 1, type: "FULL_STATE_SNAPSHOT", snapshot_clock: snap.snapshot_clock, entities: snap.entities, tombstones: snap.tombstones, final: true } as any);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    t.push({ v: 1, type: "FULL_STATE_SNAPSHOT", snapshot_clock: snap.snapshot_clock, applied_upto: snap.applied_upto, entities: snap.entities, tombstones: snap.tombstones, final: true } as any);
+    t.push({ v: 1, type: "CHANGES_ACK", applied_upto: {} });
+    t.push(null);
+    const stats = await run;
+    expect(stats.snapshotsDeclined).toBe(1);
+    expect(titles(R)).toContain("W-BEFORE");
+  });
+
+  test("DC-09 A.3 a clean sender that declared less than the cutoff does not lift the receiver to the cutoff; the gap stays pullable", { timeout: 60_000 }, async () => {
+    const L = makeDev("L");
+    const W = makeDev("W");
+    pairAll(L, W);
+    await listen(L);
+    addEvent(W, "W-1");
+    addEvent(W, "W-2");
+    await dial(W, L);
+    await L.mgr.unpairDevice(W.identity.deviceId, true);
+    const cutoff = storedRecord(L).record.revoked_after_seq!;
+    // W's seqs 1..C are all applied on L (its calendar and two events).
+    expect(cutoff).toBe(3);
+    const w = W.identity.deviceId;
+    const R = await recordHolder(L);
+    // The sender applied W only through 1 (declared W:1, clean: 1 <= C)
+    // while its snapshot_clock cites W:5 as causal context.
+    const k = loadKnowledgeFromDb(R.core.db);
+    const r = applySnapshot(
+      R.core.db,
+      { snapshot_clock: { [w]: 5 }, applied_upto: { [w]: 1 }, entities: [], tombstones: [] },
+      k,
+    );
+    expect(r.declined).toBe(false);
+    expect(appliedThrough(R, w)).toBe(1);
+    expect(k.appliedUpto[w]).toBe(1);
+    // W's seqs 2..3 are still needed and requested (clamped to C by V5).
+    const t = scriptedTransport();
+    const run = lEngine(R, L).runSession(t.transport);
+    t.push({ v: 1, type: "HELLO", device_clock: { [w]: 5 } });
+    t.push({ v: 1, type: "CHANGES_BATCH", changes: [] });
+    t.push({ v: 1, type: "CHANGES_BATCH", changes: [] });
+    t.push({ v: 1, type: "CHANGES_ACK", applied_upto: {} });
+    t.push(null);
+    await run;
+    const firstReq = t.sent.find((m) => m.type === "CHANGES_REQUEST") as { ranges: unknown } | undefined;
+    expect(firstReq?.ranges).toEqual([{ device_id: w, lo: 2, hi: 3 }]);
+  });
+
+  test("DC-09 A.4 no retry loop: a persistent Trigger A gap toward a tainted peer costs one offer and no ACCEPT per session, in two consecutive sessions", { timeout: 60_000 }, async () => {
+    const { L, W, P, cutoff } = await setup();
+    const engine = lEngine(L, P);
+    for (let session = 1; session <= 2; session++) {
+      const t = scriptedTransport();
+      const run = engine.runSession(t.transport);
+      // P advertises far more of its own history than it can serve
+      // (compacted): every CHANGES_REQUEST for it comes back empty.
+      t.push({ v: 1, type: "HELLO", device_clock: { [P.identity.deviceId]: 10_000 } });
+      t.push({ v: 1, type: "CHANGES_BATCH", changes: [] });
+      t.push({ v: 1, type: "CHANGES_BATCH", changes: [] });
+      // P answers L's Trigger A offer with its own, declaring a tainted frontier.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      t.push({ v: 1, type: "FULL_STATE_OFFER", snapshot_clock: {}, applied_upto: { [W.identity.deviceId]: cutoff + 1 }, sender_device_id: P.identity.deviceId } as any);
+      t.push({ v: 1, type: "CHANGES_ACK", applied_upto: {} });
+      t.push(null);
+      const stats = await run;
+      const n = (type: string) => t.sent.filter((m) => m.type === type).length;
+      const gapOffers = t.sent.filter((m) => m.type === "FULL_STATE_OFFER" && (m as { reason?: string }).reason === "GAP_ROUNDS").length;
+      console.error(
+        `[td041-retry] session ${session}: CHANGES_REQUEST=${n("CHANGES_REQUEST")} FULL_STATE_OFFER=${n("FULL_STATE_OFFER")} ` +
+          `(GAP_ROUNDS=${gapOffers}) FULL_STATE_ACCEPT=${n("FULL_STATE_ACCEPT")} CHANGES_ACK=${n("CHANGES_ACK")} snapshotsDeclined=${stats.snapshotsDeclined}`,
+      );
+      expect(n("CHANGES_REQUEST")).toBe(2);
+      expect(n("FULL_STATE_OFFER")).toBe(1);
+      expect(gapOffers).toBe(1);
+      expect(n("FULL_STATE_ACCEPT")).toBe(0);
+      expect(n("CHANGES_ACK")).toBe(1);
+      expect(stats.snapshotsDeclined).toBe(1);
+      expect(titles(L)).not.toContain("W-AFTER");
+      expect(appliedThrough(L, W.identity.deviceId)!).toBeLessThanOrEqual(cutoff);
+    }
   });
 });

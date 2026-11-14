@@ -36,7 +36,15 @@ import {
 } from "./misbehavior.ts";
 import type { Database } from "better-sqlite3";
 // DC-09 full-state snapshot construction/application (M-7 trigger layer).
-import { applySnapshot, buildSnapshot, type Snapshot, type SnapshotEntry } from "./full_state.ts";
+import {
+  applySnapshot,
+  buildSnapshot,
+  heldCutoffs,
+  readAppliedUpto,
+  refusesDeclaredFrontier,
+  type Snapshot,
+  type SnapshotEntry,
+} from "./full_state.ts";
 import {
   OfferDedup,
   TriggerStateTracker,
@@ -144,6 +152,8 @@ export type SyncMessage =
       type: "FULL_STATE_OFFER";
       snapshot_clock: VC;
       snapshot_size_hint_bytes?: number;
+      /** DC-08 Appendix B: the sender's applied frontier (absent on older peers). */
+      applied_upto?: VC;
       /** DC-09 §3.2: set on user-initiated offers (diagnostics only). */
       user_initiated?: boolean;
       /**
@@ -166,6 +176,8 @@ export type SyncMessage =
       v: 1;
       type: "FULL_STATE_SNAPSHOT";
       snapshot_clock: VC;
+      /** DC-08 Appendix B: the sender's applied frontier (absent on older peers). */
+      applied_upto?: VC;
       entities: SnapshotEntry[];
       tombstones?: Snapshot["tombstones"];
       /** Engine extension: marks the last message of the snapshot stream. */
@@ -308,6 +320,12 @@ export interface SessionStats {
    * and their seq is above the held cutoff (no quarantine row, no skip row).
    */
   receivedRejectedRevoked?: number;
+  /**
+   * DC-09 Appendix A.2: full-state offers and snapshot messages declined
+   * because the sender's declared applied frontier is missing, malformed or
+   * above a held revocation cutoff. Silent; not a misbehavior signal.
+   */
+  snapshotsDeclined?: number;
   /** DC-27 TR-10: true when the session ended by the mid-session cutoff. */
   peerRevoked?: boolean;
   /**
@@ -615,6 +633,8 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     // session-end terminator before the real peer ACK arrives (closing the
     // transport on a phantom ACK). Same root as TD-019 F3; fixed here.
     stashed.length = 0;
+    // DC-09 Appendix A.2: a declined snapshot stream stays declined.
+    snapshotStreamDeclined = false;
     // Pkg5b: truthful self-frontier seeding BEFORE the pull loop (see doc).
     seedSelfAppliedFrontier();
     // Pkg6 (QA-1 F-6): same GC for long-lived engine instances — a frontier
@@ -944,6 +964,8 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
   }
 
   const stashed: SyncMessage[] = [];
+  /** DC-09 Appendix A.2: the current snapshot stream was declined. */
+  let snapshotStreamDeclined = false;
 
   function drainStashed(): SyncMessage | null {
     return stashed.shift() ?? null;
@@ -1080,6 +1102,7 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
       v: 1,
       type: "FULL_STATE_OFFER",
       snapshot_clock: getDeviceClockDb(),
+      applied_upto: readAppliedUpto(deps.db), // DC-08 Appendix B
       sender_device_id: deps.selfDeviceId,
       ...(userInitiated ? { user_initiated: true } : {}),
       ...(reason ? { reason } : {}),
@@ -1100,7 +1123,12 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     const chunks: Snapshot[] = [];
     buildSnapshot(deps.db, (s) => chunks.push(s));
     if (chunks.length === 0) {
-      chunks.push({ snapshot_clock: getDeviceClockDb(), entities: [], tombstones: [] });
+      chunks.push({
+        snapshot_clock: getDeviceClockDb(),
+        applied_upto: readAppliedUpto(deps.db),
+        entities: [],
+        tombstones: [],
+      });
     }
     for (let i = 0; i < chunks.length; i++) {
       const chunkMsg = chunks[i]!;
@@ -1108,6 +1136,7 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
         v: 1,
         type: "FULL_STATE_SNAPSHOT",
         snapshot_clock: chunkMsg.snapshot_clock,
+        applied_upto: chunkMsg.applied_upto, // DC-08 Appendix B
         entities: chunkMsg.entities,
         tombstones: chunkMsg.tombstones,
         final: i === chunks.length - 1,
@@ -1122,15 +1151,28 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     stats: SessionStats,
   ): void {
     assertPeerNotRevoked();
+    // DC-09 Appendix A.2: once one message of a stream is declined, the
+    // rest of that stream (up to `final`) is declined too.
+    if (snapshotStreamDeclined) {
+      stats.snapshotsDeclined = (stats.snapshotsDeclined ?? 0) + 1;
+      if (msg.final) snapshotStreamDeclined = false;
+      return;
+    }
     const result = applySnapshot(
       deps.db,
       {
         snapshot_clock: msg.snapshot_clock,
+        applied_upto: msg.applied_upto,
         entities: msg.entities,
         tombstones: msg.tombstones ?? [],
       },
       holder.knowledge,
     );
+    if (result.declined) {
+      stats.snapshotsDeclined = (stats.snapshotsDeclined ?? 0) + 1;
+      snapshotStreamDeclined = msg.final !== true;
+      return;
+    }
     stats.receivedApplied += result.appliedEntities;
     stats.snapshotDeletions =
       (stats.snapshotDeletions ?? 0) + result.absenceTombstones + result.inheritedTombstones;
@@ -1143,6 +1185,12 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     transport: SyncTransport,
     stats: SessionStats,
   ): Promise<void> {
+    // DC-09 Appendix A.2: a receiver holding a cutoff declines (silently,
+    // §7.4: no ACCEPT) an offer whose declared frontier is tainted/missing.
+    if (refusesDeclaredFrontier(offer.applied_upto, heldCutoffs(deps.db))) {
+      stats.snapshotsDeclined = (stats.snapshotsDeclined ?? 0) + 1;
+      return;
+    }
     await transport.send({
       v: 1,
       type: "FULL_STATE_ACCEPT",

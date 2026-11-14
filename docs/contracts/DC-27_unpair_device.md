@@ -4,6 +4,9 @@ Status: APPROVED by project owner (2026-11-14).
         Owner approved P1-P12 as recommended ("all recommended").
 AMENDED by project owner (2026-11-14). See Appendix A; supersedes
         §4.8 ("NOT told why") for the pairing ceremony only.
+AMENDED by project owner (2026-11-14). See Appendix B (option a):
+        full-state snapshots and the history cutoff; amends DC-08 §3.6
+        (Appendix B) and DC-09 §5 (Appendix A).
 Depends on: Architecture Spec v0.3 §17, §18, §19, §25; DC-05 §2.2, §3.3,
             §7.1-§7.3; DC-06 §2.6; DC-07 T5/T6; DC-08 §2.2, §3.7, TR-7;
             DC-10 §2.1-§2.5, §3, E1-E3; DC-13 (Sync now fan-out);
@@ -755,8 +758,8 @@ A.6  EFFECT ON OTHER ITEMS. T2 and O2 stay open for sync sessions
      appendix closes them for the pairing ceremony only.
 
 ==================================================================
-APPENDIX B — PROPOSAL (not approved): FULL-STATE SNAPSHOTS AND THE
-             HISTORY CUTOFF (TD-041)
+APPENDIX B — FULL-STATE SNAPSHOTS AND THE HISTORY CUTOFF (TD-041)
+             (owner-approved 2026-11-14: option a), see B.6)
 ==================================================================
 
 Problem: DC-05 Appendix A.2 filters CHANGE RECORDS of a revoked
@@ -863,6 +866,11 @@ B.4  ITEMS COMMON TO a) TO c)
        reason today; whether to show one is a separate UI decision.
      - Older builds: a missing declaration counts as tainted in a),
        only on a receiver that holds a cutoff (V11 posture).
+     - Taint is permanent in a): applied_upto never goes down, so a
+       peer that applied W above C stays tainted. A device whose
+       peers are all tainted or run an older build can never accept
+       full state while it holds the cutoff, and falls back to
+       incremental sync only (TD-046).
 
 B.5  TEST REQUIREMENTS (for the chosen option)
      TR-16 the three "TD-041 repro" tests pass as ordinary tests (with
@@ -870,3 +878,31 @@ B.5  TEST REQUIREMENTS (for the chosen option)
            untainted peer still delivers W's at-or-below-cutoff state
            and other producers' state, and leaves applied_upto[W] at
            or below C; each new guard has a mutation proof.
+
+B.6  DECISION (owner, 2026-11-14): option a) is approved. B.1-B.3 stay
+     as the record of the analysis; b) to f) are not adopted. Wire and
+     receiver rules: DC-08 Appendix B, DC-09 Appendix A. Readings fixed
+     at implementation time (fail closed where a) left a detail open):
+     - "applied_upto" has the CHANGES_ACK shape (DC-08 §3.4): producer
+       device_id -> contiguous applied frontier, read from the sender's
+       applied frontier, never from device_clock (B.1 e). A producer
+       missing from the map counts as 0 (DC-02 §2.4 and §5: an absent
+       entry compares as 0; an absent applied_upto entry is 0).
+     - A declaration that is not an object, or whose value for a
+       producer with a held cutoff is not a non-negative integer,
+       counts as missing: the receiver declines.
+     - The receiver checks the offer AND every snapshot message: a
+       snapshot can arrive without an offer. Once one message of a
+       snapshot stream is declined, the rest of that stream is
+       declined too.
+     - Declining is silent and is not a misbehavior signal (DC-16):
+       no quarantine row, no tally, no ACCEPT. It is counted in the
+       session outcome only.
+     - The clamp applies to applied_upto only: applied_upto[W] :=
+       max(current, min(snapshot_clock[W], C, declared[W])), with
+       declared[W] = 0 when missing. A clean sender that applied W
+       below C does not lift the receiver to C, so W's seqs between
+       the two stay needed and are pulled incrementally. device_clock
+       is merged as before (it already carries causal context, B.1 e).
+     - The optional sender restraint in a) ("may skip offering") is
+       not used; the receiver rule alone is normative.

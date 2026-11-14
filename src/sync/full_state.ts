@@ -7,6 +7,7 @@ import type Database from "better-sqlite3";
 import { merge, dominates } from "../sync/vector_clock.ts";
 import type { VectorClock } from "../sync/change_record.ts";
 import type { KnowledgeState } from "../sync/knowledge_state.ts";
+import { revokedCutoffs } from "../security/revocation_store.ts";
 
 export interface SnapshotEntry {
   entity_id: string;
@@ -21,6 +22,11 @@ export interface SnapshotEntry {
 
 export interface Snapshot {
   snapshot_clock: VectorClock;
+  /**
+   * DC-08 Appendix B: the sender's applied frontier (applied_upto table,
+   * never device_clock). Optional on the wire: older senders omit it.
+   */
+  applied_upto?: VectorClock;
   entities: SnapshotEntry[];
   /** non-compactable tombstones ride along (DC-09 §4.3) */
   tombstones: Array<{
@@ -246,6 +252,8 @@ export function buildSnapshot(
     .all();
   const snapshot_clock: VectorClock = {};
   for (const r of clockRows) snapshot_clock[r.peer_device_id] = r.max_seq;
+  // DC-08 Appendix B: declare the applied frontier, captured with the clock.
+  const applied_upto = readAppliedUpto(db);
 
   const events = db
     .prepare<[], { event_id: string }>(
@@ -266,7 +274,7 @@ export function buildSnapshot(
   const buffer: SnapshotEntry[] = [];
   const flush = () => {
     if (buffer.length === 0) return;
-    emit({ snapshot_clock, entities: [...buffer], tombstones: [] });
+    emit({ snapshot_clock, applied_upto, entities: [...buffer], tombstones: [] });
     buffer.length = 0;
   };
 
@@ -335,6 +343,7 @@ export function buildSnapshot(
   if (tombs.length > 0) {
     emit({
       snapshot_clock,
+      applied_upto,
       entities: [],
       tombstones: tombs.map((t) => ({
         ...t,
@@ -343,6 +352,66 @@ export function buildSnapshot(
     });
   }
   flush();
+}
+
+/** This device's applied frontier per producer (the applied_upto table). */
+export function readAppliedUpto(db: Database.Database): VectorClock {
+  const rows = db
+    .prepare<[], { d: string; a: number }>(
+      "SELECT producer_device_id AS d, applied_through AS a FROM applied_upto",
+    )
+    .all();
+  const out: VectorClock = {};
+  for (const r of rows) out[r.d] = r.a;
+  return out;
+}
+
+/**
+ * DC-27 Appendix B / DC-09 Appendix A: the revocation cutoffs this device
+ * holds. A database without the revocation_records table cannot hold a
+ * record, so it holds no cutoff.
+ */
+export function heldCutoffs(db: Database.Database): Map<string, number> {
+  const hasTable = db
+    .prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'revocation_records'",
+    )
+    .get();
+  return hasTable === undefined ? new Map() : revokedCutoffs(db);
+}
+
+/**
+ * DC-09 Appendix A.2: true when a receiver holding `cutoffs` must decline a
+ * full-state offer or snapshot with this declared applied frontier. Fails
+ * closed: a missing or malformed declaration is refused; a producer missing
+ * from the declaration counts as 0 (DC-02 §2.4 comparison, §5 applied_upto).
+ */
+export function refusesDeclaredFrontier(
+  declared: unknown,
+  cutoffs: Map<string, number>,
+): boolean {
+  if (cutoffs.size === 0) return false;
+  if (typeof declared !== "object" || declared === null || Array.isArray(declared)) {
+    return true;
+  }
+  for (const [producer, cutoff] of cutoffs) {
+    if (!Object.prototype.hasOwnProperty.call(declared, producer)) continue;
+    const v = (declared as Record<string, unknown>)[producer];
+    if (typeof v !== "number" || !Number.isInteger(v) || v < 0) return true;
+    if (v > cutoff) return true;
+  }
+  return false;
+}
+
+/**
+ * DC-09 Appendix A.3: the sender's declared applied frontier for one
+ * producer; a producer missing from the declaration counts as 0. Only
+ * called after refusesDeclaredFrontier() accepted the declaration.
+ */
+function declaredFrontier(declared: VectorClock | undefined, producer: string): number {
+  if (declared === undefined) return 0;
+  if (!Object.prototype.hasOwnProperty.call(declared, producer)) return 0;
+  return declared[producer] ?? 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -361,6 +430,12 @@ export interface ApplyResult {
    * replaced by the §7.1 domination winner. Resolution lifts the guard.
    */
   conflictPreserved: number;
+  /**
+   * DC-09 Appendix A.2: the snapshot was declined as a whole (nothing
+   * written) because its declared applied frontier is missing, malformed
+   * or above a held revocation cutoff.
+   */
+  declined: boolean;
 }
 
 export function applySnapshot(
@@ -374,7 +449,17 @@ export function applySnapshot(
     survivedLocal: 0,
     absenceTombstones: 0,
     conflictPreserved: 0,
+    declined: false,
   };
+
+  // DC-09 Appendix A.2 (DC-27 Appendix B option a): a receiver holding a
+  // cutoff refuses a snapshot from a sender that applied the revoked
+  // producer above it (or does not say). Whole snapshot, nothing written.
+  const cutoffs = heldCutoffs(db);
+  if (refusesDeclaredFrontier(snapshot.applied_upto, cutoffs)) {
+    result.declined = true;
+    return result;
+  }
 
   const insertTombstone = db.prepare(`
     INSERT INTO entities_tombstones (entity_id, entity_type, producer_device_id, seq, causality_clock, deleted_at_hlc)
@@ -545,7 +630,16 @@ export function applySnapshot(
     }
 
     // DC-06 §3.4 step 2: applied_upto := dominated merge with snapshot_clock
-    for (const [d, s] of Object.entries(snapshot.snapshot_clock)) {
+    for (const [d, raw] of Object.entries(snapshot.snapshot_clock)) {
+      // DC-09 Appendix A.3: never raise applied_upto above a held cutoff
+      // from a snapshot (snapshot_clock may cite causal context only), nor
+      // above the sender's declared frontier for that producer (absent
+      // counts as 0): seqs the sender never applied stay pullable.
+      const cutoff = cutoffs.get(d);
+      const s =
+        cutoff === undefined
+          ? raw
+          : Math.min(raw, cutoff, declaredFrontier(snapshot.applied_upto, d));
       const current =
         (
           db

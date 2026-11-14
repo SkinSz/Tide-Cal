@@ -7883,6 +7883,7 @@ function buildSnapshot(db, emit, batchSize = 256) {
   ).all();
   const snapshot_clock = {};
   for (const r of clockRows) snapshot_clock[r.peer_device_id] = r.max_seq;
+  const applied_upto = readAppliedUpto(db);
   const events = db.prepare(
     "SELECT * FROM events ORDER BY event_id ASC"
   ).all();
@@ -7892,7 +7893,7 @@ function buildSnapshot(db, emit, batchSize = 256) {
   const buffer = [];
   const flush = () => {
     if (buffer.length === 0) return;
-    emit({ snapshot_clock, entities: [...buffer], tombstones: [] });
+    emit({ snapshot_clock, applied_upto, entities: [...buffer], tombstones: [] });
     buffer.length = 0;
   };
   for (const c of calendars) {
@@ -7927,6 +7928,7 @@ function buildSnapshot(db, emit, batchSize = 256) {
   if (tombs.length > 0) {
     emit({
       snapshot_clock,
+      applied_upto,
       entities: [],
       tombstones: tombs.map((t) => ({
         ...t,
@@ -7936,14 +7938,52 @@ function buildSnapshot(db, emit, batchSize = 256) {
   }
   flush();
 }
+function readAppliedUpto(db) {
+  const rows = db.prepare(
+    "SELECT producer_device_id AS d, applied_through AS a FROM applied_upto"
+  ).all();
+  const out = {};
+  for (const r of rows) out[r.d] = r.a;
+  return out;
+}
+function heldCutoffs(db) {
+  const hasTable = db.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'revocation_records'"
+  ).get();
+  return hasTable === void 0 ? /* @__PURE__ */ new Map() : revokedCutoffs(db);
+}
+function refusesDeclaredFrontier(declared, cutoffs) {
+  if (cutoffs.size === 0) return false;
+  if (typeof declared !== "object" || declared === null || Array.isArray(declared)) {
+    return true;
+  }
+  for (const [producer, cutoff] of cutoffs) {
+    if (!Object.prototype.hasOwnProperty.call(declared, producer)) continue;
+    const v = declared[producer];
+    if (typeof v !== "number" || !Number.isInteger(v) || v < 0) return true;
+    if (v > cutoff) return true;
+  }
+  return false;
+}
+function declaredFrontier(declared, producer) {
+  if (declared === void 0) return 0;
+  if (!Object.prototype.hasOwnProperty.call(declared, producer)) return 0;
+  return declared[producer] ?? 0;
+}
 function applySnapshot(db, snapshot, knowledge) {
   const result = {
     appliedEntities: 0,
     inheritedTombstones: 0,
     survivedLocal: 0,
     absenceTombstones: 0,
-    conflictPreserved: 0
+    conflictPreserved: 0,
+    declined: false
   };
+  const cutoffs = heldCutoffs(db);
+  if (refusesDeclaredFrontier(snapshot.applied_upto, cutoffs)) {
+    result.declined = true;
+    return result;
+  }
   const insertTombstone = db.prepare(`
     INSERT INTO entities_tombstones (entity_id, entity_type, producer_device_id, seq, causality_clock, deleted_at_hlc)
     VALUES (@entity_id, @entity_type, @producer_device_id, @seq, @causality_clock, @deleted_at_hlc)
@@ -8055,7 +8095,9 @@ function applySnapshot(db, snapshot, knowledge) {
       });
       result.inheritedTombstones++;
     }
-    for (const [d, s] of Object.entries(snapshot.snapshot_clock)) {
+    for (const [d, raw] of Object.entries(snapshot.snapshot_clock)) {
+      const cutoff = cutoffs.get(d);
+      const s = cutoff === void 0 ? raw : Math.min(raw, cutoff, declaredFrontier(snapshot.applied_upto, d));
       const current = db.prepare("SELECT applied_through FROM applied_upto WHERE producer_device_id = ?").get(d)?.applied_through ?? 0;
       db.prepare(`
         INSERT INTO applied_upto (producer_device_id, applied_through) VALUES (?, ?)
@@ -8376,6 +8418,7 @@ function createSyncEngine(deps) {
   async function runSessionInner(transport, stats) {
     sessionDedup = new OfferDedup();
     stashed.length = 0;
+    snapshotStreamDeclined = false;
     seedSelfAppliedFrontier();
     gcZombiePending();
     const hello = {
@@ -8564,6 +8607,7 @@ function createSyncEngine(deps) {
     return msg;
   }
   const stashed = [];
+  let snapshotStreamDeclined = false;
   function drainStashed() {
     return stashed.shift() ?? null;
   }
@@ -8649,6 +8693,8 @@ function createSyncEngine(deps) {
       v: 1,
       type: "FULL_STATE_OFFER",
       snapshot_clock: getDeviceClockDb(),
+      applied_upto: readAppliedUpto(deps.db),
+      // DC-08 Appendix B
       sender_device_id: deps.selfDeviceId,
       ...userInitiated ? { user_initiated: true } : {},
       ...reason ? { reason } : {}
@@ -8660,7 +8706,12 @@ function createSyncEngine(deps) {
     const chunks = [];
     buildSnapshot(deps.db, (s) => chunks.push(s));
     if (chunks.length === 0) {
-      chunks.push({ snapshot_clock: getDeviceClockDb(), entities: [], tombstones: [] });
+      chunks.push({
+        snapshot_clock: getDeviceClockDb(),
+        applied_upto: readAppliedUpto(deps.db),
+        entities: [],
+        tombstones: []
+      });
     }
     for (let i = 0; i < chunks.length; i++) {
       const chunkMsg = chunks[i];
@@ -8668,6 +8719,8 @@ function createSyncEngine(deps) {
         v: 1,
         type: "FULL_STATE_SNAPSHOT",
         snapshot_clock: chunkMsg.snapshot_clock,
+        applied_upto: chunkMsg.applied_upto,
+        // DC-08 Appendix B
         entities: chunkMsg.entities,
         tombstones: chunkMsg.tombstones,
         final: i === chunks.length - 1
@@ -8677,19 +8730,34 @@ function createSyncEngine(deps) {
   }
   function applyIncomingSnapshot(msg, stats) {
     assertPeerNotRevoked();
+    if (snapshotStreamDeclined) {
+      stats.snapshotsDeclined = (stats.snapshotsDeclined ?? 0) + 1;
+      if (msg.final) snapshotStreamDeclined = false;
+      return;
+    }
     const result = applySnapshot(
       deps.db,
       {
         snapshot_clock: msg.snapshot_clock,
+        applied_upto: msg.applied_upto,
         entities: msg.entities,
         tombstones: msg.tombstones ?? []
       },
       holder.knowledge
     );
+    if (result.declined) {
+      stats.snapshotsDeclined = (stats.snapshotsDeclined ?? 0) + 1;
+      snapshotStreamDeclined = msg.final !== true;
+      return;
+    }
     stats.receivedApplied += result.appliedEntities;
     stats.snapshotDeletions = (stats.snapshotDeletions ?? 0) + result.absenceTombstones + result.inheritedTombstones;
   }
   async function acceptOffer(offer, getNext, transport, stats) {
+    if (refusesDeclaredFrontier(offer.applied_upto, heldCutoffs(deps.db))) {
+      stats.snapshotsDeclined = (stats.snapshotsDeclined ?? 0) + 1;
+      return;
+    }
     await transport.send({
       v: 1,
       type: "FULL_STATE_ACCEPT",
