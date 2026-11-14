@@ -76,6 +76,9 @@ export function initDataRefresh(
   // A drag that ends releases a held-back refresh the same way. Deferred
   // one tick so the drop handler's own write + render go first.
   document.addEventListener("dragend", () => setTimeout(() => scheduler.editorClosed(), 0), true);
+  // In-window data changes outside sync (DC-26 v2: Sync Errors "Retry")
+  // use the same coalesced, edit-safe path.
+  document.addEventListener("tide:data-changed", () => scheduler.notify());
   if ("__TAURI_INTERNALS__" in globalThis) {
     void import("@tauri-apps/api/event")
       .then(({ listen }) => listen("tide://data-changed", () => scheduler.notify()))

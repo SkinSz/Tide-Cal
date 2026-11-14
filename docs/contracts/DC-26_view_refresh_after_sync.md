@@ -4,6 +4,8 @@ Status: APPROVED by project owner (2026-11-14).
         Owner approved P1-P3; quiet period raised from 0.75 s to 1.5 s at
         the owner's request ("0.75s is a little short"). The conflicts
         badge refresh (§3.3) was added in the same approval round.
+AMENDED v2 by project owner (2026-11-14). See Appendix A; supersedes
+        §3.1 where they conflict.
 Depends on: DC-08 (sync session, SessionStats), DC-13 (scheduler-driven
             sessions), DC-19 (manual Sync now), DC-21 §3.2 (stdio event
             channel precedent: id-less NDJSON notifications).
@@ -168,3 +170,21 @@ shell to the calendar view, and how the view reacts to it.
     V1  Confirm that a received change which ends up as a DC-14 conflict
         is counted in receivedApplied. If it is not, the §3.1 condition
         becomes "receivedApplied > 0 OR a conflict was recorded".
+
+==================================================================
+APPENDIX A — v2 AMENDMENT (owner-approved 2026-11-14)
+==================================================================
+
+A.1  A full-state snapshot session that DELETED local rows (absence
+     rule or inherited tombstones) also emits the notice, even when it
+     applied no new values. The count is carried in a separate session
+     statistic (snapshotDeletions) so receivedApplied keeps its meaning;
+     the notice's "applied" field carries the sum. (Review MINOR-3.)
+A.2  A successful "Retry" in the Sync Errors dialog changes local data
+     outside a sync session. It triggers the same §3.3 refresh path via
+     an in-window event, so the redraw happens once the dialog closes.
+     (Review O-2.)
+A.3  TR-9  A snapshot with 0 applied and N > 0 deletions notifies with N;
+           0 and 0 does not.
+     TR-10 An applied Retry dispatches the in-window data-changed event;
+           a still-quarantined one does not.

@@ -126,16 +126,18 @@ export function dataChangedNoticeLine(applied: number): string {
 
 /**
  * DC-26 §3.1 decision seam (TR-1): exactly one notice when the session
- * applied >= 1 received change (conflict outcomes count as applied), none
- * otherwise. A throwing sink never fails the completed session.
+ * changed local data — applied >= 1 received change (conflict outcomes
+ * count as applied) or, since v2, deleted local rows via a full-state
+ * snapshot — none otherwise. A throwing sink never fails the session.
  */
 export function notifyDataChanged(
-  stats: { receivedApplied: number },
+  stats: { receivedApplied: number; snapshotDeletions?: number },
   sink: ((applied: number) => void) | undefined,
 ): void {
-  if (stats.receivedApplied <= 0 || sink === undefined) return;
+  const changed = stats.receivedApplied + (stats.snapshotDeletions ?? 0);
+  if (changed <= 0 || sink === undefined) return;
   try {
-    sink(stats.receivedApplied);
+    sink(changed);
   } catch {
     /* a notice must never fail a completed session */
   }

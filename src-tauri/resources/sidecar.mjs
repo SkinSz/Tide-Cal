@@ -8066,6 +8066,7 @@ function createSyncEngine(deps) {
       holder.knowledge
     );
     stats.receivedApplied += result.appliedEntities;
+    stats.snapshotDeletions = (stats.snapshotDeletions ?? 0) + result.absenceTombstones + result.inheritedTombstones;
   }
   async function acceptOffer(offer, getNext, transport, stats) {
     await transport.send({
@@ -9624,9 +9625,10 @@ function dataChangedNoticeLine(applied) {
   return JSON.stringify({ notice: "data_changed", source: "sync", applied });
 }
 function notifyDataChanged(stats, sink) {
-  if (stats.receivedApplied <= 0 || sink === void 0) return;
+  const changed = stats.receivedApplied + (stats.snapshotDeletions ?? 0);
+  if (changed <= 0 || sink === void 0) return;
   try {
-    sink(stats.receivedApplied);
+    sink(changed);
   } catch {
   }
 }

@@ -266,6 +266,12 @@ export interface SessionStats {
    */
   receivedDroppedIntake: number;
   /**
+   * DC-26 v2 (owner 2026-11-14, review MINOR-3): local rows a received
+   * FULL_STATE snapshot deleted (absence rule + inherited tombstones).
+   * Counted apart from receivedApplied so its meaning stays unchanged.
+   */
+  snapshotDeletions?: number;
+  /**
    * Pkg6 (item 8): true when this session's HELLO carried the DC-02 §4.1
    * "impossible under honest operation" anomaly — the peer advertised a
    * clock component for OUR device id greater than our own (identity theft
@@ -1029,6 +1035,8 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
       holder.knowledge,
     );
     stats.receivedApplied += result.appliedEntities;
+    stats.snapshotDeletions =
+      (stats.snapshotDeletions ?? 0) + result.absenceTombstones + result.inheritedTombstones;
   }
 
   /** Send FULL_STATE_ACCEPT and consume the winner's snapshot stream. */

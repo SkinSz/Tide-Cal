@@ -71,6 +71,20 @@ const REASON_HINTS: Record<string, string> = {
  * shown alongside — information is never hidden. Unknown codes fall back to
  * the code itself — the UI never invents a meaning it doesn't have.
  */
+/**
+ * DC-26 v2 A.2 / TR-10: only a retry that APPLIED the record changed local
+ * data, so only that one asks the calendar to redraw (in-window event,
+ * picked up by data_refresh.ts once this dialog closes).
+ */
+export function notifyRetryOutcome(
+  outcome: string,
+  target: EventTarget = document,
+): boolean {
+  if (outcome !== "applied") return false;
+  target.dispatchEvent(new Event("tide:data-changed"));
+  return true;
+}
+
 export function humanReason(code: string): string {
   if (REASON_HINTS[code]) return REASON_HINTS[code]!;
   const m = /^invalid_change_record:(.+)$/.exec(code);
@@ -547,6 +561,9 @@ function renderErrorCard(
         const r = await syncOp<{ outcome: string }>("retry_quarantine", {
           quarantine_id: view.quarantine_id,
         });
+        // DC-26 v2 (owner 2026-11-14, review O-2): an applied retry changed
+        // local data; the calendar redraws once this dialog is closed.
+        notifyRetryOutcome(r.outcome);
         note =
           r.outcome === "applied" || r.outcome === "duplicate"
             ? "Applied."

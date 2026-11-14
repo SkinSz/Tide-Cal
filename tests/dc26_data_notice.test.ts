@@ -18,6 +18,13 @@ describe("DC-26 data notice", () => {
     expect(calls).toEqual([]);
   });
 
+  it("DC-26 v2: a snapshot that only deleted local rows also notifies", () => {
+    const calls: number[] = [];
+    notifyDataChanged({ receivedApplied: 0, snapshotDeletions: 2 }, (n) => calls.push(n));
+    notifyDataChanged({ receivedApplied: 0, snapshotDeletions: 0 }, (n) => calls.push(n));
+    expect(calls).toEqual([2]);
+  });
+
   it("a throwing sink never fails the session", () => {
     expect(() =>
       notifyDataChanged({ receivedApplied: 1 }, () => {
@@ -30,5 +37,22 @@ describe("DC-26 data notice", () => {
     const msg = JSON.parse(dataChangedNoticeLine(2)) as Record<string, unknown>;
     expect(msg).toEqual({ notice: "data_changed", source: "sync", applied: 2 });
     expect("id" in msg).toBe(false);
+  });
+});
+
+describe("DC-26 v2 TR-10: Sync Errors Retry", () => {
+  it("an applied retry dispatches tide:data-changed; others do not", async () => {
+    const { notifyRetryOutcome } = await import("../frontend/sync_errors");
+    for (const [outcome, expected] of [
+      ["applied", 1],
+      ["still_quarantined", 0],
+      ["duplicate", 0],
+    ] as const) {
+      const target = new EventTarget();
+      let seen = 0;
+      target.addEventListener("tide:data-changed", () => seen++);
+      expect(notifyRetryOutcome(outcome, target)).toBe(expected === 1);
+      expect(seen).toBe(expected);
+    }
   });
 });

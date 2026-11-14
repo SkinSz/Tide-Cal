@@ -414,21 +414,21 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 - **ID:** TD-028
 - **Title:** Sync now blocks its caller (tray menu thread / async command worker) while the elevated firewall-rule creation waits for the UAC answer
 - **Priority:** 3/10 — LOW (once per machine; the prompt is modal anyway)
-- **Status:** OPEN (pre-existing; surfaced by the 2026-11-14 firewall review)
+- **Status:** CLOSED — not debt (owner, 2026-11-14): the UAC prompt runs on its own secure desktop, so the app being unresponsive while it is open has no user-visible cost.
 - **Fix direction:** run `ensure_firewall(app, true)` on the blocking pool from both entry points and continue the sync pass from its completion.
 
 ## TD-029 — Per-user NSIS uninstaller likely cannot remove the firewall rules
 - **ID:** TD-029
 - **Title:** DC-24 §6.5 assumes an elevated uninstaller; Tide installs per user under AppData\Local, so `netsh delete rule` from the uninstaller probably fails silently
 - **Priority:** 2/10 — LOW (leftover rules are inert once the program path is gone)
-- **Status:** OPEN (INFERRED, not yet verified on Windows)
+- **Status:** CLOSED (owner report 2026-11-14: no longer observed on the current installer).
 - **Verify:** uninstall on a test PC, then `netsh advfirewall firewall show rule name="Tide sync"`.
 
 ## TD-030 — Conflict dialog shows raw data instead of readable values
 - **ID:** TD-030
 - **Title:** Conflict candidates render as JSON (`{"startMs":…,"endMs":…}`), field names as internal paths (`schedule`), devices as ids
 - **Priority:** 7/10 — HIGH (users cannot make an informed choice; owner report 2026-11-14)
-- **Status:** OPEN — needs a design decision (formatting per field type: dates/times in the user's locale and time format, titles as text, recurrence rules in words, device by name)
+- **Status:** OPEN — design APPROVED (DC-14 Appendix A, 2026-11-14); implementation pending
 - **Relevant files:** `frontend/conflicts.ts` (`formatCandidateValue`, `describeConflict`, `describeCandidateSide`), `src/application/conflicts_ui.ts`
 
 ## TD-031 — Conflicts badge count goes stale
