@@ -1989,4 +1989,333 @@ describe("TD-041 snapshot vs revoked-producer cutoff", () => {
       expect(appliedThrough(L, W.identity.deviceId)!).toBeLessThanOrEqual(cutoff);
     }
   });
+
+  // -------------------------------------------------------------------------
+  // TD-045: a clean peer's full-state snapshot on a peer that applied W above
+  // the cutoff. snapshot_clock comes from device_clock, which takes in causal
+  // context (Appendix B.1 e), so the absence rule (DC-09 §5.2) can treat a
+  // local entity as covered although the sender never held it.
+  // -------------------------------------------------------------------------
+
+  const versionOf = (d: Dev, id: string): Record<string, number> | null => {
+    const row = d.core.db.prepare("SELECT version FROM entity_versions WHERE entity_id=?").get(id) as { version: string } | undefined;
+    return row ? (JSON.parse(row.version) as Record<string, number>) : null;
+  };
+  const eventRow = (d: Dev, id: string) =>
+    d.core.db.prepare("SELECT title, description FROM events WHERE event_id=?").get(id) as { title: string; description: string } | undefined;
+  const tombstonesFor = (d: Dev, id: string): number =>
+    count(d, "SELECT COUNT(*) AS n FROM entities_tombstones WHERE entity_id=?", id);
+  /** Short labels for a clock's keys (device ids are random per run). */
+  const named = (clock: Record<string, number> | null | undefined, devs: Dev[]): string =>
+    clock == null
+      ? "null"
+      : JSON.stringify(
+          Object.fromEntries(
+            Object.entries(clock).map(([k, v]) => [devs.find((d) => d.identity.deviceId === k)?.label ?? k.slice(0, 6), v]),
+          ),
+        );
+
+  test("TD-045 (i) a clean peer's snapshot removes, on the tainted P, an event W created above the cutoff (accepted, DC-27 §4.4)", { timeout: 60_000 }, async () => {
+    const { L, W, P, cutoff, wAfterId, snap } = await setupUntainted();
+    const w = W.identity.deviceId;
+    const devs = [L, W, P];
+    expect(appliedThrough(P, w)!).toBeGreaterThan(cutoff); // P is tainted
+    expect(snap.entities.some((e) => e.entity_id === wAfterId)).toBe(false); // L never held it
+    const before = versionOf(P, wAfterId);
+    const r = applySnapshot(P.core.db, snap, loadKnowledgeFromDb(P.core.db));
+    console.error(
+      `[td045-i] cutoff=${cutoff} L.declared[W]=${snap.applied_upto![w]} L.snapshot_clock=${named(snap.snapshot_clock, devs)} ` +
+        `P.version(W-AFTER)=${named(before, devs)} declined=${r.declined} absenceTombstones=${r.absenceTombstones} ` +
+        `P titles after=${JSON.stringify(titles(P))} tombstones(W-AFTER)=${tombstonesFor(P, wAfterId)}`,
+    );
+    // P holds the cutoff and L declares exactly C: the snapshot is accepted.
+    expect(r.declined).toBe(false);
+    // The deletion comes from the absence rule: L's snapshot_clock[W] cites
+    // W's above-cutoff seq as causal context and so covers P's copy.
+    expect(snap.snapshot_clock[w]).toBeGreaterThanOrEqual(before![w]!);
+    expect(r.absenceTombstones).toBe(1);
+    expect(titles(P)).not.toContain("W-AFTER");
+    expect(tombstonesFor(P, wAfterId)).toBe(1);
+    expect(titles(P)).toEqual(expect.arrayContaining(["W-BEFORE", "P-ONLY"]));
+  });
+
+  test("TD-045 (i) engine: the same snapshot in a session from L removes W's above-cutoff event on P", { timeout: 60_000 }, async () => {
+    const { L, P, wAfterId, snap } = await setupUntainted();
+    const t = scriptedTransport();
+    const run = lEngine(P, L).runSession(t.transport);
+    t.push({ v: 1, type: "HELLO", device_clock: {} });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    t.push({ v: 1, type: "FULL_STATE_SNAPSHOT", snapshot_clock: snap.snapshot_clock, applied_upto: snap.applied_upto, entities: snap.entities, tombstones: snap.tombstones, final: true } as any);
+    t.push({ v: 1, type: "CHANGES_ACK", applied_upto: {} });
+    t.push(null);
+    const stats = await run;
+    console.error(`[td045-i-engine] snapshotsDeclined=${stats.snapshotsDeclined ?? 0} P titles after=${JSON.stringify(titles(P))}`);
+    expect(stats.snapshotsDeclined ?? 0).toBe(0);
+    expect(titles(P)).not.toContain("W-AFTER");
+    expect(tombstonesFor(P, wAfterId)).toBe(1);
+  });
+
+  /**
+   * Mixed entity, shape A: an event W created at or below the cutoff, whose
+   * TITLE W edits above the cutoff (P applies it while unaware), and whose
+   * DESCRIPTION P edits later. L holds the row, so it rides L's snapshot.
+   */
+  async function setupMixedA(lPulledPEdit: boolean) {
+    const L = makeDev("L");
+    const W = makeDev("W");
+    const P = makeDev("P");
+    pairAll(L, W, P);
+    await listen(L);
+    await listen(P);
+    addEvent(W, "W-BEFORE");
+    await dial(W, L);
+    await dial(W, P);
+    await L.mgr.unpairDevice(W.identity.deviceId, true);
+    const cutoff = storedRecord(L).record.revoked_after_seq!;
+    const ev = W.core.db.prepare("SELECT event_id AS id, utc_start_ms AS s, utc_end_ms AS e FROM events WHERE title='W-BEFORE'").get() as { id: string; s: number; e: number };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    W.core.updateEvent(ev.id, { title: "W-TITLE-AFTER-CUTOFF", description: "", startMs: ev.s, endMs: ev.e, allDay: false } as any);
+    await dial(W, P); // unaware P applies W's above-cutoff title
+    addEvent(P, "P-ONLY"); // cites W's above-cutoff seq as causal context
+    await dial(L, P); // P learns the record; L rejects the title, pulls P-ONLY
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    P.core.updateEvent(ev.id, { title: "W-TITLE-AFTER-CUTOFF", description: "P-DESC", startMs: ev.s, endMs: ev.e, allDay: false } as any);
+    if (lPulledPEdit) await dial(L, P);
+    return { L, W, P, cutoff, id: ev.id };
+  }
+
+  /**
+   * Mixed entity, shape B: an event W created above the cutoff (L never
+   * holds a row for it, TR-8), whose title P edits later.
+   */
+  async function setupMixedB(lPulledPEdit: boolean) {
+    const base = await setupUntainted();
+    const { L, P, wAfterId } = base;
+    const ev = P.core.db.prepare("SELECT utc_start_ms AS s, utc_end_ms AS e FROM events WHERE event_id=?").get(wAfterId) as { s: number; e: number };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    P.core.updateEvent(wAfterId, { title: "W-AFTER edited on P", description: "", startMs: ev.s, endMs: ev.e, allDay: false } as any);
+    if (lPulledPEdit) await dial(L, P);
+    return { ...base, id: wAfterId };
+  }
+
+  for (const pulled of [false, true]) {
+    const when = pulled ? "after L pulled P's edit" : "before L pulled P's edit";
+    test(`TD-045 (ii) mixed entity A (W's at-or-below-cutoff event, W title edit above the cutoff, later P edit), L's snapshot ${when}`, { timeout: 60_000 }, async () => {
+      const { L, W, P, cutoff, id } = await setupMixedA(pulled);
+      const w = W.identity.deviceId;
+      const devs = [L, W, P];
+      const snap = snapshotOf(L);
+      const entry = snap.entities.find((e) => e.entity_id === id);
+      const before = { row: eventRow(P, id), version: versionOf(P, id), onL: eventRow(L, id) };
+      const r = applySnapshot(P.core.db, snap, loadKnowledgeFromDb(P.core.db));
+      const after = eventRow(P, id);
+      console.error(
+        `[td045-ii-A ${pulled ? "pulled" : "not-pulled"}] cutoff=${cutoff} L.snapshot_clock=${named(snap.snapshot_clock, devs)} ` +
+          `L.declared[W]=${snap.applied_upto![w]} entry.in_snapshot=${entry !== undefined} L.row=${JSON.stringify(before.onL ?? null)} ` +
+          `P.version=${named(before.version, devs)} P.row.before=${JSON.stringify(before.row ?? null)} declined=${r.declined} ` +
+          `absenceTombstones=${r.absenceTombstones} P.row.after=${JSON.stringify(after ?? null)} tombstones=${tombstonesFor(P, id)}`,
+      );
+      expect(r.declined).toBe(false);
+      // L holds the row, so the entity rides the snapshot and is never
+      // deleted on P by absence.
+      expect(entry).toBeDefined();
+      expect(after).toBeDefined();
+      expect(tombstonesFor(P, id)).toBe(0);
+      expect(r.absenceTombstones).toBe(0);
+      // Observed field outcome on P (recorded; see the TD-045 entry).
+      if (!pulled) {
+        // P's own edit is not covered by L's snapshot_clock: P keeps its row.
+        expect(after).toEqual(before.row);
+      } else {
+        // L's row already carries P's description; W's above-cutoff title
+        // never reached L, and L's state replaces P's (P's version is covered).
+        expect(after).toEqual(before.onL);
+      }
+    });
+
+    test(`TD-045 (ii) mixed entity B (W created it above the cutoff, P edited it later), L's snapshot ${when}`, { timeout: 60_000 }, async () => {
+      const { L, W, P, cutoff, id } = await setupMixedB(pulled);
+      const w = W.identity.deviceId;
+      const devs = [L, W, P];
+      const snap = snapshotOf(L);
+      const before = { row: eventRow(P, id), version: versionOf(P, id) };
+      const r = applySnapshot(P.core.db, snap, loadKnowledgeFromDb(P.core.db));
+      const after = eventRow(P, id);
+      console.error(
+        `[td045-ii-B ${pulled ? "pulled" : "not-pulled"}] cutoff=${cutoff} L.snapshot_clock=${named(snap.snapshot_clock, devs)} ` +
+          `L.declared[W]=${snap.applied_upto![w]} entry.in_snapshot=${snap.entities.some((e) => e.entity_id === id)} L.row=${JSON.stringify(eventRow(L, id) ?? null)} ` +
+          `P.version=${named(before.version, devs)} P.row.before=${JSON.stringify(before.row ?? null)} declined=${r.declined} ` +
+          `absenceTombstones=${r.absenceTombstones} P.row.after=${JSON.stringify(after ?? null)} tombstones=${tombstonesFor(P, id)}`,
+      );
+      expect(r.declined).toBe(false);
+      expect(eventRow(L, id)).toBeUndefined();
+      if (pulled) {
+        // L applied P's edit record (no row to update, TR-8), so its
+        // snapshot_clock covers P's edit too: the entity is removed on P.
+        expect(after).toBeUndefined();
+        expect(tombstonesFor(P, id)).toBe(1);
+      } else {
+        // P's edit is not yet covered by L's snapshot_clock: kept.
+        expect(after).toEqual({ title: "W-AFTER edited on P", description: "" });
+        expect(tombstonesFor(P, id)).toBe(0);
+      }
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // TD-045 (iii) / TD-052: the TR-7 boundary. The same snapshot_clock
+  // over-claim, from a sender whose applied_upto[W] lags BELOW the cutoff:
+  // does it delete W's AT-OR-BELOW-cutoff events on a receiver that holds
+  // them? (Legitimate history: DC-27 §4.4 KEPT, TR-7.)
+  // -------------------------------------------------------------------------
+
+  type LagSender = "no cutoff" | "same cutoff" | "lower cutoff" | "control";
+
+  /**
+   * W writes W-1 (seqs up to k1), S applies W through k1, then W writes W-2
+   * (seq k2). L, P and X apply W through k2. P creates P-CITES-W, whose
+   * causality clock cites W:k2. L unpairs W: cutoff C = k2, so W-2 is
+   * at-or-below-cutoff history. X holds no record (receiver without a cutoff).
+   * S then lags on W (applied_upto[W] = k1 < k2) while its device_clock[W]
+   * reaches k2 through P's records:
+   *   "no cutoff"    S holds no record; its pull from P ended after P's
+   *                  records (an interrupted session), before W's k1+1..k2.
+   *   "same cutoff"  as "no cutoff", and S then accepts L's record (C = k2).
+   *   "lower cutoff" S unpaired W itself after applying W through k1 (its own
+   *                  record, cutoff k1 < C), then synced with P in a real
+   *                  session: W above k1 is not applied (DC-05 Appendix A.2),
+   *                  P's records are. Steady state until S learns C.
+   *   "control"      S never receives P's records: snapshot_clock[W] = k1.
+   */
+  async function lagWorld(kind: LagSender) {
+    const L = makeDev("L");
+    const W = makeDev("W");
+    const P = makeDev("P");
+    const X = makeDev("X");
+    const S = makeDev("S");
+    pairAll(L, W, P, S);
+    addPeer(X, W);
+    addPeer(W, X);
+    await listen(L);
+    await listen(P);
+    await listen(X);
+    await listen(S);
+    const w = W.identity.deviceId;
+    addEvent(W, "W-1");
+    const k1 = maxSeq(W, w);
+    await dial(W, S); // S holds W through k1
+    addEvent(W, "W-2");
+    const k2 = maxSeq(W, w);
+    await dial(W, L);
+    await dial(W, P);
+    await dial(W, X);
+    addEvent(P, "P-CITES-W");
+    if (kind === "lower cutoff") {
+      await S.mgr.unpairDevice(w, true);
+      expect(storedRecord(S).record.revoked_after_seq).toBe(k1);
+    }
+    await L.mgr.unpairDevice(w, true);
+    const cutoff = storedRecord(L).record.revoked_after_seq!;
+    expect(cutoff).toBe(k2);
+    if (kind === "no cutoff" || kind === "same cutoff") {
+      // Interrupted pull from P: P's records arrived, W's k1+1..k2 did not.
+      expect(deliver(S, changeRecords(P, P.identity.deviceId)).every((o) => o === "applied")).toBe(true);
+    }
+    if (kind === "same cutoff") {
+      const rec = storedRecord(L);
+      const ch = makeDbRevocationChannel(S.core.db, {
+        selfDeviceId: S.identity.deviceId,
+        selfPublicKey: S.identity.publicKey,
+        hlcNow: () => S.core.hlcNow(),
+        log: () => {},
+      });
+      expect(await ch.acceptInbound({ record: rec.record, signature: rec.signature }, L.identity.deviceId)).toBe(true);
+    }
+    if (kind === "lower cutoff") {
+      await dial(S, P); // real session; P holds no record of L's
+      expect(titles(S)).toContain("P-CITES-W");
+    }
+    const w2 = (L.core.db.prepare("SELECT event_id AS id FROM events WHERE title='W-2'").get() as { id: string }).id;
+    const snap = snapshotOf(S);
+    // Preconditions: S lags on W below the cutoff, does not hold W-2, and is
+    // clean (declared[W] <= C), so a cutoff holder accepts its snapshot.
+    expect(appliedThrough(S, w)).toBe(k1);
+    expect(k1).toBeLessThan(k2);
+    expect(titles(S)).not.toContain("W-2");
+    expect(snap.entities.some((e) => e.entity_id === w2)).toBe(false);
+    expect(snap.applied_upto![w]).toBe(k1);
+    if (kind === "control") expect(snap.snapshot_clock[w]).toBe(k1);
+    else expect(snap.snapshot_clock[w]!).toBeGreaterThanOrEqual(k2);
+    return { L, W, P, X, S, w, k1, k2, cutoff, w2, snap };
+  }
+
+  function applyLagSnapshot(tag: string, recv: Dev, world: Awaited<ReturnType<typeof lagWorld>>) {
+    const { L, W, P, X, S, w, k1, k2, cutoff, w2, snap } = world;
+    const devs = [L, W, P, X, S];
+    const before = versionOf(recv, w2);
+    const r = applySnapshot(recv.core.db, snap, loadKnowledgeFromDb(recv.core.db));
+    console.error(
+      `[td045-iii ${tag}] k1=${k1} k2(W-2)=${k2} cutoff=${cutoff} receiver=${recv.label} receiver.cutoff=${revokedCutoffsOf(recv, w)} ` +
+        `S.applied_upto[W]=${appliedThrough(S, w)} S.declared[W]=${snap.applied_upto![w]} S.snapshot_clock=${named(snap.snapshot_clock, devs)} ` +
+        `receiver.version(W-2)=${named(before, devs)} declined=${r.declined} absenceTombstones=${r.absenceTombstones} ` +
+        `receiver titles after=${JSON.stringify(titles(recv))} tombstones(W-2)=${tombstonesFor(recv, w2)}`,
+    );
+    expect(r.declined).toBe(false);
+    return r;
+  }
+
+  const revokedCutoffsOf = (d: Dev, producer: string): number | "none" =>
+    (d.core.db.prepare("SELECT MAX(revoked_after_seq) AS c FROM revocation_records WHERE revoked_device_id=?").get(producer) as { c: number | null }).c ?? "none";
+
+  test("TD-045 (iii) control: a lagging sender whose snapshot_clock[W] stays below W-2's seq leaves W-2 on both receivers", { timeout: 60_000 }, async () => {
+    const world = await lagWorld("control");
+    for (const recv of [world.L, world.X]) {
+      applyLagSnapshot("control", recv, world);
+      expect(titles(recv)).toContain("W-2");
+    }
+  });
+
+  // TD-052 OPEN (PROVEN data loss): these are `test.fails` on purpose. Each
+  // asserts the REQUIRED outcome (TR-7, DC-27 §4.4: W-2 stays) and fails on
+  // that last line only: every precondition in lagWorld() and the
+  // `declined === false` check pass, and the absence rule (DC-09 §5.2)
+  // tombstones W-2 because the sender's snapshot_clock[W] (device_clock,
+  // causal context from P's records) covers W-2's version although the sender
+  // never applied it. Turn them into plain tests when TD-052 is fixed.
+  for (const kind of ["no cutoff", "same cutoff", "lower cutoff"] as const) {
+    for (const recvName of ["L", "X"] as const) {
+      const recvDesc = recvName === "L" ? "a receiver holding the cutoff" : "a receiver holding no cutoff";
+      test.fails(`TD-045 (iii) KNOWN DATA LOSS (TD-052): sender with ${kind}, lagging below the cutoff: ${recvDesc} should keep W's at-or-below-cutoff event W-2`, { timeout: 60_000 }, async () => {
+        const world = await lagWorld(kind);
+        const recv = recvName === "L" ? world.L : world.X;
+        applyLagSnapshot(`${kind} -> ${recvName}`, recv, world);
+        // TR-7 / DC-27 §4.4: legitimate history stays.
+        expect(titles(recv)).toContain("W-2");
+      });
+    }
+  }
+
+  // TD-052 OPEN: same as above, through L's session engine. S relays its own
+  // record (cutoff k1) first, so L holds both records (highest C = k2).
+  test.fails("TD-045 (iii) KNOWN DATA LOSS (TD-052) engine: a lower-cutoff sender's FULL_STATE_SNAPSHOT in a session with L should leave W-2 on L", { timeout: 60_000 }, async () => {
+    const world = await lagWorld("lower cutoff");
+    const { L, S, w, k2, w2, snap } = world;
+    const t = scriptedTransport();
+    const run = lEngine(L, S).runSession(t.transport);
+    t.push({ v: 1, type: "HELLO", device_clock: {} });
+    t.push(recordMessage(S));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    t.push({ v: 1, type: "FULL_STATE_SNAPSHOT", snapshot_clock: snap.snapshot_clock, applied_upto: snap.applied_upto, entities: snap.entities, tombstones: snap.tombstones, final: true } as any);
+    t.push({ v: 1, type: "CHANGES_ACK", applied_upto: {} });
+    t.push(null);
+    const stats = await run;
+    console.error(
+      `[td045-iii engine] L cutoff=${revokedCutoffsOf(L, w)} records on L=${count(L, "SELECT COUNT(*) AS n FROM revocation_records")} ` +
+        `snapshotsDeclined=${stats.snapshotsDeclined ?? 0} L titles after=${JSON.stringify(titles(L))} tombstones(W-2)=${tombstonesFor(L, w2)}`,
+    );
+    expect(revokedCutoffsOf(L, w)).toBe(k2);
+    expect(count(L, "SELECT COUNT(*) AS n FROM revocation_records")).toBe(2);
+    expect(stats.snapshotsDeclined ?? 0).toBe(0);
+    expect(titles(L)).toContain("W-2");
+  });
 });

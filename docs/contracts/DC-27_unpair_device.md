@@ -7,6 +7,8 @@ AMENDED by project owner (2026-11-14). See Appendix A; supersedes
 AMENDED by project owner (2026-11-14). See Appendix B (option a):
         full-state snapshots and the history cutoff; amends DC-08 §3.6
         (Appendix B) and DC-09 §5 (Appendix A).
+PROPOSED (not approved): Appendix B.7 (TD-045, TD-052); §4.4 is
+        unchanged until it is decided.
 Depends on: Architecture Spec v0.3 §17, §18, §19, §25; DC-05 §2.2, §3.3,
             §7.1-§7.3; DC-06 §2.6; DC-07 T5/T6; DC-08 §2.2, §3.7, TR-7;
             DC-10 §2.1-§2.5, §3, E1-E3; DC-13 (Sync now fan-out);
@@ -244,6 +246,8 @@ conflicts_ui.ts); code is cited by function name, not line number.
          seq above the record's cutoff (§4.14): buffered, not yet
          applied, and not allowed to apply after revocation.
      NOT TOUCHED: anything on the removed device itself.
+     OPEN (Appendix B.7, PROPOSAL, not approved): a later full-state
+     apply can remove such state on a peer that applied it; see B.7.
 
 4.5  ENFORCEMENT ON EVERY SESSION PATH (DC-05 §3.3/§7.3, DC-08 §3.7;
      approved behavior, implementation missing per S4-S6)
@@ -861,7 +865,9 @@ B.3  OPTIONS
         No code. Leaves TR-8's intent open for the snapshot path.
 
 B.4  ITEMS COMMON TO a) TO c)
-     - §4.4 KEPT is not changed: nothing already applied is removed.
+     - §4.4 KEPT is not changed by these options: none of them
+       removes anything already applied. B.7 records a removal that
+       the DC-09 §5.2 absence rule makes on its own.
      - A declined user-requested resync (DC-09 Trigger B) shows no
        reason today; whether to show one is a separate UI decision.
      - Older builds: a missing declaration counts as tainted in a),
@@ -906,3 +912,37 @@ B.6  DECISION (owner, 2026-11-14): option a) is approved. B.1-B.3 stay
        is merged as before (it already carries causal context, B.1 e).
      - The optional sender restraint in a) ("may skip offering") is
        not used; the receiver rule alone is normative.
+
+B.7  ABOVE-CUTOFF STATE ON A PEER THAT APPLIED IT (TD-045)
+     Status: PROPOSAL (not approved). The behaviour below is
+     PROVEN; the rule sentence is NOT in force. It shares its cause
+     with TD-052 (the absence rule trusts a causal snapshot_clock),
+     and is decided together with TD-052.
+     A peer P that applied W's changes above C before it held the
+     record keeps them (§4.4). A peer L that never applied them can
+     still have snapshot_clock[W] above C, once it has applied a
+     change that cites W above C as causal context (B.1 e). A
+     full-state snapshot from L is accepted on P (L declares at most
+     C, DC-09 Appendix A.2), and the absence rule (DC-09 §5.2)
+     deletes P's copy of an entity that W created above C, because
+     L's snapshot_clock covers its version.
+     Proposed rule: such state may be removed by a later full-state
+     apply from a peer that never applied it. The permission covers state that
+     the removed device produced above the cutoff, and nothing else.
+     Mixed entities: W changed the entity above C, and a trusted peer
+     changed it later. Outcomes on P (PROVEN):
+       - Entity created at or below C: the clean sender holds a row,
+         so the absence rule does not apply to it. If the sender has
+         applied the trusted change, its row replaces P's: W's
+         above-cutoff fields are lost and the trusted change stays.
+         If it has not, P keeps its row unchanged.
+       - Entity created by W above C: the clean sender holds no row.
+         P keeps the entity while the sender has not applied the
+         trusted change. Once the sender has applied it (TR-8: the
+         change is applied without a row to update), the entity is
+         removed on P, the trusted change with it. The loss of the
+         trusted change is outside the permission above; it is
+         recorded as an open point of TD-045.
+     Evidence: tests/dc27_unpair.test.ts, "TD-045 (i)" (direct apply
+     and session engine) and the four "TD-045 (ii)" tests.
+     See also TD-052.
