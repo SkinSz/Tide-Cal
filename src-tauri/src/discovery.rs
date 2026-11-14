@@ -124,47 +124,24 @@ mod real {
             Ok(())
         }
 
-        /// DC-11 §7 browse() -> events: browse until deadline, delivering each
-        /// discovered/updated record to `on_service`. Results are UNTRUSTED
-        /// hints (DC-11 §4.1); classification happens in the caller.
-        pub fn browse(
-            &self,
-            timeout: Duration,
-            mut on_service: impl FnMut(DiscoveredService),
-        ) -> Result<usize, String> {
+        /// DC-11 §7 browse() -> events: start ONE long-lived browse. The
+        /// returned receiver yields events until the browse ends; the daemon
+        /// keeps querying on the standard RFC 6762 schedule (1 s doubling up
+        /// to 1 h) and refreshes cached records itself, so the caller must
+        /// NOT restart the browse periodically (that reset the query backoff
+        /// every cycle and re-sent a burst of queries, DC-11 §3.3). Results
+        /// are UNTRUSTED hints (DC-11 §4.1); classification is the caller's.
+        pub fn start_browse(&self) -> Result<BrowseReceiver, String> {
             let receiver = self
                 .daemon
                 .browse(TIDE_SERVICE_TYPE)
                 .map_err(|e| format!("browse: {e}"))?;
-            let deadline = std::time::Instant::now() + timeout;
-            let mut count = 0usize;
-            while let Ok(event) = receiver.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
-                match event {
-                    ServiceEvent::ServiceResolved(info) => {
-                        let mut txt = HashMap::new();
-                        for prop in info.get_properties().iter() {
-                            let val = prop
-                                .val()
-                                .map(|v| String::from_utf8_lossy(v).into_owned())
-                                .unwrap_or_default();
-                            txt.insert(prop.key().to_string(), val);
-                        }
-                        on_service(DiscoveredService {
-                            instance_name: info.get_fullname().to_string(),
-                            addresses: info.get_addresses().iter().map(|a| a.to_string()).collect(),
-                            port: info.get_port(),
-                            txt,
-                        });
-                        count += 1;
-                    }
-                    _ => { /* SearchStarted/Received etc. — hint lifecycle noise */ }
-                }
-                if std::time::Instant::now() >= deadline {
-                    break;
-                }
-            }
+            Ok(BrowseReceiver { receiver })
+        }
+
+        /// End the browse started by `start_browse` (best effort).
+        pub fn stop_browse(&self) {
             let _ = self.daemon.stop_browse(TIDE_SERVICE_TYPE);
-            Ok(count)
         }
 
         /// DC-11 §7 withdraw(): explicit unregistration (TR-4 disablement silence).
@@ -175,6 +152,58 @@ mod real {
                     .map_err(|e| format!("unregister: {e}"))?;
             }
             Ok(())
+        }
+    }
+
+    /// Receiving end of one long-lived browse (see `TideMdns::start_browse`).
+    pub struct BrowseReceiver {
+        receiver: mdns_sd::Receiver<ServiceEvent>,
+    }
+
+    /// One poll of a long-lived browse.
+    #[derive(Debug, Clone)]
+    pub enum BrowsePoll {
+        /// A service resolved or changed (full current view of it).
+        Resolved(DiscoveredService),
+        /// The daemon dropped this instance (goodbye, or its records
+        /// expired). Carries the same full name `Resolved` reports.
+        Removed(String),
+        /// Nothing relevant within the wait (timeout or lifecycle noise).
+        Idle,
+        /// The browse is over (daemon gone or search stopped); restart it.
+        Ended(String),
+    }
+
+    impl BrowseReceiver {
+        /// Wait up to `timeout` for the next browse event.
+        pub fn poll(&self, timeout: Duration) -> BrowsePoll {
+            match self.receiver.recv_timeout(timeout) {
+                Ok(ServiceEvent::ServiceResolved(info)) => {
+                    let mut txt = HashMap::new();
+                    for prop in info.get_properties().iter() {
+                        let val = prop
+                            .val()
+                            .map(|v| String::from_utf8_lossy(v).into_owned())
+                            .unwrap_or_default();
+                        txt.insert(prop.key().to_string(), val);
+                    }
+                    BrowsePoll::Resolved(DiscoveredService {
+                        instance_name: info.get_fullname().to_string(),
+                        addresses: info.get_addresses().iter().map(|a| a.to_string()).collect(),
+                        port: info.get_port(),
+                        txt,
+                    })
+                }
+                Ok(ServiceEvent::ServiceRemoved(_ty, fullname)) => BrowsePoll::Removed(fullname),
+                Ok(ServiceEvent::SearchStopped(ty)) => {
+                    BrowsePoll::Ended(format!("search stopped for {ty}"))
+                }
+                Ok(_) => BrowsePoll::Idle, // SearchStarted/ServiceFound: lifecycle noise
+                Err(mdns_sd::RecvTimeoutError::Timeout) => BrowsePoll::Idle,
+                Err(mdns_sd::RecvTimeoutError::Disconnected) => {
+                    BrowsePoll::Ended("mdns daemon channel closed".to_string())
+                }
+            }
         }
     }
 
@@ -195,7 +224,7 @@ mod real {
 
 #[cfg(feature = "mdns")]
 #[allow(unused_imports)]
-pub use real::{DiscoveredService, TideMdns, TIDE_SERVICE_TYPE};
+pub use real::{BrowsePoll, BrowseReceiver, DiscoveredService, TideMdns, TIDE_SERVICE_TYPE};
 
 // ---------------------------------------------------------------------------
 // Honest fallback (feature NOT enabled): explicit inert implementation.
@@ -265,6 +294,59 @@ mod tests {
         assert!(super::validate_host_label("tide.local").is_ok());
         assert!(super::validate_host_label(".").is_err());
         assert!(super::validate_host_label("a..local.").is_err());
+    }
+
+    /// TD-035 runtime probe (manual, needs working local multicast; ~140 s):
+    /// a long-lived browse must keep a present service (no Removed while
+    /// the daemon refreshes its records past the 120 s TTL) and must report
+    /// Removed under the SAME name after withdraw().
+    /// Run: cargo test --lib persistent_browse_runtime_probe -- --ignored --nocapture
+    #[cfg(feature = "mdns")]
+    #[test]
+    #[ignore]
+    fn persistent_browse_runtime_probe() {
+        use super::real::{BrowsePoll, TideMdns};
+        use std::time::{Duration, Instant};
+        let mut txt = std::collections::HashMap::new();
+        txt.insert("pv".to_string(), "1".to_string());
+        let announcer = TideMdns::new().expect("daemon A");
+        let instance = format!("probe{:08x}-0001", std::process::id());
+        announcer
+            .register(&instance, 47999, &txt, &super::host_label_for(&instance))
+            .expect("register");
+        let browser = TideMdns::new().expect("daemon B");
+        let rx = browser.start_browse().expect("browse");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let name = loop {
+            assert!(Instant::now() < deadline, "service never resolved (multicast unavailable?)");
+            if let BrowsePoll::Resolved(s) = rx.poll(Duration::from_secs(1)) {
+                if s.instance_name.starts_with(&instance) {
+                    break s.instance_name;
+                }
+            }
+        };
+        eprintln!("resolved {name}");
+        let hold_until = Instant::now() + Duration::from_secs(135);
+        while Instant::now() < hold_until {
+            match rx.poll(Duration::from_secs(1)) {
+                BrowsePoll::Removed(n) if n == name => panic!("removed while still announced"),
+                BrowsePoll::Ended(r) => panic!("browse ended: {r}"),
+                _ => {}
+            }
+        }
+        eprintln!("still present after 135 s");
+        announcer.withdraw().expect("withdraw");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            assert!(Instant::now() < deadline, "no Removed after withdraw");
+            if let BrowsePoll::Removed(n) = rx.poll(Duration::from_secs(1)) {
+                if n == name {
+                    eprintln!("removed under the same name: {n}");
+                    break;
+                }
+            }
+        }
+        browser.stop_browse();
     }
 
     #[cfg(feature = "mdns")]

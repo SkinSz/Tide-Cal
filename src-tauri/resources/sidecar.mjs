@@ -7081,44 +7081,17 @@ function freshBook() {
     events: []
   };
 }
+var monotonicWallClock = () => performance.timeOrigin + performance.now();
 var PeerMisbehaviorTracker = class {
-  constructor(cfg = DEFAULT_MISBEHAVIOR_CONFIG, clock = Date.now, onHardBlock) {
+  constructor(cfg = DEFAULT_MISBEHAVIOR_CONFIG, now = monotonicWallClock, onHardBlock) {
     this.cfg = cfg;
-    this.clock = clock;
+    this.now = now;
     this.onHardBlock = onHardBlock;
   }
   cfg;
-  clock;
+  now;
   onHardBlock;
   books = /* @__PURE__ */ new Map();
-  /** Highest clock reading seen so far (backward-step detection, TD-007). */
-  lastNow = Number.NEGATIVE_INFINITY;
-  /**
-   * TD-007 (2): clock read with a backward-jump guard. All windows here are
-   * wall-clock based. If the system clock steps BACKWARD by J ms, every
-   * stored timestamp suddenly lies J ms in the "future": window events would
-   * stay counted, a throttle backoff would last, and the Level-4
-   * recommendation would be delayed, each by up to J extra ms. On a backward
-   * step we therefore shift every stored timestamp back by J, which keeps
-   * each one's AGE exactly what it was. Nothing is forgotten or shortened, so
-   * the tracker still fails closed (a throttled peer stays throttled for the
-   * rest of its backoff); it just no longer gets J ms of extra penalty.
-   * Forward steps need no repair: they can only age entries faster, which
-   * is the same as that much real time passing.
-   */
-  now() {
-    const t = this.clock();
-    if (t < this.lastNow) {
-      const jump = this.lastNow - t;
-      for (const b of this.books.values()) {
-        for (const e of b.events) e.t -= jump;
-        if (b.levelSinceMs !== 0) b.levelSinceMs -= jump;
-        if (b.backoffUntilMs !== 0) b.backoffUntilMs -= jump;
-      }
-    }
-    this.lastNow = t;
-    return t;
-  }
   // ------------------------------------------------------------------
   // Intake gate (called by sync_engine BEFORE validation/parsing)
   // ------------------------------------------------------------------
@@ -7703,7 +7676,7 @@ function createSyncEngine(deps) {
   const idleTimeoutMs = deps.idleTimeoutMs ?? SYNC_IDLE_TIMEOUT_MS;
   const triggers = deps.triggers ?? new TriggerStateTracker();
   let sessionDedup = new OfferDedup();
-  const misbehavior = deps.misbehavior ?? new PeerMisbehaviorTracker(DEFAULT_MISBEHAVIOR_CONFIG, Date.now);
+  const misbehavior = deps.misbehavior ?? new PeerMisbehaviorTracker(DEFAULT_MISBEHAVIOR_CONFIG, monotonicWallClock);
   misbehavior.onHardBlock = (p) => hardBlockProducer(deps.db, p);
   const isHardBlocked = makeHardBlockCheck(deps.db);
   gcZombiePending();
@@ -8764,7 +8737,8 @@ var SchedulerRuntime = class {
   // ------------------------------------------------------------------
   async attempt(peer, manual) {
     if (peer.endpoint === null) {
-      this.log(`peer ${peer.deviceId}: no endpoint known (DC-11 wiring pending) \u2014 skipped`);
+      this.log(`peer ${peer.deviceId}: no endpoint known \u2014 skipped`);
+      this.deps.onPeerUnreachable?.();
       return;
     }
     const ok = this.scheduler.tryBeginSession(peer.deviceId, {
@@ -8791,6 +8765,7 @@ var SchedulerRuntime = class {
     } finally {
       this.scheduler.endSession(peer.deviceId, success);
       this.deps.onSessionEnd?.(peer.deviceId, success);
+      if (!success) this.deps.onPeerUnreachable?.();
     }
     this.log(
       `peer ${peer.deviceId}: session ${success ? "succeeded" : "failed"}` + (success ? "" : " \u2014 exponential backoff armed (DC-13 \xA76.1)")
@@ -9314,16 +9289,6 @@ var ConflictsViewModel = class {
     return rows.map((r) => ({ ...r }));
   }
   // ------------------------------------------------------------------
-  // Presentation accessor: entity display title for list rows.
-  // ------------------------------------------------------------------
-  /** Display title of an affected event entity, or null when unknown. */
-  entityTitle(entityId) {
-    const row = this.db.prepare(
-      "SELECT title FROM events WHERE event_id = ?"
-    ).get(entityId);
-    return row?.title ?? null;
-  }
-  // ------------------------------------------------------------------
   // Detail view (§3.2) — pure read, no detection run, no mutation
   // ------------------------------------------------------------------
   getDetail(conflictId) {
@@ -9339,7 +9304,9 @@ var ConflictsViewModel = class {
         "SELECT operation FROM changes WHERE change_id = ?"
       ).get(p.change_id);
       const eff = change !== void 0 ? effectiveOf({ operation: change.operation, payload: p.payload }) : { deleted: false, value: parseJson(p.payload) };
-      if (p.device_id === this.selfDeviceId) localChangeId = p.change_id;
+      if (p.device_id === this.selfDeviceId && localChangeId === null) {
+        localChangeId = p.change_id;
+      }
       candidates.push({
         change_id: p.change_id,
         device_id: p.device_id,
@@ -9682,6 +9649,9 @@ function msFromWallId(id) {
   const ss = +digits.slice(12, 14) || 0;
   return new Date(y, mo - 1, dd, hh, mi, ss, 0).getTime();
 }
+function discoveryKickNoticeLine() {
+  return JSON.stringify({ notice: "discovery_kick" });
+}
 function dataChangedNoticeLine(applied) {
   return JSON.stringify({ notice: "data_changed", source: "sync", applied });
 }
@@ -9870,29 +9840,37 @@ var SyncManager = class {
     const rows = this.core.db.prepare("SELECT device_id, public_key FROM peers WHERE status = 'trusted'").all();
     const remoteHex = remoteKeyBuf.toString("hex");
     for (const row of rows) {
-      const x255192 = Buffer.from(
-        ed25519ToX25519PublicKey(new Uint8Array(row.public_key))
-      );
+      let x255192;
+      try {
+        x255192 = Buffer.from(ed25519ToX25519PublicKey(new Uint8Array(row.public_key)));
+      } catch {
+        continue;
+      }
       if (x255192.toString("hex") === remoteHex) return row.device_id;
     }
     return void 0;
   }
   onInbound(session) {
     void this.runEngineSession(session).catch((err2) => {
+      const msg = err2 instanceof Error ? err2.message : String(err2);
+      const kind = msg.startsWith("unpaired peer refused") ? "refused" : "failed";
+      const t = this.inboundLogThrottle[kind];
       const now = Date.now();
-      if (now - this.lastInboundFailLog >= 6e4) {
-        const msg = err2 instanceof Error ? err2.message : String(err2);
-        const extra = this.suppressedInboundFails > 0 ? ` (+${this.suppressedInboundFails} more since last report)` : "";
-        console.error(`[tide] inbound sync session ended: ${msg.slice(0, 300)}${extra}`);
-        this.lastInboundFailLog = now;
-        this.suppressedInboundFails = 0;
+      if (now - t.last >= 6e4) {
+        const extra = t.suppressed > 0 ? ` (+${t.suppressed} more since last report)` : "";
+        const clean2 = msg.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 300);
+        console.error(`[tide] inbound sync session ${kind}: ${clean2}${extra}`);
+        t.last = now;
+        t.suppressed = 0;
       } else {
-        this.suppressedInboundFails++;
+        t.suppressed++;
       }
     });
   }
-  lastInboundFailLog = 0;
-  suppressedInboundFails = 0;
+  inboundLogThrottle = {
+    refused: { last: 0, suppressed: 0 },
+    failed: { last: 0, suppressed: 0 }
+  };
   // ------------------------------------------------------------------
   // TD-006 / DC-16 §4: peer-state visibility + explicit recovery actions
   // ------------------------------------------------------------------
@@ -10678,6 +10656,9 @@ function main() {
   void reminderTimer;
   const schedulerRuntime = startSchedulerRuntime({
     now: () => Date.now(),
+    onPeerUnreachable: () => {
+      process.stdout.write(discoveryKickNoticeLine() + "\n");
+    },
     listPeers: () => {
       const peers = listTrustedPeers(core.db);
       const byDevice = new Map(peers.map((p) => [p.device_id, p]));
@@ -10724,6 +10705,7 @@ export {
   SYNC_CONNECT_TIMEOUT_MS,
   SyncManager,
   dataChangedNoticeLine,
+  discoveryKickNoticeLine,
   handleLine,
   makeDispatcher,
   makeSyncDispatcher,

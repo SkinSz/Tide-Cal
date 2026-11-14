@@ -1061,6 +1061,15 @@ export function listQuarantine(
  * the restart-time revalidation pass (revalidateQuarantine) is the primary
  * integration point (see reconcileQuarantineResolutions below).
  */
+/**
+ * TD-007 (3), documented mismatch: despite its name, `resolved_at_hlc` stores
+ * WALL-CLOCK epoch milliseconds (`Date.now()`), not an HLC timestamp. The
+ * same holds for `quarantine.received_at_hlc` (see quarantineRecord). Both
+ * values are informational (shown to the user, NULL-ness is the lifecycle
+ * flag); nothing compares them with HLC values, and retention pruning orders
+ * by quarantine_id, not by these timestamps. The column is deliberately NOT
+ * renamed: a rename needs a schema migration for a purely cosmetic gain.
+ */
 export function markQuarantineResolved(
   db: Database.Database,
   quarantineId: number,
@@ -1322,14 +1331,29 @@ export interface HardBlockRow {
   trigger_count: number;
 }
 
+const HARD_BLOCK_LOOKUP_SQL =
+  "SELECT 1 FROM hard_blocks WHERE producer_device_id = ?";
+
 /** Is this producer currently hard-blocked (durable, NOT self-clearing)? */
 export function isHardBlocked(
   db: Database.Database,
   producerDeviceId: string,
 ): boolean {
-  return !!db
-    .prepare("SELECT 1 FROM hard_blocks WHERE producer_device_id = ?")
-    .get(producerDeviceId);
+  return !!db.prepare(HARD_BLOCK_LOOKUP_SQL).get(producerDeviceId);
+}
+
+/**
+ * TD-007 (1): same lookup as {@link isHardBlocked}, with the statement
+ * prepared ONCE. The sync engine's intake gate runs this for every arriving
+ * record, so it keeps one checker per engine instead of re-preparing the SQL
+ * per record. The query still runs against the durable table on every call,
+ * so a block or an unblock is seen by the very next record.
+ */
+export function makeHardBlockCheck(
+  db: Database.Database,
+): (producerDeviceId: string) => boolean {
+  const stmt = db.prepare(HARD_BLOCK_LOOKUP_SQL);
+  return (producerDeviceId) => !!stmt.get(producerDeviceId);
 }
 
 /**

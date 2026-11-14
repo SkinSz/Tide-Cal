@@ -110,7 +110,7 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 - **ID:** TD-007
 - **Title:** Minor findings from combined independent verification (verdict: SAFE TO COMMIT)
 - **Priority:** 2/10 — LOW (hygiene)
-- **Status:** OPEN
+- **Status:** RESOLVED (2026-11-14): (1) the hard-block lookup is prepared once per engine (`makeHardBlockCheck`); (2) the misbehavior tracker measures every window/backoff/level age on the monotonic clock (`monotonicWallClock` = performance.timeOrigin + performance.now), so wall-clock steps in either direction neither extend nor shorten a penalty (an earlier rebase approach was rejected by blind review: a back-then-forward trip could end a throttle early); (3) `resolved_at_hlc` (and `received_at_hlc`) holding wall-clock ms is documented at `markQuarantineResolved`, deliberately without a migration; (4) the single `onHardBlock` slot ("last engine wins", never share a tracker across databases) is documented at the hook. Regression: `tests/td007_td019_hygiene.test.ts`.
 - **Findings (file:line per verifier):**
   1. `src/sync/sync_engine.ts` applyBatch: `isHardBlocked()` calls `db.prepare()` per record on every arrival — hoist to a per-engine prepared statement.
   2. `src/sync/misbehavior.ts`: Date.now-based windows lack monotonicity guards — a backward system-clock jump can extend a peer's throttle/suspend retention up to the jump magnitude (fails closed, self-heals). Consider monotonic guard or clamping.
@@ -193,7 +193,7 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 - **ID:** TD-013
 - **Title:** Three-device harness scenarios occasionally fail with EADDRINUSE on a port that nothing holds afterwards
 - **Priority:** 4/10 — MEDIUM (test-infrastructure flake, not protocol)
-- **Status:** OPEN (created 2026-09-01; observed twice independently)
+- **Status:** RESOLVED (2026-11-14): the default port band moved from 41900 (inside the Linux ephemeral range 32768-60999, so outbound or TIME_WAIT sockets could hold a band port; cause INFERRED, not reproduced) to 31900, below every common ephemeral range; the harness refuses a band that overlaps this host's range; `waitHealthy` now proves the listener with a real TCP connect (the echoed `listening_port` proved nothing) inside its existing bounded window, logging every failed attempt and any sidecar bind-failure line.
 - **Evidence:** During the c088023 verification run, harness scenario 2 failed once with EADDRINUSE on 41910 (sidecar sync listener could not bind; nothing held the port afterwards; scenario passed on rerun). A second occurrence observed in the independent-review re-run. Pattern: TIME_WAIT or interface-timing race between scenario teardown and next-scenario bind.
 - **Fix direction:** deterministic per-run port bases in RunContext, or a bounded bind-retry with explicit logging in the harness (never retry-until-green — outside the harness itself).
 - **Trigger:** Before the harness becomes the standing release gate for future sync work (it now is), make it deterministic.
@@ -253,7 +253,7 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 - **ID:** TD-019
 - **Title:** engine-level message stash leaks across sessions (F3); FrameQueue single-waiter slot + immortal outbound pump (F4); ACK sends possibly-stale applied_upto (F5)
 - **Priority:** 3/10 — LOW (all bounded; no data-loss attack found in review)
-- **Status:** OPEN (created 2026-09-01, independent adversarial review F3/F4/F5 (sync))
+- **Status:** PARTIAL (2026-11-14). F3 DONE: already fixed by the session-start stash reset (DC-08 Appendix A.3); regression test added. F5 DONE (documented, no code change): the ACK reads the durable frontier at send time; lagging barrier-phase applications is the accepted DC-08 A.2.4 trade and only under-reports. F4 OPEN, deliberately not changed: FrameQueue's single waiter slot is load-bearing, because the engine builds a new receive cache per protocol phase (`nextMessage(transport)` at each phase) and can leave an abandoned pending receive; FIFO waiters would hand the next frame to it and lose it (semantics pinned by a test, documented in `noise_transport.ts`). The parked outbound pump is believed to be reclaimed with its session handle (INFERRED, not measured). What is left: make the engine use ONE receive cache per session first; only then are FIFO waiters or ending the pump safe.
 - **Details:** stash is pre-existing, not introduced by c088023; pump leak is one closure per session; stale-ACK frontier is safe under max-merge. Fix opportunistically in the next sync package (TD-017/018 wave).
 - **Trigger:** with TD-017/TD-018.
 
@@ -449,8 +449,34 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 - **Priority:** 4/10 — MEDIUM
 - **Status:** MITIGATED (2026-11-14, owner: "whatever is easier for now"): main window minimum size = the 800×600 default (`tauri.conf.json` minWidth/minHeight), the size the layout is known to work at. A responsive layout remains possible later.
 
+## TD-034 — Sidecar stderr piped but never read
+- **ID:** TD-034
+- **Title:** The shell piped the sidecar's stderr without reading it: a full pipe could block the sidecar, and its error output never reached the log
+- **Priority:** 5/10 — MEDIUM (hang risk; hidden diagnostics)
+- **Status:** RESOLVED (commit e6e5495): `src-tauri/src/sidecar.rs` drains stderr on its own thread into the app log (target `sidecar`), lines capped at 2,048 bytes (rest counted, not kept); the log file is size-capped with numbered archives (`logfile.rs`). Regression: `sidecar::tests::stderr_flood_does_not_block_the_sidecar`.
+
+## TD-035 — mDNS browse restarted every 25 s
+- **ID:** TD-035
+- **Title:** The browse loop started a new mDNS browse every 25 s, resetting the query backoff and re-sending a burst of queries each cycle
+- **Priority:** 3/10 — LOW (network chatter against DC-11 §3.3 rate rules)
+- **Status:** RESOLVED (2026-11-14): one long-lived browse (`discovery.rs` `start_browse`), restarted only when it ends or fails to start (5 s backoff). The loop keeps the live view itself (resolved adds or updates, removed deletes) and re-pushes it every 25 s, so sidecar cache entries (120 s TTL) stay fresh exactly as the per-cycle re-browse used to do. Regression: `mdns_service::browse_loop_tests` (fake browse source); runtime probe `discovery::tests::persistent_browse_runtime_probe` (`--ignored`, two real daemons: present past the 120 s TTL, removed under the same name after withdraw). Owner decision 2026-11-14 (DC-11 Appendix A): plus an on-demand query round on Sync now and when a scheduled sync cannot reach a paired peer (sidecar `discovery_kick` notice), at most one per 60 s, and removals are forwarded to the sidecar. Runtime verification on the real Linux/Windows pair (TR-A5) is owed by the owner smoke test; until then verified on one host only.
+
 ## TD-036 — Sync sessions accepted any handshake key, not only paired devices
 - **ID:** TD-036
 - **Title:** Inbound sessions (and Sync now to a typed address) ran the sync engine for ANY Noise key; a never-paired device on the network could read the whole calendar and inject changes
 - **Priority:** 10/10 — CRITICAL (confidentiality + integrity; found 2026-11-14 while drafting DC-27)
 - **Status:** RESOLVED (2026-11-14): `SyncManager.runEngineSession` refuses, before any record is served or applied, a session whose remote static key matches no `status='trusted'` peer; refusals logged with a per-kind 1/min throttle. PROVEN by `tests/inbound_trust_gate.test.ts` (fails 2/3 without the fix, passes with it). Blind review: SAFE WITH CONCERNS (minors applied). Still owned by DC-27: nothing writes `peers.status='revoked'` yet, and the gate does not yet use `canSynchronize` / the device_id = hash(key) check.
+
+## TD-037 — Conflict resolution always writes entity_type "event" / operation "set"
+- **ID:** TD-037
+- **Title:** `ConflictsViewModel.resolve` (src/application/conflicts_ui.ts) writes the winning value as an event "set" for every field kind; for reminders `effectiveOf(member_update)` may produce `{value:{value:…}}`, and overrides / `*` removals also get entity_type "event"
+- **Priority:** 5/10 — MEDIUM (data shape after resolving a non-event conflict; HYPOTHESIS, not reproduced)
+- **Status:** OPEN (blind review of DC-14 Appendix A, 2026-11-14)
+- **Verify:** create a reminder conflict between two devices, resolve it, inspect the reminder row and the emitted change record.
+
+## TD-038 — mDNS snapshot seeding is never populated
+- **ID:** TD-038
+- **Title:** DC-21 §3.2(b) snapshot replay after a sidecar restart sends nothing: `SidecarEventSink::record_observation` is a no-op and `BrowseService::record` has no caller, so `push_snapshot` always pushes an empty list
+- **Priority:** 2/10 — LOW (latent: the sidecar is spawned once per app run and the shell has no sidecar-restart path today, so nothing currently depends on the snapshot)
+- **Status:** OPEN (pre-existing; found by the DC-11 Appendix A blind review, 2026-11-14)
+- **Note when fixing:** the snapshot must not store "removed" events, because `applySnapshot` (endpoint_bridge.ts) forces kind "added" and would resurrect a removed peer.

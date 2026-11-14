@@ -19,7 +19,7 @@ import {
   quarantineRecord,
   markSeqSkipped,
   isSeqSkipped,
-  isHardBlocked,
+  makeHardBlockCheck,
   hardBlockProducer,
   appendInvalidTally,
   reconcileQuarantineResolutions,
@@ -31,6 +31,7 @@ import {
 // ladder + Tier-2 durable hard block via hardBlockProducer).
 import {
   PeerMisbehaviorTracker,
+  monotonicWallClock,
   DEFAULT_MISBEHAVIOR_CONFIG,
 } from "./misbehavior.ts";
 import type { Database } from "better-sqlite3";
@@ -330,10 +331,20 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
   // instantly from any ladder level and survives restarts.
   const misbehavior =
     deps.misbehavior ??
-    new PeerMisbehaviorTracker(DEFAULT_MISBEHAVIOR_CONFIG, Date.now);
+    new PeerMisbehaviorTracker(DEFAULT_MISBEHAVIOR_CONFIG, monotonicWallClock);
   // The durable Tier-2 write ALWAYS goes through this engine's database,
   // including for an injected tracker (hook is attached, not replaced).
+  //
+  // TD-007 (4), documented constraint: the hook is a single slot, so every
+  // engine built on a SHARED tracker re-points it at its own database (last
+  // engine wins). The product builds one engine per session, all on the one
+  // sidecar database, so every assignment is equivalent. A tracker shared by
+  // engines on DIFFERENT databases would write hard blocks into whichever
+  // database bound last: never share one tracker across databases.
   misbehavior.onHardBlock = (p) => hardBlockProducer(deps.db, p);
+  // TD-007 (1): the intake gate runs per arriving record; prepare its
+  // durable hard-block lookup once per engine, not once per record.
+  const isHardBlocked = makeHardBlockCheck(deps.db);
   // Pkg6 (QA-1 F-6): drain zombie pending rows left by an aborted session
   // (frontier already past them) BEFORE the engine's knowledge is first used.
   gcZombiePending();
@@ -640,6 +651,16 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     // runs' lifetimes: a responder with nothing to pull can no longer tear
     // down the shared session inside the initiator's HELLO/pull setup
     // window, because it still owes the session its post-ACK serve phase.
+    //
+    // TD-019 F5, documented (no code change): applied_upto is read from the
+    // durable table at send time, so it is exact for everything applied so
+    // far. It CAN lag what this side applies later in the same session (the
+    // barrier serve phase below). That lag is the deliberate trade of DC-08
+    // Appendix A.2.4 (barrier-phase applications are acknowledged by the
+    // next session's ACK). It is safe: the frontier only ever under-reports
+    // committed state, never over-reports it, and the peer max-merges it
+    // (INVARIANT 14), so a lagging value can only delay compaction unlock,
+    // never cause data loss. A second ACK would break A.2.1 (one per session).
     const ack: SyncMessage = {
       v: 1,
       type: "CHANGES_ACK",
@@ -1193,7 +1214,7 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
       // cost; nothing is quarantined, skipped, or listed while blocked.
       // Requests FROM the peer are still answered (serveRequests is
       // untouched; this gate is receive-of-data only).
-      if (isHardBlocked(deps.db, producer)) continue;
+      if (isHardBlocked(producer)) continue;
 
       // --- TD-006 Tier 1 Level 2/3 (in-memory): throttle/suspend intake
       // drop. No quarantine rows, no skip entries, no per-packet UI

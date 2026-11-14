@@ -103,12 +103,29 @@ function freshBook(): PeerBook {
  * Tier-2 detection runs here but the durable row write goes through the
  * `onHardBlock` callback so this module stays storage-agnostic.
  */
+/**
+ * TD-007 (2): the tracker's clock. Every window, backoff and level age here
+ * is a DURATION, so it is measured with the monotonic clock
+ * (performance.now, which never steps when the system clock is changed),
+ * anchored once at process start so values still read as epoch ms for the
+ * Sync Errors display. A wall-clock step (NTP, dual-boot RTC mix-up, VM
+ * restore, user edit) therefore neither extends nor shortens any penalty;
+ * the displayed "since" times may drift from the wall clock by the size of
+ * such a step, which is cosmetic. On Linux the monotonic clock pauses
+ * during system suspend, so a penalty can last longer in wall-clock terms
+ * across a sleep (fails closed). (A previous attempt rebased stored times
+ * on backward steps; review showed a back-then-forward trip could end a
+ * throttle early, i.e. fail open.)
+ */
+export const monotonicWallClock = (): number =>
+  performance.timeOrigin + performance.now();
+
 export class PeerMisbehaviorTracker {
   private readonly books = new Map<string, PeerBook>();
 
   constructor(
     private readonly cfg: MisbehaviorConfig = DEFAULT_MISBEHAVIOR_CONFIG,
-    private readonly now: () => number = Date.now,
+    private readonly now: () => number = monotonicWallClock,
     /** Durable Tier-2 write hook (sync_engine wires this to hard_blocks). */
     public onHardBlock?: (producerDeviceId: string) => void,
   ) {}

@@ -73,6 +73,12 @@ export interface SchedulerRuntimeDeps {
   /** Session-lifecycle observation hooks (tray SYNCING state, logs). */
   onSessionStart?(deviceId: string): void;
   onSessionEnd?(deviceId: string, success: boolean): void;
+  /**
+   * DC-11 Appendix A.2: a paired peer could not be reached (no endpoint
+   * known, or the session failed). The sidecar turns this into a
+   * rate-limited mDNS re-query in the shell. Carries no device id outward.
+   */
+  onPeerUnreachable?(): void;
   log?(message: string): void;
 }
 
@@ -210,7 +216,8 @@ export class SchedulerRuntime {
 
   private async attempt(peer: RuntimePeer, manual: boolean): Promise<void> {
     if (peer.endpoint === null) {
-      this.log(`peer ${peer.deviceId}: no endpoint known (DC-11 wiring pending) — skipped`);
+      this.log(`peer ${peer.deviceId}: no endpoint known — skipped`);
+      this.deps.onPeerUnreachable?.();
       return;
     }
     const ok = this.scheduler.tryBeginSession(peer.deviceId, {
@@ -238,6 +245,7 @@ export class SchedulerRuntime {
     } finally {
       this.scheduler.endSession(peer.deviceId, success);
       this.deps.onSessionEnd?.(peer.deviceId, success);
+      if (!success) this.deps.onPeerUnreachable?.();
     }
     this.log(
       `peer ${peer.deviceId}: session ${success ? "succeeded" : "failed"}` +
@@ -271,6 +279,7 @@ export function startSchedulerRuntime(deps: {
   openSession(args: SessionOpenerArgs): Promise<boolean>;
   onSessionStart?(deviceId: string): void;
   onSessionEnd?(deviceId: string, success: boolean): void;
+  onPeerUnreachable?(): void;
   log?(message: string): void;
   settings?: Partial<SchedulerSettings>;
 }): SchedulerRuntimeHandle {

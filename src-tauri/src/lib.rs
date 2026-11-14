@@ -957,22 +957,122 @@ fn trigger_sync_now(app: &AppHandle) -> Result<serde_json::Value, String> {
         return start(false, "sync unavailable: Windows Firewall rules could not be established (see notice; Try again to re-attempt)");
     }
 
+    // DC-11 A.2 (owner 2026-11-14): pressing Sync now also asks the network
+    // again (rate-limited in BrowseService); the pass below retries unreached
+    // peers once after the query round had time to answer.
+    if let Some(svc) = app.try_state::<mdns_service::BrowseService>() {
+        svc.kick();
+    }
+
     // Bug #1b (owner decision B, 2026-11-13): resolve each paired peer's
     // endpoint through the sidecar's sync_endpoints op — the SAME live-mDNS /
-    // last-known chain the scheduler uses (DC-21 §4.3/D7). The previous
-    // behavior dialed TIDE_SYNC_PEER_HOST (default 127.0.0.1:47471), i.e.
-    // the local machine itself, so cross-device "Sync now" silently did
-    // nothing. Each resolved peer gets its own sync_now pass; peers with no
-    // resolvable endpoint are skipped with a log line (honest degradation,
-    // DC-21 §4.3 step 3).
-    let resolved: Result<Vec<(String, String, u16)>, String> =
-        proxy(&sc, "sync_endpoints", json!({}))
+    // last-known chain the scheduler uses (DC-21 §4.3/D7). Each resolved peer
+    // gets its own sync_now pass; peers with no resolvable endpoint are
+    // skipped with a log line (honest degradation, DC-21 §4.3 step 3).
+    //
+    // DC-11 A.2 (owner 2026-11-14, review MAJOR-2): the kick above cannot
+    // help a pass that resolves endpoints immediately, so a peer that was
+    // skipped or failed gets ONE more attempt after SYNC_NOW_REQUERY_WAIT,
+    // and only if it now resolves to a DIFFERENT endpoint (a peer that is
+    // simply offline is not dialled twice). Resolution runs on the worker,
+    // never on the tray/menu thread.
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            use std::collections::{HashMap, HashSet};
+            let mut results: Vec<serde_json::Value> = Vec::new();
+            let mut done: HashSet<String> = HashSet::new();
+            let mut tried: HashMap<String, (String, u16)> = HashMap::new();
+            for round in 0..2 {
+                if round == 1 {
+                    if done.len() >= peers.len() {
+                        break;
+                    }
+                    std::thread::sleep(SYNC_NOW_REQUERY_WAIT);
+                }
+                let resolved = match resolve_sync_endpoints(&sc) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        log::warn!("manual sync_now: sync_endpoints failed: {e}");
+                        continue;
+                    }
+                };
+                if round == 0 {
+                    log::info!(
+                        "manual sync_now -> {} peer(s): {} (peers paired: {})",
+                        resolved.len(),
+                        resolved
+                            .iter()
+                            .map(|(d, h, p)| format!("{d}@{h}:{p}"))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        peers.len()
+                    );
+                }
+                // Serial passes: a manual pass is user-triggered; serial keeps
+                // load and log output predictable (DC-13 §4.1 allows either).
+                for (device_id, host, port) in resolved {
+                    if done.contains(&device_id) {
+                        continue;
+                    }
+                    if round == 1 && tried.get(&device_id) == Some(&(host.clone(), port)) {
+                        continue; // same endpoint already failed this press
+                    }
+                    if round == 1 {
+                        log::info!("manual sync_now: retrying {device_id} at a newly discovered endpoint (DC-11 A.2)");
+                    }
+                    tried.insert(device_id.clone(), (host.clone(), port));
+                    match proxy(&sc, "sync_now", json!({ "host": host, "port": port })) {
+                        Ok(v) => {
+                            log::info!("manual sync_now {device_id}@{host}:{port} finished: {v}");
+                            done.insert(device_id.clone());
+                            results.push(json!({
+                                "device_id": device_id, "host": host, "port": port,
+                                "ok": true, "result": v
+                            }));
+                        }
+                        Err(e) => {
+                            log::warn!("manual sync_now {device_id}@{host}:{port} failed: {e}");
+                            results.push(json!({
+                                "device_id": device_id, "host": host, "port": port,
+                                "ok": false, "error": e
+                            }));
+                        }
+                    }
+                }
+            }
+            if tried.is_empty() {
+                log::warn!("manual sync_now: no resolvable peer endpoints (peers paired, but mDNS browse found nothing and no last-known endpoint is stored)");
+            }
+            serde_json::to_value(results).unwrap_or(serde_json::Value::Null)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            log::warn!("manual sync_now join failure: {e}");
+            serde_json::Value::Null
+        });
+        log::info!("manual sync_now finished: {}", result);
+        app2.state::<SyncFlight>().0.store(false, Ordering::SeqCst);
+        set_sync_enabled(&app2, true);
+        let _ = app2.emit("tide://sync-state", true);
+    });
+    start(true, "")
+}
+
+/// DC-11 A.2: how long a Sync now press waits for the on-demand mDNS query
+/// round before its single retry of unreached peers.
+const SYNC_NOW_REQUERY_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// sync_endpoints → [(device_id, host, port)] for peers with an endpoint;
+/// peers without one are logged and left out.
+fn resolve_sync_endpoints(
+    sc: &sidecar::Sidecar,
+) -> Result<Vec<(String, String, u16)>, String> {
+    proxy(sc, "sync_endpoints", json!({}))
         .and_then(|v| {
-            serde_json::from_value::<Vec<serde_json::Value>>(
-                serde_json::Value::Array(
-                    v["endpoints"].as_array().cloned().unwrap_or_default(),
-                ),
-            )
+            serde_json::from_value::<Vec<serde_json::Value>>(serde_json::Value::Array(
+                v["endpoints"].as_array().cloned().unwrap_or_default(),
+            ))
             .map_err(|e| e.to_string())
         })
         .map(|rows| {
@@ -989,62 +1089,7 @@ fn trigger_sync_now(app: &AppHandle) -> Result<serde_json::Value, String> {
                     Some((device_id, host, port))
                 })
                 .collect()
-        });
-    let resolved = match resolved {
-        Ok(r) => r,
-        Err(e) => return start(false, &format!("sync_endpoints failed: {e}")),
-    };
-    if resolved.is_empty() {
-        return start(false, "no resolvable peer endpoints (peers paired, but mDNS browse found nothing and no last-known endpoint is stored)");
-    }
-    log::info!(
-        "manual sync_now -> {} peer(s): {} (peers paired: {})",
-        resolved.len(),
-        resolved
-            .iter()
-            .map(|(d, h, p)| format!("{d}@{h}:{p}"))
-            .collect::<Vec<_>>()
-            .join(", "),
-        peers.len()
-    );
-    let app2 = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let result = tauri::async_runtime::spawn_blocking(move || {
-            // One sync_now pass per resolved peer (serial: DC-13 §4.1 allows
-            // concurrent sessions, but a manual pass is user-triggered —
-            // serial keeps load and log output predictable).
-            let mut results: Vec<serde_json::Value> = Vec::new();
-            for (device_id, host, port) in &resolved {
-                match proxy(&sc, "sync_now", json!({ "host": host, "port": port })) {
-                    Ok(v) => {
-                        log::info!("manual sync_now {device_id}@{host}:{port} finished: {v}");
-                        results.push(json!({
-                            "device_id": device_id, "host": host, "port": port,
-                            "ok": true, "result": v
-                        }));
-                    }
-                    Err(e) => {
-                        log::warn!("manual sync_now {device_id}@{host}:{port} failed: {e}");
-                        results.push(json!({
-                            "device_id": device_id, "host": host, "port": port,
-                            "ok": false, "error": e
-                        }));
-                    }
-                }
-            }
-            serde_json::to_value(results).unwrap_or(serde_json::Value::Null)
         })
-        .await
-        .unwrap_or_else(|e| {
-            log::warn!("manual sync_now join failure: {e}");
-            serde_json::Value::Null
-        });
-        log::info!("manual sync_now finished: {}", result);
-        app2.state::<SyncFlight>().0.store(false, Ordering::SeqCst);
-        set_sync_enabled(&app2, true);
-        let _ = app2.emit("tide://sync-state", true);
-    });
-    start(true, "")
 }
 
 #[tauri::command]
@@ -1404,6 +1449,13 @@ pub fn run() {
                                     "tide://data-changed",
                                     serde_json::json!({ "applied": applied }),
                                 );
+                            }
+                            // DC-11 A.2: a paired peer was unreachable in a
+                            // background pass; BrowseService rate-limits.
+                            Some("discovery_kick") => {
+                                if let Some(svc) = notice_app.try_state::<mdns_service::BrowseService>() {
+                                    svc.kick();
+                                }
                             }
                             other => log::debug!("sidecar notice ignored: {other:?}"),
                         }

@@ -119,6 +119,16 @@ type Json = Record<string, unknown>;
 
 export type Dispatcher = (op: string, args: Json) => unknown;
 
+/**
+ * DC-11 Appendix A.2(b): ask the shell for an on-demand mDNS query round (a
+ * paired peer was unreachable in a scheduler session). No payload: the
+ * shell rate-limits. Effective once scheduler sessions are wired (the DC-13
+ * sweep is UNWIRED today; Sync now kicks from the shell directly).
+ */
+export function discoveryKickNoticeLine(): string {
+  return JSON.stringify({ notice: "discovery_kick" });
+}
+
 /** DC-26 §3.1 wire format of the data notice (exported for TR-1/TR-3). */
 export function dataChangedNoticeLine(applied: number): string {
   return JSON.stringify({ notice: "data_changed", source: "sync", applied });
@@ -1561,6 +1571,9 @@ function main(): void {
 
   const schedulerRuntime = startSchedulerRuntime({
     now: () => Date.now(),
+    onPeerUnreachable: () => {
+      process.stdout.write(discoveryKickNoticeLine() + "\n");
+    },
     listPeers: () => {
       // pkg10 review F6: ONE query per decision pass, not N+1.
       const peers = listTrustedPeers(core.db);

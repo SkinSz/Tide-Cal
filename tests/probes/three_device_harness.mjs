@@ -14,7 +14,7 @@
 //
 // Usage:
 //   node tests/probes/three_device_harness.mjs [--scenario=NAME|all]
-//        [--port-base=41900] [--keep] [--inject-failure] [--report-dir=DIR]
+//        [--port-base=31900] [--keep] [--inject-failure] [--report-dir=DIR]
 //        [--seed=N]
 //
 // Exit code 0 = all requested scenarios PASS, 1 = any FAIL.
@@ -36,7 +36,14 @@ const SIDECAR = path.join(REPO_ROOT, "dist", "sidecar.mjs");
 const HARNESS_VERSION = "3dev-harness-1.0";
 
 // --- determinism controls ---------------------------------------------------
-const DEFAULT_PORT_BASE = 41900; // reserved band 41900-41999 (proposal)
+// TD-013: the band sits BELOW every common OS ephemeral (outbound) port
+// range (Linux default 32768-60999, Windows/macOS 49152-65535). The old band
+// 41900-41999 lay inside the Linux range, so a sidecar's own outbound sync
+// or pairing socket (or one in TIME_WAIT) could occupy a port a later
+// scenario then had to listen on: transient EADDRINUSE that nothing held a
+// moment later. Ports stay deterministic per run: scenario i uses
+// PORT_BASE + 10*i + device index.
+const DEFAULT_PORT_BASE = 31900; // reserved band 31900-31999
 const BIND_VERIFY_TIMEOUT_MS = 10000; // fail fast if a bind lost a port race
 const RPC_TIMEOUT_MS = 15000; // per-op deadline (covers sidecar scheduling)
 const SYNC_RPC_TIMEOUT_MS = 22000; // sync_now: >= engine idle bound (15s) + margin
@@ -190,12 +197,33 @@ async function assertPortFree(port, label) {
   if (!ok) throw new Error(`port ${port} for ${label} already in use — refusing to race (fast-fail)`);
 }
 
+/** One TCP connect to the device's sync listener; resolves true if accepted. */
+function listenerAccepts(port) {
+  return new Promise((resolve) => {
+    const sock = net.connect({ host: "127.0.0.1", port });
+    sock.once("connect", () => {
+      sock.destroy(); // handshake never starts: the sidecar just drops it
+      resolve(true);
+    });
+    sock.once("error", () => resolve(false));
+  });
+}
+
+const BIND_FAILURE_MARK = "sync listener failed to start";
+
 async function waitHealthy(dev) {
-  // device_info forces listener startup; verify the advertised port matches
-  // ours so a lost bind race fails the run immediately.
+  // device_info forces listener startup. Its listening_port only echoes the
+  // REQUESTED port (the bind is async and a failure is merely logged), so a
+  // matching number proves nothing (TD-013). Proof of a bound listener is a
+  // real TCP accept on that port. If the bind failed, the next device_info
+  // makes the sidecar try again: this loop is that bounded bind-retry
+  // (BIND_VERIFY_TIMEOUT_MS), and every failed attempt is logged.
   const deadline = Date.now() + BIND_VERIFY_TIMEOUT_MS;
   let lastErr;
+  let attempt = 0;
+  let bindFailuresSeen = 0;
   while (Date.now() < deadline) {
+    attempt++;
     try {
       const info = await dev.rpc("device_info", {}, 4000);
       dev.deviceId = info.device_id;
@@ -204,13 +232,42 @@ async function waitHealthy(dev) {
           `${dev.name}: listener on ${info.listening_port}, expected ${dev.port} (bind lost race?)`,
         );
       }
-      return info;
+      if (await listenerAccepts(dev.port)) {
+        if (attempt > 1) log(`  [bind] ${dev.name}: port ${dev.port} accepting after ${attempt} attempts`);
+        return info;
+      }
+      const failures = dev.stderrTail.filter((l) => l.includes(BIND_FAILURE_MARK));
+      const fresh = failures.slice(bindFailuresSeen);
+      bindFailuresSeen = failures.length;
+      throw new Error(
+        `${dev.name}: nothing accepting on port ${dev.port}` +
+          (fresh.length > 0 ? ` (sidecar: ${fresh[fresh.length - 1]})` : ""),
+      );
     } catch (e) {
       lastErr = e;
+      log(`  [bind] ${dev.name}: attempt ${attempt} not ready: ${e.message ?? e}`);
       await new Promise((r) => setTimeout(r, 150));
     }
   }
-  throw new Error(`${dev.name}: device_info failed within ${BIND_VERIFY_TIMEOUT_MS}ms: ${lastErr}`);
+  throw new Error(`${dev.name}: listener not verified within ${BIND_VERIFY_TIMEOUT_MS}ms: ${lastErr}`);
+}
+
+/**
+ * TD-013: refuse (loudly) a port band that overlaps this host's ephemeral
+ * range; outbound sockets could take a band port at any moment.
+ */
+function ephemeralRange() {
+  try {
+    const [lo, hi] = fs
+      .readFileSync("/proc/sys/net/ipv4/ip_local_port_range", "utf8")
+      .trim()
+      .split(/\s+/)
+      .map(Number);
+    if (Number.isInteger(lo) && Number.isInteger(hi)) return { lo, hi, source: "linux" };
+  } catch {
+    /* not Linux */
+  }
+  return { lo: 49152, hi: 65535, source: "IANA default" };
 }
 
 // --- pairing (real DC-05 over real Noise_XX TCP) -----------------------------
@@ -821,6 +878,15 @@ async function main() {
 
   // Fast failure for port races: verify the whole band up-front.
   const maxOffset = requested.length * 10 + 4;
+  const eph = ephemeralRange();
+  if (PORT_BASE <= eph.hi && PORT_BASE + maxOffset - 1 >= eph.lo) {
+    console.error(
+      `port band ${PORT_BASE}-${PORT_BASE + maxOffset - 1} overlaps the ephemeral range ` +
+        `${eph.lo}-${eph.hi} (${eph.source}); outbound sockets can steal band ports ` +
+        `(TD-013). Choose --port-base below ${eph.lo}.`,
+    );
+    process.exit(2);
+  }
   for (let i = 0; i < maxOffset; i++) {
     await assertPortFree(PORT_BASE + i, `port band +${i}`);
   }
