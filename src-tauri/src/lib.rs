@@ -1383,7 +1383,23 @@ pub fn run() {
                     // and a dev instance is a genuinely separate device.
                     cmd.env("TIDE_DATA_DIR", &data_dir);
                     cmd.arg(&path);
-                    match sidecar::Sidecar::spawn(cmd) {
+                    // DC-26 §3.2: forward sidecar data notices to the
+                    // window. Unknown kinds: debug log, ignored. emit() only
+                    // queues, so the reader thread never blocks here.
+                    let notice_app = app.handle().clone();
+                    let notices: sidecar::NoticeSink = Arc::new(move |msg: &serde_json::Value| {
+                        match msg["notice"].as_str() {
+                            Some("data_changed") => {
+                                let applied = msg["applied"].as_u64().unwrap_or(0);
+                                let _ = notice_app.emit(
+                                    "tide://data-changed",
+                                    serde_json::json!({ "applied": applied }),
+                                );
+                            }
+                            other => log::debug!("sidecar notice ignored: {other:?}"),
+                        }
+                    });
+                    match sidecar::Sidecar::spawn_with_notices(cmd, notices) {
                         Ok(sc) => {
                             match sc.ping() {
                                 Ok(_) => log::info!(

@@ -1,7 +1,8 @@
 // Tide app-shell entry: toolbar wiring + calendar render loop.
-import { getViewMode, navigate, render, setViewMode } from "./calendar.ts";
+import { getViewMode, isDragging, navigate, render, setViewMode } from "./calendar.ts";
 import { initDialog } from "./dialog.ts";
 import { initConflicts } from "./conflicts.ts";
+import { initDataRefresh } from "./data_refresh.ts";
 import { initDevices } from "./devices.ts";
 import { initSyncErrors } from "./sync_errors.ts";
 import { initMenu } from "./menu.ts";
@@ -64,6 +65,10 @@ if ("__TAURI_INTERNALS__" in globalThis) {
     )
     .catch((err) => console.warn("[tide] event listen unavailable:", err));
 }
+
+// DC-26: redraw the current view after a sync changed local data. The
+// conflicts badge re-reads itself after every render (tide:rendered).
+initDataRefresh(() => render(), isDragging);
 
 function wire(id: string, fn: () => void): void {
   document.getElementById(id)?.addEventListener("click", fn);

@@ -325,6 +325,13 @@ function eventChip(
   const chip = document.createElement("div");
   chip.className = allDayStyle ? "chip chip-allday" : "chip";
   chip.dataset.eventId = ev.id;
+  // DC-26 §3.3 (review MAJOR-1): a redraw keeps the selection when the
+  // selected appointment (same event, same occurrence) is still shown.
+  if (selectedEvent && selectionKey(selectedEvent) === selectionKey(ev)) {
+    chip.classList.add("chip-selected");
+    selectedEvent = ev; // fresh data after a sync
+    selectionSeen = true;
+  }
   chip.textContent = allDayStyle ? ev.title : `${fmtTime(ev.startMs)} ${ev.title}`;
   chip.title = ev.title;
   // Every occurrence chip carries the 🔁 glyph + tooltip (occurrence metadata
@@ -367,6 +374,18 @@ function eventChip(
 // ---------------------------------------------------------------------------
 
 let selectedEvent: CalendarEvent | null = null;
+/** Set during render() when the selected appointment was drawn again. */
+let selectionSeen = false;
+
+/** Identity of a chip for selection: event id + occurrence (series). */
+function selectionKey(ev: CalendarEvent): string {
+  return `${ev.id}|${occurrenceOf(ev)?.recurrenceId ?? ""}`;
+}
+
+/** DC-26 (review MINOR-2): true while a chip is being dragged. */
+export function isDragging(): boolean {
+  return dragEvent !== null;
+}
 
 function deleteSelected(chip: HTMLElement): void {
   const ev = selectedEvent;
@@ -669,6 +688,28 @@ export async function render(): Promise<void> {
   const root = document.getElementById("calendar-grid");
   if (!root) return;
   const seq = ++renderSeq;
+  // Fetch BEFORE clearing (review MINOR-4): the old grid stays on screen
+  // while data loads, so a background refresh never flashes an empty grid
+  // or resets the scroll position.
+  const cells = mode === "month" ? monthGrid() : weekCells();
+  const rangeStart = cells[0]!.date;
+  const rangeEnd = addDays(cells[cells.length - 1]!.date, 1);
+  const [baseEvents, series] = await Promise.all([
+    eventsForRange(rangeStart, rangeEnd),
+    seriesByBaseEvent(),
+  ]);
+  // Re-check: async gap may mean the user navigated meanwhile.
+  if (seq !== renderSeq) {
+    return;
+  }
+  seriesLookup = series;
+  // DC-12: expand recurring series into per-occurrence chips (cancelled
+  // occurrences dropped, edited occurrences carry their override fields).
+  const events = expandSeriesEvents(baseEvents, seriesRowsCache, rangeStart, rangeEnd);
+  const scrollBox = root.closest("main");
+  const scrollTop = scrollBox?.scrollTop ?? 0;
+  selectionSeen = false;
+
   root.replaceChildren();
   root.classList.toggle("week", mode === "week");
 
@@ -685,22 +726,6 @@ export async function render(): Promise<void> {
     root.appendChild(h);
   }
 
-  const cells = mode === "month" ? monthGrid() : weekCells();
-  const rangeStart = cells[0]!.date;
-  const rangeEnd = addDays(cells[cells.length - 1]!.date, 1);
-  const [baseEvents, series] = await Promise.all([
-    eventsForRange(rangeStart, rangeEnd),
-    seriesByBaseEvent(),
-  ]);
-  seriesLookup = series;
-  // DC-12: expand recurring series into per-occurrence chips (cancelled
-  // occurrences dropped, edited occurrences carry their override fields).
-  const events = expandSeriesEvents(baseEvents, seriesRowsCache, rangeStart, rangeEnd);
-  // Re-check: async gap may mean the user navigated meanwhile.
-  if (seq !== renderSeq) {
-    return;
-  }
-
   if (mode === "week") {
     renderHourRuler(root);
     for (const cell of cells) {
@@ -715,6 +740,14 @@ export async function render(): Promise<void> {
     }
   }
   document.getElementById("cal-label")!.textContent = label();
+  // The selected appointment no longer exists (or is out of view): clear
+  // the selection so Delete can't act on a stale event (DC-26 §3.3).
+  if (!selectionSeen) selectedEvent = null;
+  if (scrollBox) scrollBox.scrollTop = scrollTop;
+  // TD-031 / DC-26 TR-8: listeners (conflicts badge) re-read their state
+  // on every completed redraw, so a conflict created by a sync or any
+  // other path is visible without a restart.
+  document.dispatchEvent(new CustomEvent("tide:rendered"));
 }
 
 // --- Week view: time-grid ---------------------------------------------------

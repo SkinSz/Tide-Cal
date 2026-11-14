@@ -9620,6 +9620,16 @@ function msFromWallId(id) {
   const ss = +digits.slice(12, 14) || 0;
   return new Date(y, mo - 1, dd, hh, mi, ss, 0).getTime();
 }
+function dataChangedNoticeLine(applied) {
+  return JSON.stringify({ notice: "data_changed", source: "sync", applied });
+}
+function notifyDataChanged(stats, sink) {
+  if (stats.receivedApplied <= 0 || sink === void 0) return;
+  try {
+    sink(stats.receivedApplied);
+  } catch {
+  }
+}
 var SyncManager = class {
   constructor(core, identity, dataDir) {
     this.core = core;
@@ -9636,6 +9646,13 @@ var SyncManager = class {
    */
   misbehavior = new PeerMisbehaviorTracker();
   host = null;
+  /**
+   * DC-26 §3.1: called once per engine session (any direction, any trigger)
+   * that applied at least one received change, AFTER the applying
+   * transactions committed. Wired to the stdout data notice in main();
+   * unset in tests unless a test installs a spy.
+   */
+  onDataChanged;
   get deviceId() {
     return this.identity.deviceId;
   }
@@ -9759,6 +9776,7 @@ var SyncManager = class {
           Date.now()
         );
       }
+      notifyDataChanged(stats, this.onDataChanged);
       return {
         ...stats,
         remote_device_id: remoteDeviceId ?? "unknown"
@@ -10402,6 +10420,9 @@ function main() {
   );
   const core = new EventCore(dbPath, syncIdentity.deviceId);
   const sync = new SyncManager(core, syncIdentity);
+  sync.onDataChanged = (applied) => {
+    process.stdout.write(dataChangedNoticeLine(applied) + "\n");
+  };
   const dispatch = makeDispatcher(core);
   const endpointCache = new EndpointCache();
   const syncDispatch = makeSyncDispatcher(sync, core, { endpointCache });
@@ -10618,9 +10639,11 @@ if (process.env.VITEST === void 0 && /sidecar\.(mjs|ts|cjs)$/.test(self)) {
 export {
   SYNC_CONNECT_TIMEOUT_MS,
   SyncManager,
+  dataChangedNoticeLine,
   handleLine,
   makeDispatcher,
   makeSyncDispatcher,
+  notifyDataChanged,
   withTimeout
 };
 /*! Bundled license information:

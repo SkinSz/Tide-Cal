@@ -311,5 +311,8 @@ export function initConflicts(): void {
   document
     .getElementById("conflict-close")
     ?.addEventListener("click", () => dlg().close());
+  // TD-031: the badge previously read its count only here (startup) and
+  // after a resolution, so a conflict created later showed "(0)".
+  document.addEventListener("tide:rendered", () => void refreshBadge());
   void refreshBadge();
 }

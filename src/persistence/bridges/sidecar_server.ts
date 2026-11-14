@@ -119,6 +119,28 @@ type Json = Record<string, unknown>;
 
 export type Dispatcher = (op: string, args: Json) => unknown;
 
+/** DC-26 §3.1 wire format of the data notice (exported for TR-1/TR-3). */
+export function dataChangedNoticeLine(applied: number): string {
+  return JSON.stringify({ notice: "data_changed", source: "sync", applied });
+}
+
+/**
+ * DC-26 §3.1 decision seam (TR-1): exactly one notice when the session
+ * applied >= 1 received change (conflict outcomes count as applied), none
+ * otherwise. A throwing sink never fails the completed session.
+ */
+export function notifyDataChanged(
+  stats: { receivedApplied: number },
+  sink: ((applied: number) => void) | undefined,
+): void {
+  if (stats.receivedApplied <= 0 || sink === undefined) return;
+  try {
+    sink(stats.receivedApplied);
+  } catch {
+    /* a notice must never fail a completed session */
+  }
+}
+
 /**
  * Sync runtime state for one sidecar process: identity + optional listener.
  * Data dir defaults to beside the DB (identity key must persist per install).
@@ -132,6 +154,13 @@ export class SyncManager {
    */
   readonly misbehavior = new PeerMisbehaviorTracker();
   private host: { actualPort: number; close(): void } | null = null;
+  /**
+   * DC-26 §3.1: called once per engine session (any direction, any trigger)
+   * that applied at least one received change, AFTER the applying
+   * transactions committed. Wired to the stdout data notice in main();
+   * unset in tests unless a test installs a spy.
+   */
+  onDataChanged: ((applied: number) => void) | undefined;
 
   constructor(
     private readonly core: EventCore,
@@ -327,6 +356,11 @@ export class SyncManager {
           Date.now(),
         );
       }
+      // DC-26 §3.1: one notice per session that changed local data. All
+      // three session paths (inbound, scheduler, Sync now) end here, and
+      // every apply transaction has committed by now. A conflict outcome
+      // counts as applied (applyRemoteChange), so new conflicts notify too.
+      notifyDataChanged(stats, this.onDataChanged);
       return {
         ...stats,
         remote_device_id: remoteDeviceId ?? "unknown",
@@ -1191,6 +1225,12 @@ function main(): void {
   );
   const core = new EventCore(dbPath, syncIdentity.deviceId);
   const sync = new SyncManager(core, syncIdentity);
+  // DC-26 §3.1/§3.2: id-less NDJSON notice on the same stdout channel as RPC
+  // responses (one write per line, so lines never interleave). Count only:
+  // no titles, entity ids or device ids (TR-3).
+  sync.onDataChanged = (applied) => {
+    process.stdout.write(dataChangedNoticeLine(applied) + "\n");
+  };
   const dispatch = makeDispatcher(core);
   // DC-21 D2: ONE endpoint cache; declared before the sync dispatcher so the
   // sync_endpoints op (bug #1b) resolves against the same cache the

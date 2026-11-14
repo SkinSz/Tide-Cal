@@ -32,6 +32,10 @@ const MAX_LOGGED_STDOUT_BYTES: usize = 200;
 
 type PendingTx = Sender<Result<Value, String>>;
 
+/// DC-26 §3.2: receiver for id-less `{"notice": …}` lines from the sidecar.
+/// Called on the reader thread; must not block.
+pub type NoticeSink = Arc<dyn Fn(&Value) + Send + Sync>;
+
 struct Inner {
     /// Option so Drop can take() it: closing stdin is the sidecar's clean
     /// shutdown signal (readline EOF → its closeListener + exit path, per
@@ -49,8 +53,15 @@ pub struct Sidecar {
 }
 
 impl Sidecar {
-    /// Spawn `cmd` (stdin/stdout piped), start the reader thread.
-    pub fn spawn(mut cmd: Command) -> Result<Self, String> {
+    /// Spawn `cmd` (stdin/stdout piped), start the reader thread. Sidecar
+    /// notices are ignored (tests only; the app uses spawn_with_notices).
+    #[cfg(test)]
+    pub fn spawn(cmd: Command) -> Result<Self, String> {
+        Self::spawn_with_notices(cmd, Arc::new(|_: &Value| {}))
+    }
+
+    /// As `spawn`, delivering each sidecar notice line to `notices`.
+    pub fn spawn_with_notices(mut cmd: Command, notices: NoticeSink) -> Result<Self, String> {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -88,7 +99,7 @@ impl Sidecar {
         let reader_pending = Arc::clone(&pending);
         std::thread::Builder::new()
             .name("tide-sidecar-reader".into())
-            .spawn(move || read_loop(stdout, reader_pending))
+            .spawn(move || read_loop(stdout, reader_pending, notices))
             .map_err(|e| format!("spawn reader thread: {e}"))?;
 
         Ok(Sidecar {
@@ -215,7 +226,11 @@ impl Drop for Sidecar {
     }
 }
 
-fn read_loop(stdout: std::process::ChildStdout, pending: Arc<Mutex<HashMap<u64, PendingTx>>>) {
+fn read_loop(
+    stdout: std::process::ChildStdout,
+    pending: Arc<Mutex<HashMap<u64, PendingTx>>>,
+    notices: NoticeSink,
+) {
     let reader = BufReader::new(stdout);
     for line in reader.lines() {
         let Ok(line) = line else { break };
@@ -227,6 +242,13 @@ fn read_loop(stdout: std::process::ChildStdout, pending: Arc<Mutex<HashMap<u64, 
             log::warn!("sidecar sent non-JSON line: {}", clip(trimmed, MAX_LOGGED_STDOUT_BYTES));
             continue;
         };
+        // DC-26 §3.2: an id-less notice is not a response; it never touches
+        // the pending-request table. Unknown notice kinds are the sink's
+        // business (it ignores them), never a warning here.
+        if msg.get("id").is_none() && msg.get("notice").is_some() {
+            notices(&msg);
+            continue;
+        }
         // Ids are numbers per protocol; tolerate string ids defensively.
         let Some(id) = msg.get("id").and_then(parse_id) else {
             log::warn!("sidecar response missing id: {}", clip(trimmed, MAX_LOGGED_STDOUT_BYTES));
@@ -354,6 +376,37 @@ mod tests {
         assert_eq!(r["args"]["input"]["startMs"], 5);
 
         assert!(sc.call("boom", json!({})).is_ok());
+    }
+
+    #[test]
+    fn notices_reach_the_sink_and_never_disturb_requests() {
+        // DC-26 TR-4: the fake sidecar answers each request with a notice
+        // line FIRST, then the response; an unknown notice kind is also
+        // delivered (the sink decides), never treated as a response.
+        let script = "n=0; while IFS= read -r l; do \
+                      n=$((n+1)); \
+                      printf '{\"notice\":\"data_changed\",\"source\":\"sync\",\"applied\":%d}\\n' \"$n\"; \
+                      printf '{\"notice\":\"future_kind\"}\\n'; \
+                      printf '{\"id\":%d,\"ok\":true,\"result\":%s}\\n' \"$n\" \"$l\"; \
+                      done";
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(script);
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        let sc = Sidecar::spawn_with_notices(
+            cmd,
+            Arc::new(move |v: &Value| sink_seen.lock().unwrap().push(v.clone())),
+        )
+        .expect("spawn notice sidecar");
+        assert_eq!(sc.ping().expect("ping")["op"], "ping");
+        let r = sc.call("create_event", json!({"x": 1})).expect("call");
+        assert_eq!(r["op"], "create_event");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 4, "{seen:?}");
+        assert_eq!(seen[0]["notice"], "data_changed");
+        assert_eq!(seen[0]["applied"], 1);
+        assert_eq!(seen[1]["notice"], "future_kind");
+        assert_eq!(seen[2]["applied"], 2);
     }
 
     #[test]
