@@ -269,7 +269,25 @@ dialog menu .spacer { flex: 1 1 auto; }
   word-break: break-word;
 }
 .conflict-value.deleted { color: var(--muted); text-decoration: line-through; }
-.conflict-actions { display: flex; gap: 8px; margin-top: 8px; justify-content: flex-end; }
+.conflict-actions { display: flex; gap: 8px; margin-top: 8px; justify-content: flex-end; flex-wrap: wrap; }
+/* DC-14 Appendix A: readable presentation (versions side by side, raw data collapsed) */
+.conflict-header { margin: 0 0 6px; font-size: 0.9rem; }
+.conflict-sides { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }
+.conflict-sides .conflict-candidate { margin-top: 0; }
+.conflict-sides .conflict-candidate-head { display: block; }
+.conflict-line + .conflict-line { margin-top: 3px; }
+.conflict-when { margin-top: 6px; }
+.conflict-show-all {
+  background: none; border: none; padding: 0; margin-top: 6px;
+  color: var(--accent); font: inherit; font-size: 0.8rem; cursor: pointer;
+}
+.conflict-tech { margin-top: 12px; font-size: 0.78rem; }
+.conflict-tech summary { cursor: pointer; color: var(--muted); }
+.conflict-raw {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 8px; margin: 2px 0 6px; font-size: 0.75rem;
+  white-space: pre-wrap; word-break: break-word;
+}
 
 /* Event dialog: day + whole-day + time row */
 #ev-time-row { display: flex; gap: 10px; }

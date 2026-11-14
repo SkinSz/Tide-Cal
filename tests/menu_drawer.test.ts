@@ -35,4 +35,19 @@ describe("burger drawer: hidden attribute must always win", () => {
     expect(html).toMatch(/id="menu-export"/);
     expect(html).not.toMatch(/id="btn-export"/);
   });
+
+  test("Devices lives in the drawer, not the toolbar; Options entry present (owner 2026-11-14)", () => {
+    const toolbar = html.match(/<header id="toolbar">([\s\S]*?)<\/header>/)![1];
+    const drawer = html.match(/<nav id="menu-drawer"[\s\S]*?<\/nav>/)![0];
+    expect(toolbar).not.toMatch(/id="btn-devices"/);
+    expect(drawer).toMatch(/id="btn-devices"/);
+    expect(drawer).toMatch(/id="menu-options"/);
+    expect(menu).toMatch(/invoke\("open_options"\)/);
+  });
+
+  test("open_options is a registered async command (window creation off the main thread)", () => {
+    const rs = readFileSync(join(import.meta.dirname, "../src-tauri/src/lib.rs"), "utf8");
+    expect(rs).toMatch(/#\[tauri::command\]\s*async fn open_options\(/);
+    expect(rs).toMatch(/generate_handler!\[[\s\S]*\bopen_options\b[\s\S]*\]/);
+  });
 });

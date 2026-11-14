@@ -1203,8 +1203,10 @@ function deleteQuarantineByUser(db, quarantineId, opts) {
     skip_row_recreated: recreated
   };
 }
-function isHardBlocked(db, producerDeviceId) {
-  return !!db.prepare("SELECT 1 FROM hard_blocks WHERE producer_device_id = ?").get(producerDeviceId);
+var HARD_BLOCK_LOOKUP_SQL = "SELECT 1 FROM hard_blocks WHERE producer_device_id = ?";
+function makeHardBlockCheck(db) {
+  const stmt = db.prepare(HARD_BLOCK_LOOKUP_SQL);
+  return (producerDeviceId) => !!stmt.get(producerDeviceId);
 }
 function hardBlockProducer(db, producerDeviceId) {
   const now = Date.now();
@@ -2096,7 +2098,7 @@ import { networkInterfaces } from "node:os";
 // src/security/identity.ts
 import { randomBytes as randomBytes2 } from "node:crypto";
 
-// ../../node_modules/@noble/ed25519/index.js
+// node_modules/@noble/ed25519/index.js
 var ed25519_CURVE = Object.freeze({
   p: 0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffedn,
   n: 0x1000000000000000000000000000000014def9dea2f79cd65812631a5cf5d3edn,
@@ -2550,7 +2552,7 @@ var wNAF = (n) => {
   return { p, f };
 };
 
-// ../../node_modules/@noble/hashes/_u64.js
+// node_modules/@noble/hashes/_u64.js
 var U32_MASK64 = /* @__PURE__ */ (() => BigInt(2 ** 32 - 1))();
 var _32n = /* @__PURE__ */ BigInt(32);
 function fromBig(n, le = false) {
@@ -2593,7 +2595,7 @@ var add4H = (low, Ah, Bh, Ch, Dh) => Ah + Bh + Ch + Dh + (low / 2 ** 32 | 0) | 0
 var add5L = (Al, Bl, Cl, Dl, El) => (Al >>> 0) + (Bl >>> 0) + (Cl >>> 0) + (Dl >>> 0) + (El >>> 0);
 var add5H = (low, Ah, Bh, Ch, Dh, Eh) => Ah + Bh + Ch + Dh + Eh + (low / 2 ** 32 | 0) | 0;
 
-// ../../node_modules/@noble/hashes/utils.js
+// node_modules/@noble/hashes/utils.js
 function isBytes2(a) {
   return a instanceof Uint8Array || ArrayBuffer.isView(a) && a.constructor.name === "Uint8Array" && "BYTES_PER_ELEMENT" in a && a.BYTES_PER_ELEMENT === 1;
 }
@@ -2742,7 +2744,7 @@ var oidNist = (suffix) => ({
   oid: Uint8Array.from([6, 9, 96, 134, 72, 1, 101, 3, 4, 2, suffix])
 });
 
-// ../../node_modules/@noble/hashes/_md.js
+// node_modules/@noble/hashes/_md.js
 function Chi(a, b, c) {
   return a & b ^ ~a & c;
 }
@@ -2873,7 +2875,7 @@ var SHA512_IV = /* @__PURE__ */ Uint32Array.from([
   327033209
 ]);
 
-// ../../node_modules/@noble/hashes/sha2.js
+// node_modules/@noble/hashes/sha2.js
 var SHA256_K = /* @__PURE__ */ Uint32Array.from([
   1116352408,
   1899447441,
@@ -3301,7 +3303,7 @@ function identityFromPrivateKey(privateKey) {
 // src/network/noise_transport.ts
 import { createRequire } from "node:module";
 
-// ../../node_modules/@noble/curves/utils.js
+// node_modules/@noble/curves/utils.js
 function aarray(item, title, inner = () => {
 }) {
   if (!Array.isArray(item))
@@ -3421,7 +3423,7 @@ function validateObject(object, fields = {}, optFields = {}, title = "object") {
   iter(optFields, true);
 }
 
-// ../../node_modules/@noble/curves/abstract/modular.js
+// node_modules/@noble/curves/abstract/modular.js
 var _0n2 = /* @__PURE__ */ BigInt(0);
 var _1n2 = /* @__PURE__ */ BigInt(1);
 var _2n = /* @__PURE__ */ BigInt(2);
@@ -3850,7 +3852,7 @@ function Field(ORDER, opts = {}) {
   return new _Field(ORDER, opts);
 }
 
-// ../../node_modules/@noble/curves/abstract/curve.js
+// node_modules/@noble/curves/abstract/curve.js
 var _0n3 = /* @__PURE__ */ BigInt(0);
 var _1n3 = /* @__PURE__ */ BigInt(1);
 var _4n2 = /* @__PURE__ */ BigInt(4);
@@ -4237,7 +4239,7 @@ function createKeygen(randomSecretKey, getPublicKey2) {
   };
 }
 
-// ../../node_modules/@noble/curves/abstract/edwards.js
+// node_modules/@noble/curves/abstract/edwards.js
 var _0n4 = /* @__PURE__ */ BigInt(0);
 var _1n4 = /* @__PURE__ */ BigInt(1);
 var _2n2 = /* @__PURE__ */ BigInt(2);
@@ -4688,7 +4690,7 @@ function eddsa(Point2, cHash, eddsaOpts = {}) {
   });
 }
 
-// ../../node_modules/@noble/curves/abstract/montgomery.js
+// node_modules/@noble/curves/abstract/montgomery.js
 var _0n5 = /* @__PURE__ */ BigInt(0);
 var _1n5 = /* @__PURE__ */ BigInt(1);
 var _2n3 = /* @__PURE__ */ BigInt(2);
@@ -4835,7 +4837,7 @@ function montgomery(curveDef) {
   });
 }
 
-// ../../node_modules/@noble/curves/ed25519.js
+// node_modules/@noble/curves/ed25519.js
 var _0n6 = /* @__PURE__ */ BigInt(0);
 var _1n6 = /* @__PURE__ */ BigInt(1);
 var _2n4 = /* @__PURE__ */ BigInt(2);
@@ -4991,6 +4993,17 @@ function noiseStaticsFromIdentity(identitySeed) {
 }
 var FrameQueue = class {
   queue = [];
+  /**
+   * TD-019 F4, deliberately ONE slot ("newest receive wins"). The sync engine
+   * builds a fresh nextMessage() cache per protocol phase and its poll
+   * helpers race receive() against short timers, so a phase can end with an
+   * ABANDONED pending receive. The next phase's receive() replaces that
+   * waiter here, so the next frame goes to the live caller. A FIFO of
+   * waiters would hand that frame to the abandoned promise instead: it would
+   * be decrypted (advancing the nonce) and silently dropped. Do not turn
+   * this into a queue unless the engine first guarantees a single receive
+   * per session (pinned by tests/td007_td019_hygiene.test.ts).
+   */
   waiter = null;
   closed = false;
   push(frame) {
@@ -7069,15 +7082,43 @@ function freshBook() {
   };
 }
 var PeerMisbehaviorTracker = class {
-  constructor(cfg = DEFAULT_MISBEHAVIOR_CONFIG, now = Date.now, onHardBlock) {
+  constructor(cfg = DEFAULT_MISBEHAVIOR_CONFIG, clock = Date.now, onHardBlock) {
     this.cfg = cfg;
-    this.now = now;
+    this.clock = clock;
     this.onHardBlock = onHardBlock;
   }
   cfg;
-  now;
+  clock;
   onHardBlock;
   books = /* @__PURE__ */ new Map();
+  /** Highest clock reading seen so far (backward-step detection, TD-007). */
+  lastNow = Number.NEGATIVE_INFINITY;
+  /**
+   * TD-007 (2): clock read with a backward-jump guard. All windows here are
+   * wall-clock based. If the system clock steps BACKWARD by J ms, every
+   * stored timestamp suddenly lies J ms in the "future": window events would
+   * stay counted, a throttle backoff would last, and the Level-4
+   * recommendation would be delayed, each by up to J extra ms. On a backward
+   * step we therefore shift every stored timestamp back by J, which keeps
+   * each one's AGE exactly what it was. Nothing is forgotten or shortened, so
+   * the tracker still fails closed (a throttled peer stays throttled for the
+   * rest of its backoff); it just no longer gets J ms of extra penalty.
+   * Forward steps need no repair: they can only age entries faster, which
+   * is the same as that much real time passing.
+   */
+  now() {
+    const t = this.clock();
+    if (t < this.lastNow) {
+      const jump = this.lastNow - t;
+      for (const b of this.books.values()) {
+        for (const e of b.events) e.t -= jump;
+        if (b.levelSinceMs !== 0) b.levelSinceMs -= jump;
+        if (b.backoffUntilMs !== 0) b.backoffUntilMs -= jump;
+      }
+    }
+    this.lastNow = t;
+    return t;
+  }
   // ------------------------------------------------------------------
   // Intake gate (called by sync_engine BEFORE validation/parsing)
   // ------------------------------------------------------------------
@@ -7664,6 +7705,7 @@ function createSyncEngine(deps) {
   let sessionDedup = new OfferDedup();
   const misbehavior = deps.misbehavior ?? new PeerMisbehaviorTracker(DEFAULT_MISBEHAVIOR_CONFIG, Date.now);
   misbehavior.onHardBlock = (p) => hardBlockProducer(deps.db, p);
+  const isHardBlocked = makeHardBlockCheck(deps.db);
   gcZombiePending();
   function nextMessage(transport) {
     let pending = null;
@@ -8153,7 +8195,7 @@ function createSyncEngine(deps) {
     for (const raw of changes) {
       const rawDevice = raw?.device_id;
       const producer = typeof rawDevice === "string" && rawDevice.length > 0 ? rawDevice : deps.peerDeviceId ?? "unknown";
-      if (isHardBlocked(deps.db, producer)) continue;
+      if (isHardBlocked(producer)) continue;
       if (misbehavior.isIntakeDropped(producer)) {
         misbehavior.recordDropped(producer);
         stats.receivedDroppedIntake++;
@@ -9307,13 +9349,10 @@ var ConflictsViewModel = class {
         hlc_timestamp: this.changeHlc(p.change_id)
       });
     }
-    const titleRow = this.db.prepare(
-      "SELECT title FROM events WHERE event_id = ?"
-    ).get(c.entity_id);
     return {
       conflict_id: conflictId,
       entity_id: c.entity_id,
-      entity_title: titleRow?.title ?? null,
+      entity_title: this.entityTitleOf(c.entity_id),
       field_path: c.field_path,
       status: c.status,
       candidates,
@@ -9594,6 +9633,28 @@ var ConflictsViewModel = class {
     const deleted = parsed === null || typeof parsed !== "object" || Object.keys(parsed).length === 0;
     return { deleted, value: deleted ? void 0 : parsed };
   }
+  /**
+   * DC-14 Appendix A presentation lookup (pure read): display title of the
+   * conflict entity. Events -> their title; series (also occurrence
+   * overrides, keyed by series id) -> the base event's title; calendars ->
+   * their name. null when unknown (e.g. the entity was removed).
+   */
+  entityTitleOf(entityId) {
+    const ev = this.db.prepare(
+      "SELECT title FROM events WHERE event_id = ?"
+    ).get(entityId);
+    if (ev !== void 0) return ev.title;
+    const ser = this.db.prepare(
+      `SELECT e.title AS title FROM series s
+         LEFT JOIN events e ON e.event_id = s.base_event_id
+         WHERE s.series_id = ?`
+    ).get(entityId);
+    if (ser !== void 0) return ser.title ?? null;
+    const cal = this.db.prepare(
+      "SELECT title FROM calendars WHERE calendar_id = ?"
+    ).get(entityId);
+    return cal?.title ?? null;
+  }
   changeHlc(changeId2) {
     const row = this.db.prepare(
       "SELECT hlc_timestamp FROM changes WHERE change_id = ?"
@@ -9809,37 +9870,29 @@ var SyncManager = class {
     const rows = this.core.db.prepare("SELECT device_id, public_key FROM peers WHERE status = 'trusted'").all();
     const remoteHex = remoteKeyBuf.toString("hex");
     for (const row of rows) {
-      let x255192;
-      try {
-        x255192 = Buffer.from(ed25519ToX25519PublicKey(new Uint8Array(row.public_key)));
-      } catch {
-        continue;
-      }
+      const x255192 = Buffer.from(
+        ed25519ToX25519PublicKey(new Uint8Array(row.public_key))
+      );
       if (x255192.toString("hex") === remoteHex) return row.device_id;
     }
     return void 0;
   }
   onInbound(session) {
     void this.runEngineSession(session).catch((err2) => {
-      const msg = err2 instanceof Error ? err2.message : String(err2);
-      const kind = msg.startsWith("unpaired peer refused") ? "refused" : "failed";
-      const t = this.inboundLogThrottle[kind];
       const now = Date.now();
-      if (now - t.last >= 6e4) {
-        const extra = t.suppressed > 0 ? ` (+${t.suppressed} more since last report)` : "";
-        const clean2 = msg.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 300);
-        console.error(`[tide] inbound sync session ${kind}: ${clean2}${extra}`);
-        t.last = now;
-        t.suppressed = 0;
+      if (now - this.lastInboundFailLog >= 6e4) {
+        const msg = err2 instanceof Error ? err2.message : String(err2);
+        const extra = this.suppressedInboundFails > 0 ? ` (+${this.suppressedInboundFails} more since last report)` : "";
+        console.error(`[tide] inbound sync session ended: ${msg.slice(0, 300)}${extra}`);
+        this.lastInboundFailLog = now;
+        this.suppressedInboundFails = 0;
       } else {
-        t.suppressed++;
+        this.suppressedInboundFails++;
       }
     });
   }
-  inboundLogThrottle = {
-    refused: { last: 0, suppressed: 0 },
-    failed: { last: 0, suppressed: 0 }
-  };
+  lastInboundFailLog = 0;
+  suppressedInboundFails = 0;
   // ------------------------------------------------------------------
   // TD-006 / DC-16 §4: peer-state visibility + explicit recovery actions
   // ------------------------------------------------------------------

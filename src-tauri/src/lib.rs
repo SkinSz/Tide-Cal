@@ -1229,6 +1229,15 @@ fn open_options_window(app: &tauri::AppHandle) {
     }
 }
 
+/// Burger menu "Options…" (owner request 2026-11-14): same window as the
+/// tray entry, so the options are reachable without a tray (DC-19 §4.6).
+/// async: creating a window from a synchronous command runs on the main
+/// thread and deadlocks on Windows (Tauri docs, WebviewWindowBuilder).
+#[tauri::command]
+async fn open_options(app: tauri::AppHandle) {
+    open_options_window(&app);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // General.locale (DC-20, owner request 2026-09-03): WebKitGTK formats
@@ -1614,7 +1623,8 @@ pub fn run() {
             update_series_rule,
             update_occurrence,
             export_ics,
-            import_ics
+            import_ics,
+            open_options
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

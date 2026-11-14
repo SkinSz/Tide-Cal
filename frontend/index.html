@@ -21,9 +21,6 @@
       <button id="btn-next" title="Next">›</button>
       <h1 id="cal-label"></h1>
       <span class="spacer"></span>
-      <button id="btn-devices" title="Devices & sync">
-        <span class="devices-label">⇄ Devices</span>
-      </button>
       <button id="btn-conflicts" title="No unresolved conflicts">
         <span class="conflicts-label">⚠ Conflicts (0)</span>
       </button>
@@ -52,6 +49,13 @@
           Import .ics…
         </button>
         <button id="menu-export">Export .ics…</button>
+      </div>
+      <!-- Owner request 2026-11-14: Devices moved here from the toolbar;
+           Options reachable from the window, not only from the tray. -->
+      <div class="menu-section">
+        <h3>Tide</h3>
+        <button id="btn-devices" title="Pairing, paired devices and sync">Devices &amp; sync…</button>
+        <button id="menu-options" title="Open the Options window">Options…</button>
       </div>
     </nav>
 

@@ -428,7 +428,7 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 - **ID:** TD-030
 - **Title:** Conflict candidates render as JSON (`{"startMs":…,"endMs":…}`), field names as internal paths (`schedule`), devices as ids
 - **Priority:** 7/10 — HIGH (users cannot make an informed choice; owner report 2026-11-14)
-- **Status:** OPEN — design APPROVED (DC-14 Appendix A, 2026-11-14); implementation pending
+- **Status:** RESOLVED (2026-11-14, DC-14 Appendix A): conflicts show readable labels, locale- and clock-aware dates/times, only differing sub-fields, "Device <8 chars>" sides, side-named buttons, and raw data only in a collapsed "Technical details" section
 - **Relevant files:** `frontend/conflicts.ts` (`formatCandidateValue`, `describeConflict`, `describeCandidateSide`), `src/application/conflicts_ui.ts`
 
 ## TD-031 — Conflicts badge count goes stale

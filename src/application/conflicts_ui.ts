@@ -69,6 +69,13 @@ export interface CandidateView {
   hlc_timestamp: number;
 }
 
+/**
+ * DC-14 Appendix A (presentation only): what kind of entity a conflict is
+ * about. Not part of any RPC shape; the UI infers it (frontend/conflicts.ts
+ * inferEntityKind) so "title" can read "Calendar name" vs "Title".
+ */
+export type ConflictEntityKind = "event" | "series" | "calendar" | "unknown";
+
 export interface ConflictDetailView {
   conflict_id: string;
   entity_id: string;
@@ -221,20 +228,6 @@ export class ConflictsViewModel {
   }
 
   // ------------------------------------------------------------------
-  // Presentation accessor: entity display title for list rows.
-  // ------------------------------------------------------------------
-
-  /** Display title of an affected event entity, or null when unknown. */
-  entityTitle(entityId: string): string | null {
-    const row = this.db
-      .prepare<[string], { title: string }>(
-        "SELECT title FROM events WHERE event_id = ?",
-      )
-      .get(entityId);
-    return row?.title ?? null;
-  }
-
-  // ------------------------------------------------------------------
   // Detail view (§3.2) — pure read, no detection run, no mutation
   // ------------------------------------------------------------------
 
@@ -259,7 +252,11 @@ export class ConflictsViewModel {
         change !== undefined
           ? effectiveOf({ operation: change.operation, payload: p.payload })
           : { deleted: false, value: parseJson(p.payload) };
-      if (p.device_id === this.selfDeviceId) localChangeId = p.change_id;
+      // The FIRST self participant (participantsOf order) — the same one
+      // keep_mine / undo resolve to via localParticipant().
+      if (p.device_id === this.selfDeviceId && localChangeId === null) {
+        localChangeId = p.change_id;
+      }
       candidates.push({
         change_id: p.change_id,
         device_id: p.device_id,
@@ -269,15 +266,10 @@ export class ConflictsViewModel {
         hlc_timestamp: this.changeHlc(p.change_id),
       });
     }
-    const titleRow = this.db
-      .prepare<[string], { title: string }>(
-        "SELECT title FROM events WHERE event_id = ?",
-      )
-      .get(c.entity_id);
     return {
       conflict_id: conflictId,
       entity_id: c.entity_id,
-      entity_title: titleRow?.title ?? null,
+      entity_title: this.entityTitleOf(c.entity_id),
       field_path: c.field_path,
       status: c.status,
       candidates,
@@ -657,6 +649,35 @@ export class ConflictsViewModel {
       typeof parsed !== "object" ||
       Object.keys(parsed).length === 0;
     return { deleted, value: deleted ? undefined : parsed };
+  }
+
+  /**
+   * DC-14 Appendix A presentation lookup (pure read): display title of the
+   * conflict entity. Events -> their title; series (also occurrence
+   * overrides, keyed by series id) -> the base event's title; calendars ->
+   * their name. null when unknown (e.g. the entity was removed).
+   */
+  private entityTitleOf(entityId: string): string | null {
+    const ev = this.db
+      .prepare<[string], { title: string }>(
+        "SELECT title FROM events WHERE event_id = ?",
+      )
+      .get(entityId);
+    if (ev !== undefined) return ev.title;
+    const ser = this.db
+      .prepare<[string], { title: string | null }>(
+        `SELECT e.title AS title FROM series s
+         LEFT JOIN events e ON e.event_id = s.base_event_id
+         WHERE s.series_id = ?`,
+      )
+      .get(entityId);
+    if (ser !== undefined) return ser.title ?? null;
+    const cal = this.db
+      .prepare<[string], { title: string }>(
+        "SELECT title FROM calendars WHERE calendar_id = ?",
+      )
+      .get(entityId);
+    return cal?.title ?? null;
   }
 
   private changeHlc(changeId: string): number {
