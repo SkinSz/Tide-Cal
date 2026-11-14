@@ -1,6 +1,8 @@
 # TIDE DESIGN CONTRACT DC-10
 # Trust-Revocation Propagation
 Status: APPROVED by project owner (2026-08-25)
+AMENDED v2 by project owner (2026-11-14). See Appendix A; supersedes E3
+        where they conflict.
 
 OWNER Q&A AMENDMENTS (2026-08-25):
 - Returning-device latency confirmed bounded by first-contact sync, not
@@ -426,3 +428,16 @@ TRP-9  NO PLAINTEXT / SESSION-ONLY CHANNEL (static check): every
                                                           required
 - Sync session scheduling/triggers that determine
   relay forwarding times                                -> deferred #13/#14
+
+==================================================================
+APPENDIX A — v2 AMENDMENT (owner-approved 2026-11-14, via DC-27)
+==================================================================
+
+A.1  E3 narrowed (DC-27 P10, §4.13): a device_id is derived from its
+     identity key (DC-05 §2.2), so "same device_id, new handshake
+     keys" cannot occur. Re-pairing a REVOKED device_id is refused
+     locally; the removed device must start with a fresh identity
+     (new key, therefore new device_id) before it can be paired again.
+A.2  Revocation records carry a history cutoff (DC-27 P12, §4.14):
+     see DC-05 Appendix A. Record identity stays the §2.5 triple.
+

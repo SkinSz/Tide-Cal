@@ -1,6 +1,8 @@
 # TIDE DESIGN CONTRACT DC-07
 # Exact SQLite Schema
 Status: APPROVED by project owner (2026-08-25)
+AMENDED (schema additions) by project owner (2026-11-14). See Appendix
+        X (DC-27 P5, DC-28 P9).
 
 OWNER DECISION (2026-08-25), resolves the §12 encryption-at-rest open item:
 The calendar database MUST be encrypted at rest using SQLCipher-style
@@ -659,3 +661,17 @@ TR-11 IDENTITY PRIVACY: static assertion/test that the identity table
   housekeeping contract; until then quarantine grows monotonically.
 - Exact connection/pool configuration for Tauri (WAL checkpoint cadence,
   busy_timeout) -> implementation task constrained by section 2.4.
+
+==================================================================
+APPENDIX X — SCHEMA ADDITIONS (owner-approved 2026-11-14)
+==================================================================
+
+X.1  DC-27 P5: a persisted revocation ACK store, one row per
+     (peer device_id, revocation triple) a peer has acknowledged
+     (DC-10 §2.5: never reset except by local data loss). Additive
+     table; exact DDL fixed at implementation, with a migration test.
+X.2  DC-28 P9: peers.announced_name TEXT NULL holds the name a peer
+     announced for itself; peers.display_name keeps its meaning as the
+     local user's label (nickname). Migration moves existing values
+     into announced_name and clears id-prefix placeholders.
+

@@ -3,6 +3,9 @@
 Status: APPROVED by project owner (2026-08-25)
 AMENDED v2 by project owner (2026-11-14). See Appendix A; supersedes
         §3.2(a)/(b) presentation where they conflict.
+AMENDED v3 by project owner (2026-11-14): the A.4 short device id skips
+        the "d-" prefix ("Device 2ee25c62", as in the A.1 example), and is
+        superseded by DC-28 device names where one exists.
 
 OWNER AMENDMENTS (2026-08-25):
 - A dedicated "Conflicts" GUI button/entry point opening the conflict

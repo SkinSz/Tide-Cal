@@ -1,6 +1,8 @@
 # TIDE DESIGN CONTRACT DC-05
 # Device Identity, Pairing Ceremony, and Secure Transport
 Status: APPROVED by project owner (2026-08-25)
+AMENDED v2 by project owner (2026-11-14). See Appendix A; supersedes
+        §7.1/§7.3 where they conflict.
 Depends on: Architecture Spec v0.3 §15–§20, §25, §29, §30, §31; DC-01 §7;
             DC-02 §4
 Unblocks: sync protocol implementation, network/transport layer,
@@ -451,3 +453,21 @@ TR-13 Trust-store consistency: every stored peer entry satisfies
 - Platform keystorage adapters (Win/Android/Linux)   -> implementation,
   constrained by §2.3 preference order
 - UX copy for safety-number screens                  -> UI task
+
+==================================================================
+APPENDIX A — v2 AMENDMENT (owner-approved 2026-11-14, via DC-27)
+==================================================================
+
+A.1  §7.1: a signed revocation record gains the field
+     "revoked_after_seq": the highest seq of the revoked device that the
+     revoking device had applied when it signed. It is covered by the
+     signature.
+A.2  §7.3: a change record produced by a known-revoked device is
+     accepted when its seq <= revoked_after_seq (legitimate history,
+     including history relayed later) and rejected when seq >
+     revoked_after_seq. With several revocations of the same device, the
+     HIGHEST cutoff held applies.
+A.3  Rationale and test requirements: DC-27 §4.14, TR-8, TR-12. Older
+     builds' handling of the new signed field is an implementation-time
+     verification item (DC-27 V11).
+
