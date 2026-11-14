@@ -327,6 +327,25 @@ export class SyncManager {
           );
         }
       }
+      // DC-05 §3.3 / DC-10 canSynchronize: a session with NO expected peer
+      // (inbound, or Sync now to a typed address) must still prove the
+      // handshake key belongs to a TRUSTED paired device before any record
+      // is served or applied. Noise XX authenticates a key, not membership:
+      // without this, any never-paired (or revoked) device on the network
+      // could read the whole calendar and inject changes (probe 2026-11-14).
+      // Same placement as the D3 check above: inside the try, so the socket
+      // is always closed.
+      let trustedRemoteId = expectedDeviceId;
+      if (trustedRemoteId === undefined) {
+        trustedRemoteId = this.resolveDeviceIdByRemoteKey(remoteKeyBuf);
+        if (trustedRemoteId === undefined) {
+          throw new Error(
+            `unpaired peer refused: remote static key ` +
+              `${remoteKeyBuf.toString("hex").slice(0, 16)}… matches no trusted ` +
+              `paired device — session closed before any data was exchanged`,
+          );
+        }
+      }
       const engine = createSyncEngine({
         db: this.core.db,
         selfDeviceId: this.identity.deviceId,
@@ -347,9 +366,8 @@ export class SyncManager {
       // DC-21 D6: record the endpoint only AFTER a successful authenticated
       // session with a KNOWN expected peer (scheduler path). Inbound sessions
       // (no expectedDeviceId) resolve identity from the trust store by key.
-      const remoteDeviceId =
-        expectedDeviceId ?? this.resolveDeviceIdByRemoteKey(remoteKeyBuf);
-      if (remoteDeviceId !== undefined && session.dialEndpoint !== undefined) {
+      const remoteDeviceId = trustedRemoteId;
+      if (session.dialEndpoint !== undefined) {
         recordPeerEndpoint(
           this.core.db,
           remoteDeviceId,
@@ -365,7 +383,7 @@ export class SyncManager {
       notifyDataChanged(stats, this.onDataChanged);
       return {
         ...stats,
-        remote_device_id: remoteDeviceId ?? "unknown",
+        remote_device_id: remoteDeviceId,
       };
     } catch (err) {
       // pkg10 F3: session.done() is idempotent-safe — always run it when the
@@ -390,20 +408,47 @@ export class SyncManager {
       .all() as Array<{ device_id: string; public_key: Buffer }>;
     const remoteHex = remoteKeyBuf.toString("hex");
     for (const row of rows) {
-      const x25519 = Buffer.from(
-        ed25519ToX25519PublicKey(new Uint8Array(row.public_key)),
-      );
+      // One malformed stored key must not refuse every peer (review
+      // 2026-11-14): skip it; it can never match a handshake key anyway.
+      let x25519: Buffer;
+      try {
+        x25519 = Buffer.from(ed25519ToX25519PublicKey(new Uint8Array(row.public_key)));
+      } catch {
+        continue;
+      }
       if (x25519.toString("hex") === remoteHex) return row.device_id;
     }
     return undefined;
   }
 
   private onInbound(session: InboundSession): void {
-    // Inbound post-pairing sessions run an immediate sync session.
-    void this.runEngineSession(session).catch(() => {
-      /* fail-closed: logged by transport; session is dead */
+    // A peer dialed our sync listener: run one engine session (gated on the
+    // trust store inside runEngineSession).
+    void this.runEngineSession(session).catch((err: unknown) => {
+      // fail-closed: the session is dead. Logged with one throttle per
+      // KIND (one line per minute each), so a stranger hammering the port
+      // can neither bloat the log nor hide failures of paired peers.
+      const msg = err instanceof Error ? err.message : String(err);
+      const kind = msg.startsWith("unpaired peer refused") ? "refused" : "failed";
+      const t = this.inboundLogThrottle[kind];
+      const now = Date.now();
+      if (now - t.last >= 60_000) {
+        const extra = t.suppressed > 0 ? ` (+${t.suppressed} more since last report)` : "";
+        // Peer-influenced text: strip control characters (no log-line
+        // injection) and cap the length.
+        const clean = msg.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 300);
+        console.error(`[tide] inbound sync session ${kind}: ${clean}${extra}`);
+        t.last = now;
+        t.suppressed = 0;
+      } else {
+        t.suppressed++;
+      }
     });
   }
+  private readonly inboundLogThrottle = {
+    refused: { last: 0, suppressed: 0 },
+    failed: { last: 0, suppressed: 0 },
+  };
 
   // ------------------------------------------------------------------
   // TD-006 / DC-16 §4: peer-state visibility + explicit recovery actions

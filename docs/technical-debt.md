@@ -448,3 +448,9 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 - **Title:** Below a certain window size the layout stops scaling and scroll bars appear
 - **Priority:** 4/10 — MEDIUM
 - **Status:** MITIGATED (2026-11-14, owner: "whatever is easier for now"): main window minimum size = the 800×600 default (`tauri.conf.json` minWidth/minHeight), the size the layout is known to work at. A responsive layout remains possible later.
+
+## TD-036 — Sync sessions accepted any handshake key, not only paired devices
+- **ID:** TD-036
+- **Title:** Inbound sessions (and Sync now to a typed address) ran the sync engine for ANY Noise key; a never-paired device on the network could read the whole calendar and inject changes
+- **Priority:** 10/10 — CRITICAL (confidentiality + integrity; found 2026-11-14 while drafting DC-27)
+- **Status:** RESOLVED (2026-11-14): `SyncManager.runEngineSession` refuses, before any record is served or applied, a session whose remote static key matches no `status='trusted'` peer; refusals logged with a per-kind 1/min throttle. PROVEN by `tests/inbound_trust_gate.test.ts` (fails 2/3 without the fix, passes with it). Blind review: SAFE WITH CONCERNS (minors applied). Still owned by DC-27: nothing writes `peers.status='revoked'` yet, and the gate does not yet use `canSynchronize` / the device_id = hash(key) check.

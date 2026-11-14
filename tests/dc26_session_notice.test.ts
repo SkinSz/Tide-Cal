@@ -14,6 +14,7 @@ import { SyncManager } from "../src/persistence/bridges/sidecar_server.ts";
 import { createSyncEngine, type SyncTransport } from "../src/sync/sync_engine.ts";
 import { makeEntityMutator } from "../src/persistence/bridges/sync_service.ts";
 import { msgPipePair } from "./probes/sync_probe_helpers.ts";
+import { ed25519ToX25519PublicKey } from "../src/network/noise_transport.ts";
 
 let root: string;
 beforeEach(() => {
@@ -30,6 +31,16 @@ function dev(tag: string) {
   return { identity, core, dbPath: join(dir, "tide.db") };
 }
 type Dev = ReturnType<typeof dev>;
+/** Make `peer` a trusted paired device in `host`'s DB (inbound sessions
+ *  from unpaired keys are refused before any data flows). */
+function trust(host: Dev, peer: Dev): void {
+  host.core.db
+    .prepare(
+      "INSERT INTO peers (device_id, public_key, display_name, paired_at, status) VALUES (?, ?, ?, ?, 'trusted')",
+    )
+    .run(peer.identity.deviceId, Buffer.from(peer.identity.publicKey), "peer", Date.now());
+}
+const noiseKey = (d: Dev) => ed25519ToX25519PublicKey(d.identity.publicKey);
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const wrap = (raw: any): SyncTransport =>
   ({
@@ -48,7 +59,7 @@ async function session(a: Dev, mgrB: SyncManager): Promise<void> {
     mutateEntity: makeEntityMutator(),
   });
   const fake = {
-    raw: { remoteStaticKey: () => new Uint8Array(32) },
+    raw: { remoteStaticKey: () => noiseKey(a) },
     transport: wrap(rawB),
     done: () => rawB.close(),
     dialEndpoint: undefined,
@@ -70,6 +81,7 @@ describe("DC-26 notice at the session choke point", () => {
   test("TR-1/TR-2/V1: applied, conflicting, idle and failed sessions", { timeout: 60_000 }, async () => {
     const a = dev("A");
     const b = dev("B");
+    trust(b, a);
     const mgrB = new SyncManager(b.core, b.identity);
     const notices: Array<{ applied: number; events: number; conflicts: number }> = [];
     mgrB.onDataChanged = (applied) => {
@@ -111,7 +123,7 @@ describe("DC-26 notice at the session choke point", () => {
     let threw = false;
     await mgrB
       .runEngineSession({
-        raw: { remoteStaticKey: () => new Uint8Array(32) },
+        raw: { remoteStaticKey: () => noiseKey(a) },
         transport: wrap(rawB),
         done: () => rawB.close(),
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
