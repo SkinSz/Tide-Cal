@@ -37,7 +37,7 @@ import {
 import type { Database } from "better-sqlite3";
 // DC-09 full-state snapshot construction/application (M-7 trigger layer).
 import {
-  applySnapshot,
+  SnapshotStream,
   buildSnapshot,
   heldCutoffs,
   readAppliedUpto,
@@ -617,6 +617,10 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
       }
       stats.peerRevoked = true;
       return stats;
+    } finally {
+      // DC-09 §7.2 (TD-047): a stream the session did not finish writes
+      // nothing; drop its staged rows.
+      dropSnapshotStream();
     }
   }
 
@@ -964,8 +968,20 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
   }
 
   const stashed: SyncMessage[] = [];
-  /** DC-09 Appendix A.2: the current snapshot stream was declined. */
+  /**
+   * DC-09 Appendix A.2: the current snapshot stream was declined (or
+   * malformed); its remaining messages up to `final` are not applied either.
+   * Still needed with atomic apply: without it the tail of a declined stream
+   * would be staged as a new stream and committed on its own at `final`.
+   */
   let snapshotStreamDeclined = false;
+  /** DC-09 §5.1 (TD-047): the snapshot stream being staged in this session. */
+  let snapshotStream: SnapshotStream | undefined;
+
+  function dropSnapshotStream(): void {
+    snapshotStream?.discard();
+    snapshotStream = undefined;
+  }
 
   function drainStashed(): SyncMessage | null {
     return stashed.shift() ?? null;
@@ -1145,7 +1161,10 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     }
   }
 
-  /** DC-09 §5: apply a received snapshot through the transactional pipeline. */
+  /**
+   * DC-09 §5.1 / §7.2 (TD-047): stage each FULL_STATE_SNAPSHOT message of a
+   * stream; at `final` apply the whole stream as one unit (one transaction).
+   */
   function applyIncomingSnapshot(
     msg: Extract<SyncMessage, { type: "FULL_STATE_SNAPSHOT" }>,
     stats: SessionStats,
@@ -1158,21 +1177,26 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
       if (msg.final) snapshotStreamDeclined = false;
       return;
     }
-    const result = applySnapshot(
-      deps.db,
-      {
-        snapshot_clock: msg.snapshot_clock,
-        applied_upto: msg.applied_upto,
-        entities: msg.entities,
-        tombstones: msg.tombstones ?? [],
-      },
-      holder.knowledge,
-    );
-    if (result.declined) {
-      stats.snapshotsDeclined = (stats.snapshotsDeclined ?? 0) + 1;
+    snapshotStream ??= new SnapshotStream(deps.db);
+    const outcome = snapshotStream.add({
+      snapshot_clock: msg.snapshot_clock,
+      applied_upto: msg.applied_upto,
+      entities: msg.entities,
+      tombstones: msg.tombstones ?? [],
+    });
+    if (outcome !== "staged") {
+      // add() discarded everything staged so far: nothing is written.
+      snapshotStream = undefined;
+      if (outcome === "declined") {
+        stats.snapshotsDeclined = (stats.snapshotsDeclined ?? 0) + 1;
+      }
       snapshotStreamDeclined = msg.final !== true;
       return;
     }
+    if (msg.final !== true) return;
+    const stream = snapshotStream;
+    snapshotStream = undefined;
+    const result = stream.commit(holder.knowledge);
     stats.receivedApplied += result.appliedEntities;
     stats.snapshotDeletions =
       (stats.snapshotDeletions ?? 0) + result.absenceTombstones + result.inheritedTombstones;

@@ -1827,6 +1827,80 @@ describe("TD-041 snapshot vs revoked-producer cutoff", () => {
     expect(titles(R)).toContain("W-BEFORE");
   });
 
+  /** One snapshot as a two-message stream (any sender batch size may split it). */
+  function twoMessages(snap: Snapshot): SyncMessage[] {
+    const half = Math.ceil(snap.entities.length / 2);
+    const base = { v: 1, type: "FULL_STATE_SNAPSHOT", snapshot_clock: snap.snapshot_clock, applied_upto: snap.applied_upto } as const;
+    return [
+      { ...base, entities: snap.entities.slice(0, half), tombstones: snap.tombstones, final: false },
+      { ...base, entities: snap.entities.slice(half), tombstones: [], final: true },
+    ] as SyncMessage[];
+  }
+
+  /** L's revocation record for W as the peer relays it (DC-08 §3.7). */
+  function recordMessage(L: Dev): SyncMessage {
+    const rec = storedRecord(L);
+    return {
+      v: 1,
+      type: "REVOCATION_RECORDS",
+      records: [{ record: rec.record, signature_hex: Buffer.from(rec.signature).toString("hex") }],
+    };
+  }
+
+  test("TD-047 a cutoff that arrives mid-stream from a tainted sender declines the whole stream: nothing written, message 1 included", { timeout: 60_000 }, async () => {
+    const { L, W, P, cutoff } = await setup();
+    const R = makeDev("R");
+    addPeer(R, L); // the record's signer
+    addPeer(R, P); // the session peer that relays it
+    const snap = snapshotOf(P);
+    expect(snap.applied_upto![W.identity.deviceId]).toBeGreaterThan(cutoff);
+    const [m1, m2] = twoMessages(snap);
+    expect((m1 as { entities: unknown[] }).entities.length).toBeGreaterThan(0);
+    const versionsBefore = JSON.stringify(R.core.db.prepare("SELECT * FROM entity_versions ORDER BY 1").all());
+    const t = scriptedTransport();
+    const run = lEngine(R, P).runSession(t.transport);
+    t.push({ v: 1, type: "HELLO", device_clock: {} });
+    t.push(m1!); // R holds no cutoff yet: accepted for staging
+    t.push(recordMessage(L)); // now R holds C for W
+    t.push(m2!); // declined: so is the stream as a whole
+    t.push({ v: 1, type: "CHANGES_ACK", applied_upto: {} });
+    t.push(null);
+    const stats = await run;
+    expect(isKnownRevoked(R.core.db, W.identity.deviceId)).toBe(true);
+    expect(stats.snapshotsDeclined).toBe(1);
+    expect(titles(R)).toEqual([]);
+    expect(JSON.stringify(R.core.db.prepare("SELECT * FROM entity_versions ORDER BY 1").all())).toBe(versionsBefore);
+    expect(count(R, "SELECT COUNT(*) AS n FROM entities_tombstones")).toBe(0);
+    expect(appliedThrough(R, W.identity.deviceId)).toBeUndefined();
+    expect(appliedThrough(R, P.identity.deviceId)).toBeUndefined();
+  });
+
+  test("TD-047 a cutoff that arrives mid-stream from a clean sender: the whole stream applies with the clamp (DC-09 A.3), message 1 included", { timeout: 60_000 }, async () => {
+    const { L, W, P, cutoff, snap } = await setupUntainted();
+    const R = makeDev("R");
+    addPeer(R, L);
+    const [m1, m2] = twoMessages(snap);
+    const t = scriptedTransport();
+    const run = lEngine(R, L).runSession(t.transport);
+    t.push({ v: 1, type: "HELLO", device_clock: {} });
+    t.push(m1!);
+    t.push(recordMessage(L));
+    t.push(m2!);
+    t.push({ v: 1, type: "CHANGES_ACK", applied_upto: {} });
+    t.push(null);
+    const stats = await run;
+    expect(isKnownRevoked(R.core.db, W.identity.deviceId)).toBe(true);
+    expect(stats.snapshotsDeclined ?? 0).toBe(0);
+    expect(titles(R)).toContain("W-BEFORE");
+    expect(titles(R)).toContain("P-ONLY");
+    expect(titles(R)).not.toContain("W-AFTER");
+    // One unit: the clamp holds for the stream as a whole, not only for the
+    // messages that arrived after the record.
+    expect(snap.snapshot_clock[W.identity.deviceId]).toBeGreaterThan(cutoff);
+    expect(appliedThrough(R, W.identity.deviceId)).toBe(cutoff);
+    expect(appliedThrough(R, P.identity.deviceId)).toBe(snap.snapshot_clock[P.identity.deviceId]);
+  });
+
   test("TR-16 a declined one-message stream (final) does not latch: the next stream in the same session is judged afresh", { timeout: 60_000 }, async () => {
     const { L, snap } = await setupUntainted();
     const R = await recordHolder(L);

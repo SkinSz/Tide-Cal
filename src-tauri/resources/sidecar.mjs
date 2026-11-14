@@ -7970,82 +7970,207 @@ function declaredFrontier(declared, producer) {
   if (!Object.prototype.hasOwnProperty.call(declared, producer)) return 0;
   return declared[producer] ?? 0;
 }
-function applySnapshot(db, snapshot, knowledge) {
-  const result = {
-    appliedEntities: 0,
-    inheritedTombstones: 0,
-    survivedLocal: 0,
-    absenceTombstones: 0,
-    conflictPreserved: 0,
-    declined: false
-  };
-  const cutoffs = heldCutoffs(db);
-  if (refusesDeclaredFrontier(snapshot.applied_upto, cutoffs)) {
-    result.declined = true;
-    return result;
-  }
-  const insertTombstone = db.prepare(`
-    INSERT INTO entities_tombstones (entity_id, entity_type, producer_device_id, seq, causality_clock, deleted_at_hlc)
-    VALUES (@entity_id, @entity_type, @producer_device_id, @seq, @causality_clock, @deleted_at_hlc)
-    ON CONFLICT(entity_id, producer_device_id, seq) DO NOTHING`);
-  const deleteEvent = db.prepare("DELETE FROM events WHERE event_id = ?");
-  const tx = db.transaction(() => {
+var COMMIT_PAGE = 256;
+var nextStreamId = 1;
+var SnapshotStream = class {
+  constructor(db) {
+    this.db = db;
     db.exec(`
-      CREATE TEMP TABLE IF NOT EXISTS stage_entities (
-        entity_id TEXT PRIMARY KEY, entity_type TEXT, data TEXT)`);
-    for (const entry of snapshot.entities) {
-      const localVersion = localVersionClock(db, entry.entity_id);
-      if (!dominates(snapshot.snapshot_clock, localVersion)) {
-        result.survivedLocal++;
-        continue;
-      }
-      if (hasUnresolvedConflict(db, entry.entity_id)) {
-        result.conflictPreserved++;
-        continue;
-      }
-      if (localRowMatchesEntry(db, entry)) {
-        continue;
-      }
-      db.prepare(
-        `INSERT INTO temp.stage_entities (entity_id, entity_type, data) VALUES (?, ?, ?)
-         ON CONFLICT(entity_id) DO UPDATE SET data = excluded.data`
-      ).run(entry.entity_id, entry.entity_type, entry.data);
-      recordSnapshotEntityVersion(
-        db,
-        entry.entity_id,
-        entry.entity_type,
-        entry.causality_clock,
-        entry.producer_device_id,
-        entry.producer_seq
-      );
-      result.appliedEntities++;
+      CREATE TEMP TABLE IF NOT EXISTS snapshot_stream_entities (
+        stream_id INTEGER NOT NULL, entity_id TEXT NOT NULL,
+        entity_type TEXT NOT NULL, data TEXT NOT NULL,
+        producer_device_id TEXT NOT NULL, producer_seq INTEGER NOT NULL,
+        causality_clock TEXT NOT NULL,
+        PRIMARY KEY (stream_id, entity_id));
+      CREATE TEMP TABLE IF NOT EXISTS snapshot_stream_tombstones (
+        stream_id INTEGER NOT NULL, entity_id TEXT NOT NULL,
+        entity_type TEXT NOT NULL, producer_device_id TEXT NOT NULL,
+        seq INTEGER NOT NULL, causality_clock TEXT NOT NULL,
+        deleted_at_hlc INTEGER NOT NULL,
+        PRIMARY KEY (stream_id, entity_id, producer_device_id, seq))`);
+  }
+  db;
+  id = nextStreamId++;
+  head;
+  /** Check and stage one message of the stream. */
+  add(snapshot) {
+    if (refusesDeclaredFrontier(snapshot.applied_upto, heldCutoffs(this.db))) {
+      this.discard();
+      return "declined";
     }
-    const staged = db.prepare(
-      "SELECT entity_id, entity_type, data FROM stage_entities"
-    ).all();
-    const upsertEvent = db.prepare(`
-      INSERT INTO events (event_id, calendar_id, title, description, all_day,
-        start_date, end_date, start_wall, end_wall, tz_id, utc_start_ms,
-        utc_end_ms, created_hlc, updated_hlc)
-      VALUES (@event_id, @calendar_id, @title, @description, @all_day,
-        @start_date, @end_date, @start_wall, @end_wall, @tz_id, @utc_start_ms,
-        @utc_end_ms, @created_hlc, @updated_hlc)
-      ON CONFLICT(event_id) DO UPDATE SET
-        title=excluded.title, description=excluded.description,
-        all_day=excluded.all_day, start_date=excluded.start_date,
-        end_date=excluded.end_date, start_wall=excluded.start_wall,
-        end_wall=excluded.end_wall, tz_id=excluded.tz_id,
-        utc_start_ms=excluded.utc_start_ms, utc_end_ms=excluded.utc_end_ms,
-        updated_hlc=excluded.updated_hlc`);
-    const upsertCalendar = db.prepare(`
-      INSERT INTO calendars (calendar_id, title, color, created_hlc, updated_hlc)
-      VALUES (@calendar_id, @title, @color, @created_hlc, @updated_hlc)
-      ON CONFLICT(calendar_id) DO UPDATE SET
-        title=excluded.title, color=excluded.color,
-        updated_hlc=MAX(calendars.updated_hlc, excluded.updated_hlc)`);
-    for (const s of staged) {
-      if (s.entity_type === "calendar") {
-        const data = JSON.parse(s.data);
+    const clockKey = canonicalJson(snapshot.snapshot_clock);
+    const declaredKey = snapshot.applied_upto === void 0 ? "" : canonicalJson(snapshot.applied_upto);
+    if (this.head === void 0) {
+      this.head = {
+        clockKey,
+        declaredKey,
+        snapshot_clock: snapshot.snapshot_clock,
+        applied_upto: snapshot.applied_upto
+      };
+    } else if (this.head.clockKey !== clockKey || this.head.declaredKey !== declaredKey) {
+      this.discard();
+      return "malformed";
+    }
+    const putEntity = this.db.prepare(`
+      INSERT INTO temp.snapshot_stream_entities (stream_id, entity_id, entity_type,
+        data, producer_device_id, producer_seq, causality_clock)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(stream_id, entity_id) DO UPDATE SET
+        entity_type = excluded.entity_type, data = excluded.data,
+        producer_device_id = excluded.producer_device_id,
+        producer_seq = excluded.producer_seq,
+        causality_clock = excluded.causality_clock`);
+    const putTombstone = this.db.prepare(`
+      INSERT INTO temp.snapshot_stream_tombstones (stream_id, entity_id, entity_type,
+        producer_device_id, seq, causality_clock, deleted_at_hlc)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(stream_id, entity_id, producer_device_id, seq) DO NOTHING`);
+    this.db.transaction(() => {
+      for (const e of snapshot.entities) {
+        putEntity.run(
+          this.id,
+          e.entity_id,
+          e.entity_type,
+          e.data,
+          e.producer_device_id,
+          e.producer_seq,
+          JSON.stringify(e.causality_clock)
+        );
+      }
+      for (const t of snapshot.tombstones) {
+        putTombstone.run(
+          this.id,
+          t.entity_id,
+          t.entity_type,
+          t.producer_device_id,
+          t.seq,
+          JSON.stringify(t.causality_clock),
+          t.deleted_at_hlc
+        );
+      }
+    })();
+    return "staged";
+  }
+  /** Drop this stream's staged rows (never touches live tables). */
+  discard() {
+    this.db.prepare("DELETE FROM temp.snapshot_stream_entities WHERE stream_id = ?").run(this.id);
+    this.db.prepare("DELETE FROM temp.snapshot_stream_tombstones WHERE stream_id = ?").run(this.id);
+  }
+  /** Apply the whole staged stream as one unit (DC-09 §5.1), then discard it. */
+  commit(knowledge) {
+    try {
+      return this.commitStaged(knowledge);
+    } finally {
+      this.head = void 0;
+      this.discard();
+    }
+  }
+  /** Staged entity rows in pages (keyset on rowid; bounded memory). */
+  *stagedEntities() {
+    const page = this.db.prepare(`SELECT rowid, entity_id, entity_type, data, producer_device_id, producer_seq,
+         causality_clock FROM temp.snapshot_stream_entities
+       WHERE stream_id = ? AND rowid > ? ORDER BY rowid LIMIT ?`);
+    let after = 0;
+    for (; ; ) {
+      const rows = page.all(this.id, after, COMMIT_PAGE);
+      if (rows.length === 0) return;
+      for (const r of rows) {
+        yield {
+          entity_id: r.entity_id,
+          entity_type: r.entity_type,
+          data: r.data,
+          producer_device_id: r.producer_device_id,
+          producer_seq: r.producer_seq,
+          causality_clock: JSON.parse(r.causality_clock)
+        };
+      }
+      after = rows[rows.length - 1].rowid;
+    }
+  }
+  commitStaged(knowledge) {
+    const db = this.db;
+    const result = {
+      appliedEntities: 0,
+      inheritedTombstones: 0,
+      survivedLocal: 0,
+      absenceTombstones: 0,
+      conflictPreserved: 0,
+      declined: false
+    };
+    const head = this.head;
+    if (head === void 0) return result;
+    const snapshotClock = head.snapshot_clock;
+    const insertTombstone = db.prepare(`
+      INSERT INTO entities_tombstones (entity_id, entity_type, producer_device_id, seq, causality_clock, deleted_at_hlc)
+      VALUES (@entity_id, @entity_type, @producer_device_id, @seq, @causality_clock, @deleted_at_hlc)
+      ON CONFLICT(entity_id, producer_device_id, seq) DO NOTHING`);
+    const deleteEvent = db.prepare("DELETE FROM events WHERE event_id = ?");
+    const advances = [];
+    const tx = db.transaction(() => {
+      const cutoffs = heldCutoffs(db);
+      db.exec(`
+        CREATE TEMP TABLE IF NOT EXISTS stage_entities (
+          entity_id TEXT PRIMARY KEY, entity_type TEXT, data TEXT)`);
+      for (const entry of this.stagedEntities()) {
+        const localVersion = localVersionClock(db, entry.entity_id);
+        if (!dominates(snapshotClock, localVersion)) {
+          result.survivedLocal++;
+          continue;
+        }
+        if (hasUnresolvedConflict(db, entry.entity_id)) {
+          result.conflictPreserved++;
+          continue;
+        }
+        if (localRowMatchesEntry(db, entry)) {
+          continue;
+        }
+        db.prepare(
+          `INSERT INTO temp.stage_entities (entity_id, entity_type, data) VALUES (?, ?, ?)
+           ON CONFLICT(entity_id) DO UPDATE SET data = excluded.data`
+        ).run(entry.entity_id, entry.entity_type, entry.data);
+        recordSnapshotEntityVersion(
+          db,
+          entry.entity_id,
+          entry.entity_type,
+          entry.causality_clock,
+          entry.producer_device_id,
+          entry.producer_seq
+        );
+        result.appliedEntities++;
+      }
+      const stagedPage = db.prepare(`SELECT rowid, data FROM temp.stage_entities
+         WHERE entity_type = ? AND rowid > ? ORDER BY rowid LIMIT ?`);
+      const eachStaged = (type, apply) => {
+        let after = 0;
+        for (; ; ) {
+          const rows = stagedPage.all(type, after, COMMIT_PAGE);
+          if (rows.length === 0) return;
+          for (const r of rows) apply(r.data);
+          after = rows[rows.length - 1].rowid;
+        }
+      };
+      const upsertEvent = db.prepare(`
+        INSERT INTO events (event_id, calendar_id, title, description, all_day,
+          start_date, end_date, start_wall, end_wall, tz_id, utc_start_ms,
+          utc_end_ms, created_hlc, updated_hlc)
+        VALUES (@event_id, @calendar_id, @title, @description, @all_day,
+          @start_date, @end_date, @start_wall, @end_wall, @tz_id, @utc_start_ms,
+          @utc_end_ms, @created_hlc, @updated_hlc)
+        ON CONFLICT(event_id) DO UPDATE SET
+          title=excluded.title, description=excluded.description,
+          all_day=excluded.all_day, start_date=excluded.start_date,
+          end_date=excluded.end_date, start_wall=excluded.start_wall,
+          end_wall=excluded.end_wall, tz_id=excluded.tz_id,
+          utc_start_ms=excluded.utc_start_ms, utc_end_ms=excluded.utc_end_ms,
+          updated_hlc=excluded.updated_hlc`);
+      const upsertCalendar = db.prepare(`
+        INSERT INTO calendars (calendar_id, title, color, created_hlc, updated_hlc)
+        VALUES (@calendar_id, @title, @color, @created_hlc, @updated_hlc)
+        ON CONFLICT(calendar_id) DO UPDATE SET
+          title=excluded.title, color=excluded.color,
+          updated_hlc=MAX(calendars.updated_hlc, excluded.updated_hlc)`);
+      eachStaged("calendar", (raw) => {
+        const data = JSON.parse(raw);
         upsertCalendar.run({
           calendar_id: data.calendar_id,
           title: data.title ?? "",
@@ -8053,75 +8178,77 @@ function applySnapshot(db, snapshot, knowledge) {
           created_hlc: data.created_hlc ?? 0,
           updated_hlc: data.updated_hlc ?? 0
         });
-      }
-    }
-    for (const s of staged) {
-      if (s.entity_type === "event") {
-        const data = JSON.parse(s.data);
-        upsertEvent.run(data);
-      }
-    }
-    db.exec("DELETE FROM temp.stage_entities");
-    const snapshotIds = new Set(snapshot.entities.map((e) => e.entity_id));
-    const localEvents = db.prepare("SELECT event_id FROM events").all();
-    for (const le of localEvents) {
-      if (snapshotIds.has(le.event_id)) continue;
-      if (hasUnresolvedConflict(db, le.event_id)) {
-        result.conflictPreserved++;
-        continue;
-      }
-      const localVersion = localVersionClock(db, le.event_id);
-      if (!dominates(snapshot.snapshot_clock, localVersion)) continue;
-      if (Object.keys(localVersion).length === 0) continue;
-      const winner = latestProducer(db, le.event_id);
-      insertTombstone.run({
-        entity_id: le.event_id,
-        entity_type: "event",
-        producer_device_id: winner?.device_id ?? "_absence",
-        seq: winner?.local_seq ?? 0,
-        causality_clock: JSON.stringify(
-          merge(localVersion, snapshot.snapshot_clock)
-        ),
-        deleted_at_hlc: Date.now()
       });
-      deleteEvent.run(le.event_id);
-      clearEntityVersion(db, le.event_id);
-      result.absenceTombstones++;
-    }
-    for (const t of snapshot.tombstones) {
-      insertTombstone.run({
-        ...t,
-        causality_clock: JSON.stringify(t.causality_clock)
+      eachStaged("event", (raw) => {
+        upsertEvent.run(JSON.parse(raw));
       });
-      result.inheritedTombstones++;
-    }
-    for (const [d, raw] of Object.entries(snapshot.snapshot_clock)) {
-      const cutoff = cutoffs.get(d);
-      const s = cutoff === void 0 ? raw : Math.min(raw, cutoff, declaredFrontier(snapshot.applied_upto, d));
-      const current = db.prepare("SELECT applied_through FROM applied_upto WHERE producer_device_id = ?").get(d)?.applied_through ?? 0;
-      db.prepare(`
-        INSERT INTO applied_upto (producer_device_id, applied_through) VALUES (?, ?)
-        ON CONFLICT(producer_device_id) DO UPDATE SET applied_through = excluded.applied_through`).run(
-        d,
-        Math.max(current, s)
-      );
-      db.prepare(
-        "DELETE FROM pending_changes WHERE device_id = ? AND local_seq <= ?"
-      ).run(d, Math.max(current, s));
-      db.prepare(
-        "DELETE FROM skipped_seqs WHERE producer_device_id = ? AND local_seq <= ?"
-      ).run(d, Math.max(current, s));
-      advanceAppliedIfContiguous(knowledge, d, s);
-    }
-    for (const [d, s] of Object.entries(snapshot.snapshot_clock)) {
-      db.prepare(`
-        INSERT INTO device_clock (peer_device_id, max_seq) VALUES (?, ?)
-        ON CONFLICT(peer_device_id) DO UPDATE SET max_seq = MAX(max_seq, excluded.max_seq)`).run(d, s);
-    }
-  });
-  tx();
-  return result;
-}
+      db.exec("DELETE FROM temp.stage_entities");
+      const absentEvents = db.prepare(
+        `SELECT event_id FROM events WHERE event_id NOT IN (
+             SELECT entity_id FROM temp.snapshot_stream_entities WHERE stream_id = ?)`
+      ).all(this.id);
+      for (const le of absentEvents) {
+        if (hasUnresolvedConflict(db, le.event_id)) {
+          result.conflictPreserved++;
+          continue;
+        }
+        const localVersion = localVersionClock(db, le.event_id);
+        if (!dominates(snapshotClock, localVersion)) continue;
+        if (Object.keys(localVersion).length === 0) continue;
+        const winner = latestProducer(db, le.event_id);
+        insertTombstone.run({
+          entity_id: le.event_id,
+          entity_type: "event",
+          producer_device_id: winner?.device_id ?? "_absence",
+          seq: winner?.local_seq ?? 0,
+          causality_clock: JSON.stringify(merge(localVersion, snapshotClock)),
+          deleted_at_hlc: Date.now()
+        });
+        deleteEvent.run(le.event_id);
+        clearEntityVersion(db, le.event_id);
+        result.absenceTombstones++;
+      }
+      const tombPage = db.prepare(`SELECT rowid, entity_id, entity_type, producer_device_id, seq, causality_clock,
+           deleted_at_hlc FROM temp.snapshot_stream_tombstones
+         WHERE stream_id = ? AND rowid > ? ORDER BY rowid LIMIT ?`);
+      for (let after = 0; ; ) {
+        const rows = tombPage.all(this.id, after, COMMIT_PAGE);
+        if (rows.length === 0) break;
+        for (const { rowid: _rowid, ...t } of rows) {
+          insertTombstone.run(t);
+          result.inheritedTombstones++;
+        }
+        after = rows[rows.length - 1].rowid;
+      }
+      for (const [d, raw] of Object.entries(snapshotClock)) {
+        const cutoff = cutoffs.get(d);
+        const s = cutoff === void 0 ? raw : Math.min(raw, cutoff, declaredFrontier(head.applied_upto, d));
+        const current = db.prepare("SELECT applied_through FROM applied_upto WHERE producer_device_id = ?").get(d)?.applied_through ?? 0;
+        db.prepare(`
+          INSERT INTO applied_upto (producer_device_id, applied_through) VALUES (?, ?)
+          ON CONFLICT(producer_device_id) DO UPDATE SET applied_through = excluded.applied_through`).run(
+          d,
+          Math.max(current, s)
+        );
+        db.prepare(
+          "DELETE FROM pending_changes WHERE device_id = ? AND local_seq <= ?"
+        ).run(d, Math.max(current, s));
+        db.prepare(
+          "DELETE FROM skipped_seqs WHERE producer_device_id = ? AND local_seq <= ?"
+        ).run(d, Math.max(current, s));
+        advances.push([d, s]);
+      }
+      for (const [d, s] of Object.entries(snapshotClock)) {
+        db.prepare(`
+          INSERT INTO device_clock (peer_device_id, max_seq) VALUES (?, ?)
+          ON CONFLICT(peer_device_id) DO UPDATE SET max_seq = MAX(max_seq, excluded.max_seq)`).run(d, s);
+      }
+    });
+    tx();
+    for (const [d, s] of advances) advanceAppliedIfContiguous(knowledge, d, s);
+    return result;
+  }
+};
 function advanceAppliedIfContiguous(k, deviceId, target) {
   const current = k.appliedUpto[deviceId] ?? 0;
   if (target > current) {
@@ -8413,6 +8540,8 @@ function createSyncEngine(deps) {
       }
       stats.peerRevoked = true;
       return stats;
+    } finally {
+      dropSnapshotStream();
     }
   }
   async function runSessionInner(transport, stats) {
@@ -8608,6 +8737,11 @@ function createSyncEngine(deps) {
   }
   const stashed = [];
   let snapshotStreamDeclined = false;
+  let snapshotStream;
+  function dropSnapshotStream() {
+    snapshotStream?.discard();
+    snapshotStream = void 0;
+  }
   function drainStashed() {
     return stashed.shift() ?? null;
   }
@@ -8735,21 +8869,25 @@ function createSyncEngine(deps) {
       if (msg.final) snapshotStreamDeclined = false;
       return;
     }
-    const result = applySnapshot(
-      deps.db,
-      {
-        snapshot_clock: msg.snapshot_clock,
-        applied_upto: msg.applied_upto,
-        entities: msg.entities,
-        tombstones: msg.tombstones ?? []
-      },
-      holder.knowledge
-    );
-    if (result.declined) {
-      stats.snapshotsDeclined = (stats.snapshotsDeclined ?? 0) + 1;
+    snapshotStream ??= new SnapshotStream(deps.db);
+    const outcome = snapshotStream.add({
+      snapshot_clock: msg.snapshot_clock,
+      applied_upto: msg.applied_upto,
+      entities: msg.entities,
+      tombstones: msg.tombstones ?? []
+    });
+    if (outcome !== "staged") {
+      snapshotStream = void 0;
+      if (outcome === "declined") {
+        stats.snapshotsDeclined = (stats.snapshotsDeclined ?? 0) + 1;
+      }
       snapshotStreamDeclined = msg.final !== true;
       return;
     }
+    if (msg.final !== true) return;
+    const stream = snapshotStream;
+    snapshotStream = void 0;
+    const result = stream.commit(holder.knowledge);
     stats.receivedApplied += result.appliedEntities;
     stats.snapshotDeletions = (stats.snapshotDeletions ?? 0) + result.absenceTombstones + result.inheritedTombstones;
   }
