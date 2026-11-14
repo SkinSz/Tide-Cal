@@ -28,6 +28,12 @@ export interface RevocationRecord {
   /** Hybrid logical clock ms at creation — identity metadata ONLY. Never compared against wall-clock time anywhere in propagation (DC-10 §2.4 TTL-free). */
   revoked_at_hlc: number;
   reason?: string;
+  /**
+   * DC-05 Appendix A.1 (DC-27 P12): highest seq of the revoked device the
+   * revoker had applied when it signed. Covered by the signature. Optional
+   * so records signed without it still verify byte-for-byte.
+   */
+  revoked_after_seq?: number;
 }
 
 /** A record plus its detached Ed25519 signature over canonical bytes. */
@@ -104,6 +110,14 @@ export function validateRevocationRecord(r: unknown): RevocationRecord {
   if (rec.reason !== undefined && !isNonEmptyString(rec.reason)) {
     throw new RevocationError("missing_field", "invalid reason");
   }
+  if (
+    rec.revoked_after_seq !== undefined &&
+    (typeof rec.revoked_after_seq !== "number" ||
+      !Number.isInteger(rec.revoked_after_seq) ||
+      rec.revoked_after_seq < 0)
+  ) {
+    throw new RevocationError("bad_hlc", "revoked_after_seq must be a non-negative integer");
+  }
   const out: RevocationRecord = {
     v: 1,
     revoked_device_id: rec.revoked_device_id as string,
@@ -111,6 +125,9 @@ export function validateRevocationRecord(r: unknown): RevocationRecord {
     revoked_at_hlc: rec.revoked_at_hlc as number,
   };
   if (rec.reason !== undefined) out.reason = rec.reason as string;
+  if (rec.revoked_after_seq !== undefined) {
+    out.revoked_after_seq = rec.revoked_after_seq as number;
+  }
   return out;
 }
 
@@ -322,6 +339,14 @@ export class RevocationQueue {
   hasAck(peer: string, triple: RevocationTriple): boolean {
     return this.acks.get(peer)?.has(revocationTripleKey(triple)) ?? false;
   }
+}
+
+/**
+ * DC-27 P9: the short device id used in logs and the UI (same form as the
+ * frontend's truncatedDeviceId: first 16 characters + ellipsis).
+ */
+export function shortDeviceId(deviceId: string): string {
+  return deviceId.length > 16 ? deviceId.slice(0, 16) + "\u2026" : deviceId;
 }
 
 export type SyncDecision = "ALLOW" | "DENY_UNPAIRED" | "DENY_REVOKED" | "DENY_KEY_MISMATCH";

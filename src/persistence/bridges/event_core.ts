@@ -351,6 +351,14 @@ export class EventCore {
   private readonly deviceId: string;
   private readonly hlc = new HlcTicker();
 
+  /**
+   * DC-27 V3: the ONE hybrid logical clock of this process, the same ticker
+   * that stamps local change records (revoked_at_hlc must come from it).
+   */
+  hlcNow(): number {
+    return this.hlc.now();
+  }
+
   constructor(dbPath: string, deviceId?: string) {
     this.dbPath = dbPath;
     this.db = openDatabase({ path: dbPath });

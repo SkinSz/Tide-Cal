@@ -108,6 +108,16 @@ import {
   ConflictsViewModel,
   type ResolutionOption,
 } from "../../application/conflicts_ui.ts";
+// DC-27: unpair (local revocation), persisted record/ACK store, trust gate.
+import {
+  isKnownRevoked,
+  makeDbRevocationChannel,
+  unpairLocal,
+  UnpairError,
+  listRemovedDevices,
+} from "../../security/revocation_store.ts";
+import { canSynchronize, shortDeviceId, type TrustStoreEntry } from "../../security/revocation.ts";
+import { PeerClosedBeforeHelloError } from "../../sync/sync_engine.ts";
 // TD-006 / DC-16: Tier-1 tracker (in-memory) + state surface for the UI.
 import {
   PeerMisbehaviorTracker,
@@ -154,6 +164,21 @@ export function notifyDataChanged(
 }
 
 /**
+ * DC-27 §4.5: a session refused at the trust gate (after the handshake,
+ * before any sync message). The message is the §4.12 log line itself:
+ * decision + short id only (no keys, no full ids).
+ */
+export class SyncRefusedError extends Error {
+  constructor(
+    readonly decision: string,
+    deviceId?: string,
+  ) {
+    super(`sync refused: ${decision}${deviceId !== undefined ? " " + shortDeviceId(deviceId) : ""}`);
+    this.name = "SyncRefusedError";
+  }
+}
+
+/**
  * Sync runtime state for one sidecar process: identity + optional listener.
  * Data dir defaults to beside the DB (identity key must persist per install).
  */
@@ -173,6 +198,20 @@ export class SyncManager {
    * unset in tests unless a test installs a spy.
    */
   onDataChanged: ((applied: number) => void) | undefined;
+  /**
+   * DC-27 §4.6 urgent push (DC-10 §2.3): started once after a local unpair
+   * commits. Installed by makeSyncDispatcher (it owns endpoint resolution);
+   * tests may install a spy. Fire-and-forget: never awaited by the RPC.
+   */
+  urgentPush: (() => void) | undefined;
+  /** DC-27 §4.3: live engine sessions per remote device (to end on unpair). */
+  private readonly liveSessions = new Map<string, Set<InboundSession>>();
+  /**
+   * DC-27 P6/V8: peers whose LAST session attempt ended "closed after the
+   * handshake, before HELLO" (they refused us at their trust gate). In
+   * memory only: it is a hint, cleared by the next successful session.
+   */
+  private readonly refusedBy = new Set<string>();
 
   constructor(
     private readonly core: EventCore,
@@ -303,7 +342,12 @@ export class SyncManager {
    * a paired peer — scheduler path). A mismatch throws BEFORE runSession, so
    * nothing is exchanged and nothing is persisted (DC-11 §4.6 silent drop).
    */
-  async runEngineSession(session: InboundSession, expectedDeviceId?: string): Promise<{
+  async runEngineSession(
+    session: InboundSession,
+    expectedDeviceId?: string,
+    /** True only for sessions a peer dialed to us (onInbound). */
+    inbound = false,
+  ): Promise<{
     sent: number;
     receivedApplied: number;
     receivedBuffered: number;
@@ -312,6 +356,12 @@ export class SyncManager {
   }> {
     const remoteKeyBuf = Buffer.from(session.raw.remoteStaticKey());
     try {
+      // DC-05 §3.3 / DC-27 §4.5 gate, on EVERY path (inbound, Sync now,
+      // scheduler): resolve the handshake key over ALL peers rows (trusted
+      // AND revoked) and run canSynchronize before any sync message, and
+      // before createSyncEngine (its constructor writes to the DB). Noise XX
+      // authenticates a key, not membership.
+      const trustedRemoteId = this.gateRemoteKey(remoteKeyBuf);
       if (expectedDeviceId !== undefined) {
         // D3: routing hints are NOT identity. Only the handshake result, checked
         // against the trust store, proves who is on the other end. This throw
@@ -330,42 +380,46 @@ export class SyncManager {
             ).toString("hex")
           : null;
         if (row === undefined || trustedX25519Hex !== remoteX25519Hex) {
+          // DC-27 P9: short id only, no key material in the message.
           throw new Error(
-            `DC-21 D3 identity mismatch: endpoint attributed to ${expectedDeviceId} ` +
-              `presented remote static key ${remoteX25519Hex.slice(0, 16)}… — ` +
-              `session aborted, endpoint NOT persisted (DC-11 §4.6 silent drop)`,
+            `DC-21 D3 identity mismatch: endpoint attributed to ${shortDeviceId(expectedDeviceId)} ` +
+              `presented a different handshake key — session aborted, endpoint NOT ` +
+              `persisted (DC-11 §4.6 silent drop)`,
           );
         }
       }
-      // DC-05 §3.3 / DC-10 canSynchronize: a session with NO expected peer
-      // (inbound, or Sync now to a typed address) must still prove the
-      // handshake key belongs to a TRUSTED paired device before any record
-      // is served or applied. Noise XX authenticates a key, not membership:
-      // without this, any never-paired (or revoked) device on the network
-      // could read the whole calendar and inject changes (probe 2026-11-14).
-      // Same placement as the D3 check above: inside the try, so the socket
-      // is always closed.
-      let trustedRemoteId = expectedDeviceId;
-      if (trustedRemoteId === undefined) {
-        trustedRemoteId = this.resolveDeviceIdByRemoteKey(remoteKeyBuf);
-        if (trustedRemoteId === undefined) {
-          throw new Error(
-            `unpaired peer refused: remote static key ` +
-              `${remoteKeyBuf.toString("hex").slice(0, 16)}… matches no trusted ` +
-              `paired device — session closed before any data was exchanged`,
-          );
-        }
-      }
+      const revocations = makeDbRevocationChannel(this.core.db, {
+        selfDeviceId: this.identity.deviceId,
+        selfPublicKey: this.identity.publicKey,
+        hlcNow: () => this.core.hlcNow(),
+        onPeerRevoked: (id) => this.afterPeerRevoked(id),
+      });
       const engine = createSyncEngine({
         db: this.core.db,
         selfDeviceId: this.identity.deviceId,
         mutateEntity: makeEntityMutator(),
         misbehavior: this.misbehavior,
+        // DC-27 V2: the gate-resolved id keys revocation bookkeeping; DC-09
+        // trigger state is per engine (per session), so keying is unchanged
+        // across sessions.
+        peerDeviceId: trustedRemoteId,
+        revocations,
       });
       let stats;
+      this.trackSession(trustedRemoteId, session);
       try {
         stats = await engine.runSession(session.transport);
+        this.refusedBy.delete(trustedRemoteId);
+      } catch (err) {
+        // DC-27 V8/P6: closed after a completed handshake, before HELLO.
+        // Only a session WE dialed means "they refused us"; an inbound
+        // dialer that hangs up early refused nothing.
+        if (err instanceof PeerClosedBeforeHelloError && !inbound) {
+          this.refusedBy.add(trustedRemoteId);
+        }
+        throw err;
       } finally {
+        this.untrackSession(trustedRemoteId, session);
         // Pkg4 (QA M-3/BND-08): the socket must never dangle on a failed
         // session — a timed-out/stalled peer previously left this side's
         // connection open forever (session.done() was only reached on the
@@ -377,7 +431,7 @@ export class SyncManager {
       // session with a KNOWN expected peer (scheduler path). Inbound sessions
       // (no expectedDeviceId) resolve identity from the trust store by key.
       const remoteDeviceId = trustedRemoteId;
-      if (session.dialEndpoint !== undefined) {
+      if (session.dialEndpoint !== undefined && !stats.peerRevoked) {
         recordPeerEndpoint(
           this.core.db,
           remoteDeviceId,
@@ -405,18 +459,18 @@ export class SyncManager {
   }
 
   /**
-   * DC-21 D3/D6: inbound sessions have no expectedDeviceId (the peer dialed
-   * us); resolve identity by matching the handshake's remote static key
-   * against the trust store. Unmatched keys return undefined — the session
-   * stats still return (the engine already ran; the data flow was
-   * authenticated by Noise against SOME paired key or rejected), but no
-   * endpoint is recorded.
+   * DC-27 §4.5 gate: match the handshake's remote static key against EVERY
+   * peers row (trusted and revoked) and evaluate DC-05 §3.3 canSynchronize
+   * with the matched row's stored public key as the claim (the Noise static
+   * is derived from it, DC-27 S10). Fails closed: any matching revoked row
+   * refuses, even if a trusted row also matches. Returns the device id.
    */
-  private resolveDeviceIdByRemoteKey(remoteKeyBuf: Buffer): string | undefined {
+  private gateRemoteKey(remoteKeyBuf: Buffer): string {
     const rows = this.core.db
-      .prepare("SELECT device_id, public_key FROM peers WHERE status = 'trusted'")
-      .all() as Array<{ device_id: string; public_key: Buffer }>;
+      .prepare("SELECT device_id, public_key, status FROM peers")
+      .all() as Array<{ device_id: string; public_key: Buffer; status: "trusted" | "revoked" }>;
     const remoteHex = remoteKeyBuf.toString("hex");
+    const matches: typeof rows = [];
     for (const row of rows) {
       // One malformed stored key must not refuse every peer (review
       // 2026-11-14): skip it; it can never match a handshake key anyway.
@@ -426,20 +480,126 @@ export class SyncManager {
       } catch {
         continue;
       }
-      if (x25519.toString("hex") === remoteHex) return row.device_id;
+      if (x25519.toString("hex") === remoteHex) matches.push(row);
     }
-    return undefined;
+    if (matches.length === 0) throw new SyncRefusedError("DENY_UNPAIRED");
+    // DC-05 §7.3: known-revoked by row status OR by a stored valid record
+    // naming the id (a device that learned the revocation by gossip).
+    const revoked = matches.find(
+      (m) => m.status === "revoked" || isKnownRevoked(this.core.db, m.device_id),
+    );
+    if (revoked !== undefined) throw new SyncRefusedError("DENY_REVOKED", revoked.device_id);
+    const m = matches[0]!;
+    // DC-05 §3.3 with the handshake as proof of possession: the remote
+    // X25519 static equals ed25519ToX25519(stored key) (checked above), and
+    // canSynchronize checks hash(stored key) == the row's device_id (DC-05
+    // §2.2) plus status. A row whose id does not derive from its own key is
+    // refused as DENY_KEY_MISMATCH.
+    const store = new Map<string, TrustStoreEntry>([
+      [m.device_id, { publicKey: new Uint8Array(m.public_key), status: m.status }],
+    ]);
+    const decision = canSynchronize(store, m.device_id, new Uint8Array(m.public_key));
+    if (decision !== "ALLOW") throw new SyncRefusedError(decision, m.device_id);
+    return m.device_id;
+  }
+
+  private trackSession(deviceId: string, session: InboundSession): void {
+    let set = this.liveSessions.get(deviceId);
+    if (set === undefined) {
+      set = new Set();
+      this.liveSessions.set(deviceId, set);
+    }
+    set.add(session);
+  }
+
+  private untrackSession(deviceId: string, session: InboundSession): void {
+    const set = this.liveSessions.get(deviceId);
+    set?.delete(session);
+    if (set !== undefined && set.size === 0) this.liveSessions.delete(deviceId);
+  }
+
+  /** Number of live engine sessions with `deviceId` (tests, diagnostics). */
+  liveSessionCount(deviceId: string): number {
+    return this.liveSessions.get(deviceId)?.size ?? 0;
+  }
+
+  /**
+   * DC-27 §4.3 / DC-08 §3.7: once a peer is revoked (locally or by an
+   * accepted record) its live sessions end. The engine itself also stops at
+   * its next message boundary (it sees the peer in the revoked cutoffs).
+   */
+  private afterPeerRevoked(deviceId: string): void {
+    this.misbehavior.forget(deviceId); // Tier-1 state dropped (DC-27 §4.3, DC-16 §2.4)
+    this.refusedBy.delete(deviceId);
+    for (const s of this.liveSessions.get(deviceId) ?? []) {
+      try {
+        s.done();
+      } catch {
+        /* already closed */
+      }
+    }
+  }
+
+  /**
+   * DC-27 §4.3: Unpair. Server-side confirmation (P2): refuses unless
+   * confirm === true. Signs with the identity key this process already
+   * holds (P7). Idempotent (§4.15): an already revoked peer is a no-op.
+   */
+  async unpairDevice(
+    deviceId: unknown,
+    confirm: unknown,
+    opts: { beforeCommit?: () => void } = {},
+  ): Promise<
+    | { ok: true; already: true }
+    | {
+        ok: true;
+        already: false;
+        triple: { revoked_device_id: string; revoked_at_hlc: number; revoked_by_device_id: string };
+        peers_to_tell: number;
+      }
+  > {
+    if (confirm !== true) throw new UnpairError("ERR_CONFIRM", "confirm:true required");
+    if (typeof deviceId !== "string" || deviceId.length === 0) {
+      throw new UnpairError("ERR_NOT_PAIRED", "device_id required");
+    }
+    const out = await unpairLocal(this.core.db, {
+      deviceId,
+      selfDeviceId: this.identity.deviceId,
+      privateKey: this.identity.privateKey,
+      hlcNow: () => this.core.hlcNow(),
+      beforeCommit: opts.beforeCommit,
+    });
+    if (out.already) {
+      console.error(`[tide] unpair: ${shortDeviceId(deviceId)} already revoked; no-op`);
+      return { ok: true, already: true };
+    }
+    this.afterPeerRevoked(deviceId);
+    const peersToTell = listTrustedPeers(this.core.db).length;
+    console.error(
+      `[tide] unpair: ${shortDeviceId(deviceId)} revoked; record stored; telling ${peersToTell} peers`,
+    );
+    try {
+      this.urgentPush?.();
+    } catch {
+      /* the push is best-effort; the record already rides the next session */
+    }
+    return { ok: true, already: false, triple: out.triple, peers_to_tell: peersToTell };
+  }
+
+  /** DC-27 P8: the Removed devices section. */
+  removedDevices(): ReturnType<typeof listRemovedDevices> {
+    return listRemovedDevices(this.core.db, this.identity.deviceId);
   }
 
   private onInbound(session: InboundSession): void {
     // A peer dialed our sync listener: run one engine session (gated on the
     // trust store inside runEngineSession).
-    void this.runEngineSession(session).catch((err: unknown) => {
+    void this.runEngineSession(session, undefined, true).catch((err: unknown) => {
       // fail-closed: the session is dead. Logged with one throttle per
       // KIND (one line per minute each), so a stranger hammering the port
       // can neither bloat the log nor hide failures of paired peers.
       const msg = err instanceof Error ? err.message : String(err);
-      const kind = msg.startsWith("unpaired peer refused") ? "refused" : "failed";
+      const kind = err instanceof SyncRefusedError ? "refused" : "failed";
       const t = this.inboundLogThrottle[kind];
       const now = Date.now();
       if (now - t.last >= 60_000) {
@@ -447,7 +607,12 @@ export class SyncManager {
         // Peer-influenced text: strip control characters (no log-line
         // injection) and cap the length.
         const clean = msg.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 300);
-        console.error(`[tide] inbound sync session ${kind}: ${clean}${extra}`);
+        // DC-27 §4.12: a refusal's message IS the "sync refused: ..." line.
+        console.error(
+          kind === "refused"
+            ? `[tide] ${clean}${extra}`
+            : `[tide] inbound sync session ${kind}: ${clean}${extra}`,
+        );
         t.last = now;
         t.suppressed = 0;
       } else {
@@ -472,6 +637,8 @@ export class SyncManager {
   peerStateSnapshot(): Array<
     PeerTier1State & {
       paired: boolean;
+      /** DC-27 P6: our last session attempt was refused after the handshake. */
+      refused_us: boolean;
       display_name: string | null;
       paired_at: number | null;
       ladder_label: string;
@@ -506,6 +673,7 @@ export class SyncManager {
       out.push({
         ...t1,
         paired,
+        refused_us: this.refusedBy.has(id),
         display_name: peer?.display_name ?? null,
         paired_at: peer ? peer.paired_at * 1000 : null,
         ladder_label: LADDER_LABELS[t1.level],
@@ -991,6 +1159,64 @@ export function makeSyncDispatcher(
     endpointCache: EndpointCache;
   },
 ): Dispatcher {
+  // DC-21 §4.3/D7: each TRUSTED peer's endpoint via the scheduler's chain
+  // (live mDNS cache first, then last-known). Revoked peers never appear.
+  const trustedEndpoints = (): Array<{
+    device_id: string;
+    endpoint: { host: string; port: number } | null;
+  }> => {
+    const peers = listTrustedPeers(core.db);
+    const byDevice = new Map(peers.map((p) => [p.device_id, p]));
+    return peers.map((p) => ({
+      device_id: p.device_id,
+      endpoint:
+        resolveEndpoint(
+          endpoints.endpointCache,
+          {
+            deviceIds: () => peers.map((x) => x.device_id),
+            lastKnown: (deviceId: string) => {
+              const row = byDevice.get(deviceId);
+              return row?.last_endpoint_host != null &&
+                row.last_endpoint_port != null &&
+                row.last_endpoint_seen != null
+                ? {
+                    host: row.last_endpoint_host,
+                    port: row.last_endpoint_port,
+                    seen: row.last_endpoint_seen,
+                  }
+                : null;
+            },
+          },
+          p.device_id,
+        )?.endpoint ?? null,
+    }));
+  };
+  // DC-27 §4.6 / DC-10 §2.3 urgent push (V7: run in the sidecar, not the
+  // shell): one session to every reachable trusted peer, sequentially,
+  // through the scheduler-style attributed path (D3 identity check + gate).
+  // Immediate, not debounced; every failure is caught and logged by short
+  // id. Unreachable peers get the record in their next ordinary session.
+  sync.urgentPush ??= () => {
+    void (async () => {
+      for (const t of trustedEndpoints()) {
+        if (t.endpoint === null) continue;
+        const { host, port } = t.endpoint;
+        try {
+          const session = await withTimeout(
+            connectSync(sync.identity.privateKey, host, port),
+            SYNC_CONNECT_TIMEOUT_MS,
+            "urgent push: connect timed out",
+          );
+          await sync.runEngineSession({ ...session, dialEndpoint: { host, port } }, t.device_id);
+        } catch (err) {
+          const code =
+            err instanceof SyncRefusedError ? err.decision
+            : err instanceof Error ? err.name : "error";
+          console.error(`[tide] unpair: urgent push to ${shortDeviceId(t.device_id)} failed (${code})`);
+        }
+      }
+    })().catch(() => {});
+  };
   return (op, args) => {
     switch (op) {
       case "device_info": {
@@ -1019,33 +1245,7 @@ export function makeSyncDispatcher(
       // last-known from the peers table). No localhost fallback exists at
       // this layer — an unresolvable peer is reported, never guessed.
       case "sync_endpoints": {
-        const peers = listTrustedPeers(core.db);
-        const byDevice = new Map(peers.map((p) => [p.device_id, p]));
-        return {
-          endpoints: peers.map((p) => ({
-            device_id: p.device_id,
-            endpoint:
-              resolveEndpoint(
-                endpoints.endpointCache,
-                {
-                  deviceIds: () => peers.map((x) => x.device_id),
-                  lastKnown: (deviceId: string) => {
-                    const row = byDevice.get(deviceId);
-                    return row?.last_endpoint_host != null &&
-                      row.last_endpoint_port != null &&
-                      row.last_endpoint_seen != null
-                      ? {
-                          host: row.last_endpoint_host,
-                          port: row.last_endpoint_port,
-                          seen: row.last_endpoint_seen,
-                        }
-                      : null;
-                  },
-                },
-                p.device_id,
-              )?.endpoint ?? null,
-          })),
-        };
+        return { endpoints: trustedEndpoints() };
       }
       case "pairing_offer": {
         // NOTE: synchronous snapshot of an async ceremony — the offer object
@@ -1207,6 +1407,15 @@ export function makeSyncDispatcher(
         }
         return { ok: true, cleared: sync.unblockPeer(args.device_id) };
       }
+      // DC-27 §4.2/§4.3: Unpair. The sidecar refuses without confirm:true
+      // (P2) — the UI's two-step confirmation is not the only guard.
+      case "unpair_device": {
+        return sync.unpairDevice(args.device_id, args.confirm);
+      }
+      // DC-27 §4.11 / P8: Removed devices + per-peer "told" state.
+      case "list_removed_devices": {
+        return { removed: sync.removedDevices() };
+      }
       default:
         throw new Error(`unknown op: ${op}`);
     }
@@ -1326,7 +1535,8 @@ function main(): void {
     op === "list_quarantine" || op === "quarantine_stats" ||
     op === "retry_quarantine" || op === "delete_quarantine" ||
     op === "peer_state" || op === "list_paired_devices" ||
-    op === "reset_peer_state" || op === "unblock_peer"
+    op === "reset_peer_state" || op === "unblock_peer" ||
+    op === "unpair_device" || op === "list_removed_devices"
       ? syncDispatch(op, args)
       : dispatch(op, args);
   // DC-21 §3.2/D2: the ONE endpoint cache (declared above with the sync

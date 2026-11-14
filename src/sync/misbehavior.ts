@@ -184,6 +184,14 @@ export class PeerMisbehaviorTracker {
     this.books.set(producer, freshBook());
   }
 
+  /**
+   * DC-27 §4.3 / DC-16 §2.4: unpair removes the producer's Tier-1 state
+   * entirely (it is no longer listed; a later lookup starts at Level 0).
+   */
+  forget(producer: string): void {
+    this.books.delete(producer);
+  }
+
   getState(producer: string): PeerTier1State {
     return this.snapshot(producer, this.bookFor(producer));
   }

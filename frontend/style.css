@@ -556,6 +556,32 @@ input[type="time"]::-webkit-time-picker-indicator { display: none; }
   width: 100%;
   white-space: normal;
 }
+/* DC-27 §4.1: inline Unpair confirmation panel + Removed devices rows */
+.unpair-panel {
+  width: 100%;
+  white-space: normal;
+  border: 1px solid rgba(128, 128, 128, 0.4);
+  border-radius: 4px;
+  padding: 0.4rem 0.6rem;
+}
+.unpair-panel ul {
+  margin: 0.3rem 0;
+  padding-left: 1.2rem;
+}
+.unpair-panel-actions {
+  display: flex;
+  gap: 0.4rem;
+  justify-content: flex-end;
+}
+.unpair-error {
+  width: 100%;
+  white-space: normal;
+}
+.removed-device-row {
+  border-bottom: 1px solid rgba(128, 128, 128, 0.25);
+  padding: 0.4rem 0;
+  white-space: normal;
+}
 .peer-state-row {
   display: flex;
   flex-wrap: wrap;

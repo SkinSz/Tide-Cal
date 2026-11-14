@@ -10,7 +10,7 @@ import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 
 // src/persistence/schema.ts
-var SCHEMA_VERSION = 8;
+var SCHEMA_VERSION = 9;
 var DDL = `
 CREATE TABLE calendars (
     calendar_id   TEXT PRIMARY KEY,
@@ -213,7 +213,23 @@ CREATE TABLE revocation_records (
     verification_state   TEXT NOT NULL CHECK
                          (verification_state IN ('pending','valid','invalid')),
     received_at_hlc      INTEGER NOT NULL,
+    -- DC-27 P12 / DC-05 Appendix A: history cutoff carried in the signed
+    -- record (NULL for records signed without the field).
+    revoked_after_seq    INTEGER,
     PRIMARY KEY (revoked_device_id, revoked_by_device_id, revoked_at_hlc)
+);
+
+-- DC-27 P5 / DC-07 Appendix X.1: which revocation records each peer has
+-- ACKed (DC-10 \xA72.5 revocation_ack[peer][triple]). Never reset except by
+-- local data loss. Knowledge only: never feeds enforcement.
+CREATE TABLE revocation_acks (
+    peer_device_id       TEXT NOT NULL,
+    revoked_device_id    TEXT NOT NULL,
+    revoked_by_device_id TEXT NOT NULL,
+    revoked_at_hlc       INTEGER NOT NULL,
+    acked_at             INTEGER NOT NULL,
+    PRIMARY KEY (peer_device_id, revoked_device_id, revoked_by_device_id,
+                 revoked_at_hlc)
 );
 
 CREATE TABLE quarantine (
@@ -572,6 +588,7 @@ function initializeSchema(db) {
       });
       tx();
     }
+    db.transaction(() => ensureRevocationSchemaV9(db))();
   } else if (row.version < SCHEMA_VERSION) {
     const tx = db.transaction(() => {
       if (row.version < 2) {
@@ -654,10 +671,39 @@ function initializeSchema(db) {
           `);
         }
       }
+      if (row.version < 9) {
+        ensureRevocationSchemaV9(db);
+      }
       db.prepare("UPDATE schema_version SET version = ?").run(SCHEMA_VERSION);
     });
     tx();
   }
+}
+function ensureRevocationSchemaV9(db) {
+  db.exec(`CREATE TABLE IF NOT EXISTS revocation_records (
+    revoked_device_id    TEXT NOT NULL,
+    revoked_by_device_id TEXT NOT NULL,
+    revoked_at_hlc       INTEGER NOT NULL,
+    reason               TEXT,
+    record_bytes         BLOB NOT NULL,
+    signature            BLOB NOT NULL,
+    verification_state   TEXT NOT NULL CHECK
+                         (verification_state IN ('pending','valid','invalid')),
+    received_at_hlc      INTEGER NOT NULL,
+    revoked_after_seq    INTEGER,
+    PRIMARY KEY (revoked_device_id, revoked_by_device_id, revoked_at_hlc))`);
+  const cols = db.prepare("PRAGMA table_info(revocation_records)").all().map((c) => c.name);
+  if (!cols.includes("revoked_after_seq")) {
+    db.exec("ALTER TABLE revocation_records ADD COLUMN revoked_after_seq INTEGER");
+  }
+  db.exec(`CREATE TABLE IF NOT EXISTS revocation_acks (
+    peer_device_id       TEXT NOT NULL,
+    revoked_device_id    TEXT NOT NULL,
+    revoked_by_device_id TEXT NOT NULL,
+    revoked_at_hlc       INTEGER NOT NULL,
+    acked_at             INTEGER NOT NULL,
+    PRIMARY KEY (peer_device_id, revoked_device_id, revoked_by_device_id,
+                 revoked_at_hlc))`);
 }
 function backfillEntityVersions(db) {
   const rows = db.prepare(
@@ -1411,6 +1457,13 @@ var EventCore = class {
   dbPath;
   deviceId;
   hlc = new HlcTicker();
+  /**
+   * DC-27 V3: the ONE hybrid logical clock of this process, the same ticker
+   * that stamps local change records (revoked_at_hlc must come from it).
+   */
+  hlcNow() {
+    return this.hlc.now();
+  }
   constructor(dbPath, deviceId) {
     this.dbPath = dbPath;
     this.db = openDatabase({ path: dbPath });
@@ -2474,6 +2527,7 @@ var uvRatio = (u, v) => {
   return { isValid: useRoot1 || useRoot2, value: x };
 };
 var modL_LE = (hash) => modN(bytesToNumberLE(hash));
+var sha512a = (...m) => Promise.resolve(callHash("sha512Async")(concatBytes(...m))).then(checkDigest);
 var sha512s = (...m) => checkDigest(callHash("sha512")(concatBytes(...m)));
 var hash2extK = (hashed) => {
   const copy = u8fr(hashed);
@@ -2487,8 +2541,58 @@ var hash2extK = (hashed) => {
   const pointBytes = point.toBytes();
   return { head, prefix, scalar, point, pointBytes };
 };
+var getExtendedPublicKeyAsync = (secretKey) => sha512a(abytes(secretKey, L)).then(hash2extK);
 var getExtendedPublicKey = (secretKey) => hash2extK(sha512s(abytes(secretKey, L)));
 var getPublicKey = (priv) => getExtendedPublicKey(priv).pointBytes;
+var hashFinishA = (res) => sha512a(res.hashable).then(res.finish);
+var _sign = (e, rBytes, msg) => {
+  const { pointBytes: P2, scalar: s } = e;
+  const r = modL_LE(rBytes);
+  const R = G.multiply(r).toBytes();
+  const hashable = concatBytes(R, P2, msg);
+  const finish = (hashed) => {
+    const S = modN(r + modL_LE(hashed) * s);
+    return abytes(concatBytes(R, numTo32bLE(S)), 64);
+  };
+  return { hashable, finish };
+};
+var signAsync = async (message, secretKey) => {
+  const m = abytes(message);
+  const e = await getExtendedPublicKeyAsync(secretKey);
+  const rBytes = await sha512a(e.prefix, m);
+  return hashFinishA(_sign(e, rBytes, m));
+};
+var defaultVerifyOpts = { zip215: true };
+var _verify = (sig, msg, publicKey, options = defaultVerifyOpts) => {
+  sig = abytes(sig, 64);
+  msg = abytes(msg);
+  publicKey = abytes(publicKey, L);
+  const { zip215 = true } = options;
+  const r = sig.subarray(0, L);
+  const s = bytesToNumberLE(sig.subarray(L, L * 2));
+  let A, R, SB;
+  let hashable = Uint8Array.of();
+  let finished = false;
+  try {
+    A = Point.fromBytes(publicKey, zip215);
+    R = Point.fromBytes(r, zip215);
+    SB = G.multiply(s, false);
+    hashable = concatBytes(r, publicKey, msg);
+    finished = true;
+  } catch (error) {
+  }
+  const finish = (hashed) => {
+    if (!finished)
+      return false;
+    if (!zip215 && A.isSmallOrder())
+      return false;
+    const k = modL_LE(hashed);
+    const RkA = R.add(A.multiply(k, false));
+    return RkA.subtract(SB).clearCofactor().is0();
+  };
+  return { hashable, finish };
+};
+var verifyAsync = async (signature, message, publicKey, opts = defaultVerifyOpts) => hashFinishA(_verify(signature, message, publicKey, opts));
 var hashes = {
   sha512Async: async (message) => {
     const s = subtle();
@@ -3298,6 +3402,16 @@ function generateIdentity() {
 function identityFromPrivateKey(privateKey) {
   const publicKey = getPublicKey(privateKey);
   return { deviceId: deriveDeviceId(publicKey), publicKey, privateKey };
+}
+async function signAsync2(message, privateKey) {
+  return signAsync(message, privateKey);
+}
+async function verifyAsync2(message, signature, publicKey) {
+  try {
+    return await verifyAsync(signature, message, publicKey);
+  } catch {
+    return false;
+  }
 }
 
 // src/network/noise_transport.ts
@@ -6887,10 +7001,441 @@ var PairingSession = class _PairingSession {
   }
 };
 
+// src/security/revocation.ts
+var RevocationError = class extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+    this.name = "RevocationError";
+  }
+  code;
+};
+var encoder = new TextEncoder();
+function isNonEmptyString(v) {
+  return typeof v === "string" && v.length > 0;
+}
+function validateRevocationRecord(r) {
+  if (typeof r !== "object" || r === null) {
+    throw new RevocationError("missing_field", "record is not an object");
+  }
+  const rec = r;
+  if (rec.v !== 1) {
+    throw new RevocationError("bad_version", `unsupported version ${String(rec.v)}`);
+  }
+  for (const key of [
+    "revoked_device_id",
+    "revoked_by_device_id"
+  ]) {
+    if (!isNonEmptyString(rec[key])) {
+      throw new RevocationError("missing_field", `invalid ${key}`);
+    }
+  }
+  if (typeof rec.revoked_at_hlc !== "number" || !Number.isInteger(rec.revoked_at_hlc) || rec.revoked_at_hlc < 0) {
+    throw new RevocationError("bad_hlc", "revoked_at_hlc must be a non-negative integer");
+  }
+  if (rec.reason !== void 0 && !isNonEmptyString(rec.reason)) {
+    throw new RevocationError("missing_field", "invalid reason");
+  }
+  if (rec.revoked_after_seq !== void 0 && (typeof rec.revoked_after_seq !== "number" || !Number.isInteger(rec.revoked_after_seq) || rec.revoked_after_seq < 0)) {
+    throw new RevocationError("bad_hlc", "revoked_after_seq must be a non-negative integer");
+  }
+  const out = {
+    v: 1,
+    revoked_device_id: rec.revoked_device_id,
+    revoked_by_device_id: rec.revoked_by_device_id,
+    revoked_at_hlc: rec.revoked_at_hlc
+  };
+  if (rec.reason !== void 0) out.reason = rec.reason;
+  if (rec.revoked_after_seq !== void 0) {
+    out.revoked_after_seq = rec.revoked_after_seq;
+  }
+  return out;
+}
+function canonicalRevocationBytes(record) {
+  const obj = record;
+  const keys = Object.keys(obj).filter((k) => obj[k] !== void 0).sort();
+  const parts = keys.map(
+    (k) => `${JSON.stringify(k)}:${JSON.stringify(obj[k])}`
+  );
+  return encoder.encode(`{${parts.join(",")}}`);
+}
+async function createRevocation(fields, privateKey) {
+  const record = validateRevocationRecord({ ...fields, v: 1 });
+  const signature = await signAsync2(canonicalRevocationBytes(record), privateKey);
+  return { record, signature };
+}
+async function verifyRevocation(signed, trustStoreLookup) {
+  try {
+    let record;
+    try {
+      record = validateRevocationRecord(signed.record);
+    } catch {
+      return { valid: false, reason: "malformed" };
+    }
+    if (!(signed.signature instanceof Uint8Array) || signed.signature.length === 0) {
+      return { valid: false, reason: "malformed" };
+    }
+    if (record.revoked_by_device_id === record.revoked_device_id) {
+      return { valid: false, reason: "self_signed" };
+    }
+    const entry = trustStoreLookup(record.revoked_by_device_id);
+    if (entry === void 0) {
+      return { valid: false, reason: "unknown_revoker" };
+    }
+    if (entry.status !== "trusted") {
+      return { valid: false, reason: "revoker_not_trusted" };
+    }
+    const ok = await verifyAsync2(
+      canonicalRevocationBytes(record),
+      signed.signature,
+      entry.publicKey
+    );
+    return ok ? { valid: true } : { valid: false, reason: "bad_signature" };
+  } catch {
+    return { valid: false, reason: "malformed" };
+  }
+}
+function recordTriple(record) {
+  return {
+    revoked_device_id: record.revoked_device_id,
+    revoked_at_hlc: record.revoked_at_hlc,
+    revoked_by_device_id: record.revoked_by_device_id
+  };
+}
+function shortDeviceId(deviceId) {
+  return deviceId.length > 16 ? deviceId.slice(0, 16) + "\u2026" : deviceId;
+}
+function keysEqual(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= (a[i] ?? 0) ^ (b[i] ?? 0);
+  return diff === 0;
+}
+function canSynchronize(trustStore, peerId, claimedPublicKey) {
+  const entry = trustStore.get(peerId);
+  if (entry === void 0) return "DENY_UNPAIRED";
+  if (claimedPublicKey !== void 0) {
+    const claimedId = deriveDeviceId(claimedPublicKey);
+    if (claimedId !== peerId || !keysEqual(entry.publicKey, claimedPublicKey)) {
+      return "DENY_KEY_MISMATCH";
+    }
+  }
+  if (entry.status === "revoked") return "DENY_REVOKED";
+  return "ALLOW";
+}
+
+// src/security/revocation_store.ts
+var defaultLog = (line) => console.error(`[tide] ${line}`);
+function bytesEqual(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+function dbTrustLookup(db, self2) {
+  const stmt = db.prepare(
+    "SELECT public_key, status FROM peers WHERE device_id = ?"
+  );
+  return (deviceId) => {
+    if (self2 !== void 0 && deviceId === self2.deviceId) {
+      return { publicKey: self2.publicKey, status: "trusted" };
+    }
+    const row = stmt.get(deviceId);
+    if (row === void 0) return void 0;
+    return { publicKey: new Uint8Array(row.public_key), status: row.status };
+  };
+}
+function rowToSigned(row) {
+  try {
+    const record = validateRevocationRecord(
+      JSON.parse(Buffer.from(row.record_bytes).toString("utf8"))
+    );
+    return { record, signature: new Uint8Array(row.signature) };
+  } catch {
+    return void 0;
+  }
+}
+function revokedCutoffs(db) {
+  const rows = db.prepare(
+    `SELECT revoked_device_id AS d, MAX(COALESCE(revoked_after_seq, 0)) AS c
+       FROM revocation_records WHERE verification_state = 'valid'
+       GROUP BY revoked_device_id`
+  ).all();
+  return new Map(rows.map((r) => [r.d, r.c]));
+}
+function isKnownRevoked(db, deviceId) {
+  const row = db.prepare(
+    `SELECT 1 FROM peers WHERE device_id = @id AND status = 'revoked'
+       UNION ALL
+       SELECT 1 FROM revocation_records
+        WHERE revoked_device_id = @id AND verification_state = 'valid'
+       LIMIT 1`
+  ).get({ id: deviceId });
+  return row !== void 0;
+}
+function insertRecordStmt(db) {
+  return db.prepare(
+    `INSERT INTO revocation_records
+       (revoked_device_id, revoked_by_device_id, revoked_at_hlc, reason,
+        record_bytes, signature, verification_state, received_at_hlc,
+        revoked_after_seq)
+     VALUES (?, ?, ?, NULL, ?, ?, 'valid', ?, ?)`
+  );
+}
+function deletePendingAboveCutoff(db, producer) {
+  const cutoff = revokedCutoffs(db).get(producer) ?? 0;
+  db.prepare(
+    "DELETE FROM pending_changes WHERE device_id = ? AND local_seq > ?"
+  ).run(producer, cutoff);
+}
+function clearRevokedPeerState(db, deviceId) {
+  db.prepare(
+    `UPDATE peers SET last_endpoint_host = NULL, last_endpoint_port = NULL,
+            last_endpoint_seen = NULL
+     WHERE device_id = ?`
+  ).run(deviceId);
+  db.prepare("DELETE FROM hard_blocks WHERE producer_device_id = ?").run(deviceId);
+  db.prepare("DELETE FROM peer_invalid_tally WHERE producer_device_id = ?").run(deviceId);
+}
+function makeDbRevocationChannel(db, opts) {
+  const log = opts.log ?? defaultLog;
+  const lookup = dbTrustLookup(db, {
+    deviceId: opts.selfDeviceId,
+    publicKey: opts.selfPublicKey
+  });
+  const findStored = db.prepare(
+    `SELECT signature FROM revocation_records
+     WHERE revoked_device_id = ? AND revoked_by_device_id = ? AND revoked_at_hlc = ?
+       AND verification_state = 'valid'`
+  );
+  return {
+    queueFor(peer) {
+      const rows = db.prepare(
+        `SELECT r.record_bytes, r.signature FROM revocation_records r
+           WHERE r.verification_state = 'valid'
+             AND r.revoked_device_id != ?
+             AND NOT EXISTS (
+               SELECT 1 FROM revocation_acks a
+               WHERE a.peer_device_id = ?
+                 AND a.revoked_device_id = r.revoked_device_id
+                 AND a.revoked_by_device_id = r.revoked_by_device_id
+                 AND a.revoked_at_hlc = r.revoked_at_hlc)
+           ORDER BY r.received_at_hlc`
+      ).all(peer, peer);
+      const out = [];
+      for (const r of rows) {
+        const s = rowToSigned(r);
+        if (s !== void 0) out.push(s);
+      }
+      return out;
+    },
+    async acceptInbound(signed, fromPeer) {
+      const from = shortDeviceId(fromPeer);
+      let record;
+      try {
+        record = validateRevocationRecord(signed.record);
+      } catch {
+        log(`revocation: rejected record (malformed) from ${from}`);
+        return false;
+      }
+      const existing = findStored.get(
+        record.revoked_device_id,
+        record.revoked_by_device_id,
+        record.revoked_at_hlc
+      );
+      if (existing !== void 0) {
+        if (bytesEqual(new Uint8Array(existing.signature), signed.signature)) {
+          return false;
+        }
+        log(`revocation: rejected record (conflicting_triple) from ${from}`);
+        return false;
+      }
+      const verdict = await verifyRevocation({ record, signature: signed.signature }, lookup);
+      if (!verdict.valid) {
+        log(`revocation: rejected record (${verdict.reason}) from ${from}`);
+        return false;
+      }
+      let flipped = false;
+      const stored = db.transaction(() => {
+        const revoker = lookup(record.revoked_by_device_id);
+        if (revoker === void 0 || revoker.status !== "trusted") return "untrusted";
+        const dup = findStored.get(
+          record.revoked_device_id,
+          record.revoked_by_device_id,
+          record.revoked_at_hlc
+        );
+        if (dup !== void 0) return "duplicate";
+        insertRecordStmt(db).run(
+          record.revoked_device_id,
+          record.revoked_by_device_id,
+          record.revoked_at_hlc,
+          Buffer.from(canonicalRevocationBytes(record)),
+          Buffer.from(signed.signature),
+          opts.hlcNow(),
+          record.revoked_after_seq ?? null
+        );
+        const res = db.prepare(
+          "UPDATE peers SET status = 'revoked' WHERE device_id = ? AND status = 'trusted'"
+        ).run(record.revoked_device_id);
+        flipped = res.changes > 0;
+        clearRevokedPeerState(db, record.revoked_device_id);
+        deletePendingAboveCutoff(db, record.revoked_device_id);
+        return "stored";
+      })();
+      if (stored === "duplicate") return false;
+      if (stored === "untrusted") {
+        log(`revocation: rejected record (revoker_not_trusted) from ${from}`);
+        return false;
+      }
+      log(
+        `revocation: accepted record for ${shortDeviceId(record.revoked_device_id)} from ${from}`
+      );
+      if (flipped) {
+        try {
+          opts.onPeerRevoked?.(record.revoked_device_id);
+        } catch {
+        }
+      }
+      return true;
+    },
+    acceptedTriples() {
+      return db.prepare(
+        `SELECT revoked_device_id, revoked_at_hlc, revoked_by_device_id
+             FROM revocation_records WHERE verification_state = 'valid'`
+      ).all().map((t) => ({
+        revoked_device_id: t.revoked_device_id,
+        revoked_at_hlc: t.revoked_at_hlc,
+        revoked_by_device_id: t.revoked_by_device_id
+      }));
+    },
+    recordAck(fromPeer, triples) {
+      if (!Array.isArray(triples)) return;
+      const ins = db.prepare(
+        `INSERT OR IGNORE INTO revocation_acks
+           (peer_device_id, revoked_device_id, revoked_by_device_id, revoked_at_hlc, acked_at)
+         SELECT ?, revoked_device_id, revoked_by_device_id, revoked_at_hlc, ?
+         FROM revocation_records
+         WHERE revoked_device_id = ? AND revoked_by_device_id = ? AND revoked_at_hlc = ?
+           AND verification_state = 'valid'`
+      );
+      const now = Date.now();
+      db.transaction(() => {
+        for (const t of triples) {
+          if (t === null || typeof t !== "object" || typeof t.revoked_device_id !== "string" || typeof t.revoked_by_device_id !== "string" || typeof t.revoked_at_hlc !== "number") {
+            continue;
+          }
+          ins.run(fromPeer, now, t.revoked_device_id, t.revoked_by_device_id, t.revoked_at_hlc);
+        }
+      })();
+    },
+    revokedCutoffs() {
+      return revokedCutoffs(db);
+    }
+  };
+}
+var UnpairError = class extends Error {
+  constructor(code, message) {
+    super(`${code}: ${message}`);
+    this.code = code;
+    this.name = "UnpairError";
+  }
+  code;
+};
+async function unpairLocal(db, opts) {
+  const statusOf = db.prepare("SELECT status FROM peers WHERE device_id = ?");
+  const cutoffOf = db.prepare(
+    "SELECT applied_through FROM applied_upto WHERE producer_device_id = ?"
+  );
+  const readCutoff = () => cutoffOf.get(opts.deviceId)?.applied_through ?? 0;
+  if (opts.deviceId === opts.selfDeviceId) {
+    throw new UnpairError("ERR_NOT_PAIRED", "this device cannot unpair itself");
+  }
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const pre = statusOf.get(opts.deviceId);
+    if (pre === void 0) throw new UnpairError("ERR_NOT_PAIRED", "device is not paired");
+    if (pre.status === "revoked") return { already: true };
+    const hlc = opts.hlcNow();
+    const cutoff = readCutoff();
+    const signed = await createRevocation(
+      {
+        revoked_device_id: opts.deviceId,
+        revoked_by_device_id: opts.selfDeviceId,
+        revoked_at_hlc: hlc,
+        revoked_after_seq: cutoff
+      },
+      opts.privateKey
+    );
+    const result = db.transaction(() => {
+      const row = statusOf.get(opts.deviceId);
+      if (row === void 0) throw new UnpairError("ERR_NOT_PAIRED", "device is not paired");
+      if (row.status === "revoked") return { already: true };
+      if (readCutoff() !== cutoff) return "retry";
+      db.prepare("UPDATE peers SET status = 'revoked' WHERE device_id = ?").run(opts.deviceId);
+      insertRecordStmt(db).run(
+        signed.record.revoked_device_id,
+        signed.record.revoked_by_device_id,
+        signed.record.revoked_at_hlc,
+        Buffer.from(canonicalRevocationBytes(signed.record)),
+        Buffer.from(signed.signature),
+        hlc,
+        cutoff
+      );
+      clearRevokedPeerState(db, opts.deviceId);
+      db.prepare(
+        "DELETE FROM pending_changes WHERE device_id = ? AND local_seq > ?"
+      ).run(opts.deviceId, cutoff);
+      opts.beforeCommit?.();
+      return { already: false, triple: recordTriple(signed.record), cutoff };
+    })();
+    if (result !== "retry") return result;
+  }
+  throw new UnpairError("ERR_BUSY", "the device is still syncing; try again");
+}
+function listRemovedDevices(db, selfDeviceId) {
+  const revoked = db.prepare(
+    "SELECT device_id, display_name FROM peers WHERE status = 'revoked' ORDER BY device_id"
+  ).all();
+  const trusted = db.prepare(
+    "SELECT device_id, display_name FROM peers WHERE status = 'trusted' ORDER BY paired_at, device_id"
+  ).all();
+  const removedAt = db.prepare(
+    `SELECT COALESCE(
+        (SELECT MIN(revoked_at_hlc) FROM revocation_records
+          WHERE revoked_device_id = @d AND revoked_by_device_id = @self
+            AND verification_state = 'valid'),
+        (SELECT MIN(received_at_hlc) FROM revocation_records
+          WHERE revoked_device_id = @d AND verification_state = 'valid')) AS t`
+  );
+  const acked = db.prepare(
+    `SELECT 1 FROM revocation_acks a JOIN revocation_records r
+       ON r.revoked_device_id = a.revoked_device_id
+      AND r.revoked_by_device_id = a.revoked_by_device_id
+      AND r.revoked_at_hlc = a.revoked_at_hlc
+     WHERE a.peer_device_id = ? AND r.revoked_device_id = ? LIMIT 1`
+  );
+  return revoked.map((p) => ({
+    device_id: p.device_id,
+    label: p.display_name,
+    removed_at: removedAt.get({ d: p.device_id, self: selfDeviceId })?.t ?? 0,
+    told: trusted.filter((t) => t.device_id !== p.device_id).map((t) => ({
+      device_id: t.device_id,
+      label: t.display_name,
+      done: acked.get(t.device_id, p.device_id) !== void 0
+    }))
+  }));
+}
+
 // src/network/pairing_manager.ts
+var REVOKED_REPAIR_MESSAGE = "This device was unpaired earlier. To pair it again, start it fresh first.";
+var PairingRefusedError = class extends Error {
+  constructor() {
+    super(REVOKED_REPAIR_MESSAGE);
+    this.name = "PairingRefusedError";
+  }
+};
 function sqlPeerStore(db) {
   return {
     store({ deviceId, publicKey, displayName, pairedAtMs }) {
+      if (isKnownRevoked(db, deviceId)) throw new PairingRefusedError();
       const info = db.prepare(
         `INSERT INTO peers (device_id, public_key, display_name, paired_at,
                               status, last_known_clock)
@@ -6899,14 +7444,19 @@ function sqlPeerStore(db) {
              public_key = excluded.public_key,
              display_name = excluded.display_name,
              paired_at = excluded.paired_at,
-             status = 'trusted'`
+             status = 'trusted'
+           WHERE peers.status = 'trusted'`
       ).run(
         deviceId,
         Buffer.from(publicKey),
         displayName,
         Math.floor(pairedAtMs / 1e3)
       );
+      if (info.changes === 0) throw new PairingRefusedError();
       return true;
+    },
+    isRevoked(deviceId) {
+      return isKnownRevoked(db, deviceId);
     }
   };
 }
@@ -6950,6 +7500,10 @@ async function createPairingOffer(opts) {
       };
       await session.json.send(localPayload);
       const remoteRaw = await session.json.receive();
+      if (typeof remoteRaw?.device_id === "string" && opts.store.isRevoked?.(remoteRaw.device_id) === true) {
+        await session.json.send({ kind: "PAIRING_REFUSED", code: "revoked" });
+        throw new PairingRefusedError();
+      }
       const ps = new PairingSession();
       ps.exchangePayloads(localPayload, remoteRaw);
       ps.bindTranscript(session.raw.handshakeHash());
@@ -7014,6 +7568,9 @@ async function createPairingOffer(opts) {
 async function acceptPairingPayload(opts) {
   const remote = decodePairingPayload(opts.qrText);
   if (!remote.connect) throw new Error("payload has no connect hint");
+  if (opts.store.isRevoked?.(remote.device_id) === true) {
+    throw new PairingRefusedError();
+  }
   const conn = await connectSync(
     opts.identity.privateKey,
     remote.connect.ip,
@@ -7046,6 +7603,9 @@ async function acceptPairingPayload(opts) {
       })
     );
     const ok = await json.receive();
+    if (ok?.kind === "PAIRING_REFUSED" && ok.code === "revoked") {
+      throw new PairingRefusedError();
+    }
     if (ok.kind !== "PAIRING_OK") {
       throw new Error("pairing not confirmed by other side");
     }
@@ -7137,6 +7697,13 @@ var PeerMisbehaviorTracker = class {
   // ------------------------------------------------------------------
   resetPeer(producer) {
     this.books.set(producer, freshBook());
+  }
+  /**
+   * DC-27 §4.3 / DC-16 §2.4: unpair removes the producer's Tier-1 state
+   * entirely (it is no longer listed; a later lookup starts at Level 0).
+   */
+  forget(producer) {
+    this.books.delete(producer);
   }
   getState(producer) {
     return this.snapshot(producer, this.bookFor(producer));
@@ -7665,6 +8232,18 @@ function sigFromHex(hex) {
   }
   return out;
 }
+var PeerRevokedCutoff = class extends Error {
+  constructor() {
+    super("session ended: the peer was revoked during this session");
+    this.name = "PeerRevokedCutoff";
+  }
+};
+var PeerClosedBeforeHelloError = class extends Error {
+  constructor() {
+    super("protocol violation: expected HELLO, got closed");
+    this.name = "PeerClosedBeforeHelloError";
+  }
+};
 var helloClockAnomalyCount = 0;
 function createSyncEngine(deps) {
   const knowledge = deps.knowledge ?? loadKnowledgeFromDb2(deps.db);
@@ -7782,6 +8361,19 @@ function createSyncEngine(deps) {
       receivedQuarantined: 0,
       receivedDroppedIntake: 0
     };
+    try {
+      return await runSessionInner(transport, stats);
+    } catch (err2) {
+      if (!(err2 instanceof PeerRevokedCutoff)) throw err2;
+      try {
+        transport.close?.();
+      } catch {
+      }
+      stats.peerRevoked = true;
+      return stats;
+    }
+  }
+  async function runSessionInner(transport, stats) {
     sessionDedup = new OfferDedup();
     stashed.length = 0;
     seedSelfAppliedFrontier();
@@ -7802,7 +8394,9 @@ function createSyncEngine(deps) {
     triggers.resetStreak(peerKey);
     noteHelloClockAnomaly(peerHello.device_clock, peerKey, stats);
     await pushRevocationQueue(transport, stats);
-    let ranges = neededRanges(holder.knowledge, peerHello.device_clock, deps.selfDeviceId);
+    let ranges = clampRevoked(
+      neededRanges(holder.knowledge, peerHello.device_clock, deps.selfDeviceId)
+    );
     let gapRetries = 0;
     let pullIterations = 0;
     while (ranges.length > 0 && gapRetries < 2 && pullIterations < 10) {
@@ -7813,7 +8407,9 @@ function createSyncEngine(deps) {
       if (batch === null) break;
       applyBatch(batch.changes, stats);
       const before = JSON.stringify(ranges);
-      ranges = batch.remaining_ranges ?? neededRanges(holder.knowledge, peerHello.device_clock, deps.selfDeviceId);
+      ranges = clampRevoked(
+        batch.remaining_ranges ?? neededRanges(holder.knowledge, peerHello.device_clock, deps.selfDeviceId)
+      );
       if (JSON.stringify(ranges) === before) {
         gapRetries++;
         triggers.recordGapRound(peerKey);
@@ -8022,12 +8618,20 @@ function createSyncEngine(deps) {
     const ch = revocations();
     if (ch === void 0) return;
     const peer = deps.peerDeviceId ?? "unknown";
-    for (const wire of msg.records) {
-      await ch.acceptInbound(
+    let namesPeer = false;
+    for (const wire of Array.isArray(msg.records) ? msg.records : []) {
+      if (wire === null || typeof wire !== "object" || typeof wire.signature_hex !== "string") {
+        continue;
+      }
+      const accepted = await ch.acceptInbound(
         { record: wire.record, signature: sigFromHex(wire.signature_hex) },
         peer
       );
+      if (accepted && deps.peerDeviceId !== void 0 && wire.record?.revoked_device_id === deps.peerDeviceId) {
+        namesPeer = true;
+      }
     }
+    if (namesPeer) throw new PeerRevokedCutoff();
     await transport.send({
       v: 1,
       type: "REVOCATIONS_ACK",
@@ -8052,6 +8656,7 @@ function createSyncEngine(deps) {
     stats.sent++;
   }
   async function streamFullStateSnapshot(transport, stats) {
+    assertPeerNotRevoked();
     const chunks = [];
     buildSnapshot(deps.db, (s) => chunks.push(s));
     if (chunks.length === 0) {
@@ -8071,6 +8676,7 @@ function createSyncEngine(deps) {
     }
   }
   function applyIncomingSnapshot(msg, stats) {
+    assertPeerNotRevoked();
     const result = applySnapshot(
       deps.db,
       {
@@ -8164,11 +8770,44 @@ function createSyncEngine(deps) {
     }
     return null;
   }
+  function currentCutoffs() {
+    return deps.revocations?.revokedCutoffs?.() ?? /* @__PURE__ */ new Map();
+  }
+  function clampRevoked(ranges) {
+    const cutoffs = currentCutoffs();
+    if (cutoffs.size === 0) return ranges;
+    const out = [];
+    for (const r of ranges) {
+      const c = cutoffs.get(r.device_id);
+      if (c === void 0) {
+        out.push(r);
+        continue;
+      }
+      const hi = Math.min(r.hi, c);
+      if (r.lo <= hi) out.push({ device_id: r.device_id, lo: r.lo, hi });
+    }
+    return out;
+  }
+  function assertPeerNotRevoked(cutoffs = currentCutoffs()) {
+    if (deps.peerDeviceId !== void 0 && cutoffs.has(deps.peerDeviceId)) {
+      throw new PeerRevokedCutoff();
+    }
+  }
   function applyBatch(changes, stats) {
+    const cutoffs = currentCutoffs();
+    assertPeerNotRevoked(cutoffs);
     for (const raw of changes) {
       const rawDevice = raw?.device_id;
       const producer = typeof rawDevice === "string" && rawDevice.length > 0 ? rawDevice : deps.peerDeviceId ?? "unknown";
       if (isHardBlocked(producer)) continue;
+      const revokedCutoff = cutoffs.get(producer);
+      if (revokedCutoff !== void 0) {
+        const seq = raw?.local_seq;
+        if (typeof seq === "number" && Number.isInteger(seq) && seq > revokedCutoff) {
+          stats.receivedRejectedRevoked = (stats.receivedRejectedRevoked ?? 0) + 1;
+          continue;
+        }
+      }
       if (misbehavior.isIntakeDropped(producer)) {
         misbehavior.recordDropped(producer);
         stats.receivedDroppedIntake++;
@@ -8226,6 +8865,7 @@ function createSyncEngine(deps) {
     }
   }
   function fetchRanges(ranges) {
+    assertPeerNotRevoked();
     const out = [];
     const stmt = deps.db.prepare(`
       SELECT change_id, device_id, local_seq, entity_id, entity_type,
@@ -8264,6 +8904,7 @@ function createSyncEngine(deps) {
 }
 async function expectType(nextMessage, type) {
   const msg = await nextMessage();
+  if (msg === null && type === "HELLO") throw new PeerClosedBeforeHelloError();
   if (msg === null || msg.type !== type || msg.v !== 1) {
     throw new Error(`protocol violation: expected ${type}, got ${msg?.type ?? "closed"}`);
   }
@@ -8639,7 +9280,7 @@ var Scheduler = class {
 };
 
 // src/application/scheduler_runtime.ts
-var defaultLog = (message) => {
+var defaultLog2 = (message) => {
   console.log(`[tide-scheduler] ${message}`);
 };
 function makeSessionOpener(deps) {
@@ -8665,7 +9306,7 @@ var SchedulerRuntime = class {
   constructor(deps) {
     this.deps = deps;
     this.scheduler = deps.scheduler;
-    this.log = deps.log ?? defaultLog;
+    this.log = deps.log ?? defaultLog2;
   }
   // ------------------------------------------------------------------
   // Lifecycle
@@ -9663,6 +10304,14 @@ function notifyDataChanged(stats, sink) {
   } catch {
   }
 }
+var SyncRefusedError = class extends Error {
+  constructor(decision, deviceId) {
+    super(`sync refused: ${decision}${deviceId !== void 0 ? " " + shortDeviceId(deviceId) : ""}`);
+    this.decision = decision;
+    this.name = "SyncRefusedError";
+  }
+  decision;
+};
 var SyncManager = class {
   constructor(core, identity, dataDir) {
     this.core = core;
@@ -9686,6 +10335,20 @@ var SyncManager = class {
    * unset in tests unless a test installs a spy.
    */
   onDataChanged;
+  /**
+   * DC-27 §4.6 urgent push (DC-10 §2.3): started once after a local unpair
+   * commits. Installed by makeSyncDispatcher (it owns endpoint resolution);
+   * tests may install a spy. Fire-and-forget: never awaited by the RPC.
+   */
+  urgentPush;
+  /** DC-27 §4.3: live engine sessions per remote device (to end on unpair). */
+  liveSessions = /* @__PURE__ */ new Map();
+  /**
+   * DC-27 P6/V8: peers whose LAST session attempt ended "closed after the
+   * handshake, before HELLO" (they refused us at their trust gate). In
+   * memory only: it is a hint, cleared by the next successful session.
+   */
+  refusedBy = /* @__PURE__ */ new Set();
   get deviceId() {
     return this.identity.deviceId;
   }
@@ -9770,9 +10433,10 @@ var SyncManager = class {
    * a paired peer — scheduler path). A mismatch throws BEFORE runSession, so
    * nothing is exchanged and nothing is persisted (DC-11 §4.6 silent drop).
    */
-  async runEngineSession(session, expectedDeviceId) {
+  async runEngineSession(session, expectedDeviceId, inbound = false) {
     const remoteKeyBuf = Buffer.from(session.raw.remoteStaticKey());
     try {
+      const trustedRemoteId = this.gateRemoteKey(remoteKeyBuf);
       if (expectedDeviceId !== void 0) {
         const row = this.core.db.prepare(
           "SELECT public_key FROM peers WHERE device_id = ? AND status = 'trusted'"
@@ -9783,33 +10447,43 @@ var SyncManager = class {
         ).toString("hex") : null;
         if (row === void 0 || trustedX25519Hex !== remoteX25519Hex) {
           throw new Error(
-            `DC-21 D3 identity mismatch: endpoint attributed to ${expectedDeviceId} presented remote static key ${remoteX25519Hex.slice(0, 16)}\u2026 \u2014 session aborted, endpoint NOT persisted (DC-11 \xA74.6 silent drop)`
+            `DC-21 D3 identity mismatch: endpoint attributed to ${shortDeviceId(expectedDeviceId)} presented a different handshake key \u2014 session aborted, endpoint NOT persisted (DC-11 \xA74.6 silent drop)`
           );
         }
       }
-      let trustedRemoteId = expectedDeviceId;
-      if (trustedRemoteId === void 0) {
-        trustedRemoteId = this.resolveDeviceIdByRemoteKey(remoteKeyBuf);
-        if (trustedRemoteId === void 0) {
-          throw new Error(
-            `unpaired peer refused: remote static key ${remoteKeyBuf.toString("hex").slice(0, 16)}\u2026 matches no trusted paired device \u2014 session closed before any data was exchanged`
-          );
-        }
-      }
+      const revocations = makeDbRevocationChannel(this.core.db, {
+        selfDeviceId: this.identity.deviceId,
+        selfPublicKey: this.identity.publicKey,
+        hlcNow: () => this.core.hlcNow(),
+        onPeerRevoked: (id) => this.afterPeerRevoked(id)
+      });
       const engine = createSyncEngine({
         db: this.core.db,
         selfDeviceId: this.identity.deviceId,
         mutateEntity: makeEntityMutator(),
-        misbehavior: this.misbehavior
+        misbehavior: this.misbehavior,
+        // DC-27 V2: the gate-resolved id keys revocation bookkeeping; DC-09
+        // trigger state is per engine (per session), so keying is unchanged
+        // across sessions.
+        peerDeviceId: trustedRemoteId,
+        revocations
       });
       let stats;
+      this.trackSession(trustedRemoteId, session);
       try {
         stats = await engine.runSession(session.transport);
+        this.refusedBy.delete(trustedRemoteId);
+      } catch (err2) {
+        if (err2 instanceof PeerClosedBeforeHelloError && !inbound) {
+          this.refusedBy.add(trustedRemoteId);
+        }
+        throw err2;
       } finally {
+        this.untrackSession(trustedRemoteId, session);
         session.done();
       }
       const remoteDeviceId = trustedRemoteId;
-      if (session.dialEndpoint !== void 0) {
+      if (session.dialEndpoint !== void 0 && !stats.peerRevoked) {
         recordPeerEndpoint(
           this.core.db,
           remoteDeviceId,
@@ -9829,16 +10503,16 @@ var SyncManager = class {
     }
   }
   /**
-   * DC-21 D3/D6: inbound sessions have no expectedDeviceId (the peer dialed
-   * us); resolve identity by matching the handshake's remote static key
-   * against the trust store. Unmatched keys return undefined — the session
-   * stats still return (the engine already ran; the data flow was
-   * authenticated by Noise against SOME paired key or rejected), but no
-   * endpoint is recorded.
+   * DC-27 §4.5 gate: match the handshake's remote static key against EVERY
+   * peers row (trusted and revoked) and evaluate DC-05 §3.3 canSynchronize
+   * with the matched row's stored public key as the claim (the Noise static
+   * is derived from it, DC-27 S10). Fails closed: any matching revoked row
+   * refuses, even if a trusted row also matches. Returns the device id.
    */
-  resolveDeviceIdByRemoteKey(remoteKeyBuf) {
-    const rows = this.core.db.prepare("SELECT device_id, public_key FROM peers WHERE status = 'trusted'").all();
+  gateRemoteKey(remoteKeyBuf) {
+    const rows = this.core.db.prepare("SELECT device_id, public_key, status FROM peers").all();
     const remoteHex = remoteKeyBuf.toString("hex");
+    const matches = [];
     for (const row of rows) {
       let x255192;
       try {
@@ -9846,20 +10520,101 @@ var SyncManager = class {
       } catch {
         continue;
       }
-      if (x255192.toString("hex") === remoteHex) return row.device_id;
+      if (x255192.toString("hex") === remoteHex) matches.push(row);
     }
-    return void 0;
+    if (matches.length === 0) throw new SyncRefusedError("DENY_UNPAIRED");
+    const revoked = matches.find(
+      (m2) => m2.status === "revoked" || isKnownRevoked(this.core.db, m2.device_id)
+    );
+    if (revoked !== void 0) throw new SyncRefusedError("DENY_REVOKED", revoked.device_id);
+    const m = matches[0];
+    const store = /* @__PURE__ */ new Map([
+      [m.device_id, { publicKey: new Uint8Array(m.public_key), status: m.status }]
+    ]);
+    const decision = canSynchronize(store, m.device_id, new Uint8Array(m.public_key));
+    if (decision !== "ALLOW") throw new SyncRefusedError(decision, m.device_id);
+    return m.device_id;
+  }
+  trackSession(deviceId, session) {
+    let set = this.liveSessions.get(deviceId);
+    if (set === void 0) {
+      set = /* @__PURE__ */ new Set();
+      this.liveSessions.set(deviceId, set);
+    }
+    set.add(session);
+  }
+  untrackSession(deviceId, session) {
+    const set = this.liveSessions.get(deviceId);
+    set?.delete(session);
+    if (set !== void 0 && set.size === 0) this.liveSessions.delete(deviceId);
+  }
+  /** Number of live engine sessions with `deviceId` (tests, diagnostics). */
+  liveSessionCount(deviceId) {
+    return this.liveSessions.get(deviceId)?.size ?? 0;
+  }
+  /**
+   * DC-27 §4.3 / DC-08 §3.7: once a peer is revoked (locally or by an
+   * accepted record) its live sessions end. The engine itself also stops at
+   * its next message boundary (it sees the peer in the revoked cutoffs).
+   */
+  afterPeerRevoked(deviceId) {
+    this.misbehavior.forget(deviceId);
+    this.refusedBy.delete(deviceId);
+    for (const s of this.liveSessions.get(deviceId) ?? []) {
+      try {
+        s.done();
+      } catch {
+      }
+    }
+  }
+  /**
+   * DC-27 §4.3: Unpair. Server-side confirmation (P2): refuses unless
+   * confirm === true. Signs with the identity key this process already
+   * holds (P7). Idempotent (§4.15): an already revoked peer is a no-op.
+   */
+  async unpairDevice(deviceId, confirm, opts = {}) {
+    if (confirm !== true) throw new UnpairError("ERR_CONFIRM", "confirm:true required");
+    if (typeof deviceId !== "string" || deviceId.length === 0) {
+      throw new UnpairError("ERR_NOT_PAIRED", "device_id required");
+    }
+    const out = await unpairLocal(this.core.db, {
+      deviceId,
+      selfDeviceId: this.identity.deviceId,
+      privateKey: this.identity.privateKey,
+      hlcNow: () => this.core.hlcNow(),
+      beforeCommit: opts.beforeCommit
+    });
+    if (out.already) {
+      console.error(`[tide] unpair: ${shortDeviceId(deviceId)} already revoked; no-op`);
+      return { ok: true, already: true };
+    }
+    this.afterPeerRevoked(deviceId);
+    const peersToTell = listTrustedPeers(this.core.db).length;
+    console.error(
+      `[tide] unpair: ${shortDeviceId(deviceId)} revoked; record stored; telling ${peersToTell} peers`
+    );
+    try {
+      this.urgentPush?.();
+    } catch {
+    }
+    return { ok: true, already: false, triple: out.triple, peers_to_tell: peersToTell };
+  }
+  /** DC-27 P8: the Removed devices section. */
+  removedDevices() {
+    return listRemovedDevices(this.core.db, this.identity.deviceId);
   }
   onInbound(session) {
-    void this.runEngineSession(session).catch((err2) => {
+    void this.runEngineSession(session, void 0, true).catch((err2) => {
       const msg = err2 instanceof Error ? err2.message : String(err2);
-      const kind = msg.startsWith("unpaired peer refused") ? "refused" : "failed";
+      const kind = err2 instanceof SyncRefusedError ? "refused" : "failed";
       const t = this.inboundLogThrottle[kind];
       const now = Date.now();
       if (now - t.last >= 6e4) {
         const extra = t.suppressed > 0 ? ` (+${t.suppressed} more since last report)` : "";
         const clean2 = msg.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 300);
-        console.error(`[tide] inbound sync session ${kind}: ${clean2}${extra}`);
+        console.error(
+          kind === "refused" ? `[tide] ${clean2}${extra}` : `[tide] inbound sync session ${kind}: ${clean2}${extra}`
+        );
         t.last = now;
         t.suppressed = 0;
       } else {
@@ -9901,6 +10656,7 @@ var SyncManager = class {
       out.push({
         ...t1,
         paired,
+        refused_us: this.refusedBy.has(id),
         display_name: peer?.display_name ?? null,
         paired_at: peer ? peer.paired_at * 1e3 : null,
         ladder_label: LADDER_LABELS[t1.level],
@@ -10254,6 +11010,48 @@ function withTimeout(p, ms, message) {
   })();
 }
 function makeSyncDispatcher(sync, core, endpoints) {
+  const trustedEndpoints = () => {
+    const peers = listTrustedPeers(core.db);
+    const byDevice = new Map(peers.map((p) => [p.device_id, p]));
+    return peers.map((p) => ({
+      device_id: p.device_id,
+      endpoint: resolveEndpoint(
+        endpoints.endpointCache,
+        {
+          deviceIds: () => peers.map((x) => x.device_id),
+          lastKnown: (deviceId) => {
+            const row = byDevice.get(deviceId);
+            return row?.last_endpoint_host != null && row.last_endpoint_port != null && row.last_endpoint_seen != null ? {
+              host: row.last_endpoint_host,
+              port: row.last_endpoint_port,
+              seen: row.last_endpoint_seen
+            } : null;
+          }
+        },
+        p.device_id
+      )?.endpoint ?? null
+    }));
+  };
+  sync.urgentPush ??= () => {
+    void (async () => {
+      for (const t of trustedEndpoints()) {
+        if (t.endpoint === null) continue;
+        const { host, port } = t.endpoint;
+        try {
+          const session = await withTimeout(
+            connectSync(sync.identity.privateKey, host, port),
+            SYNC_CONNECT_TIMEOUT_MS,
+            "urgent push: connect timed out"
+          );
+          await sync.runEngineSession({ ...session, dialEndpoint: { host, port } }, t.device_id);
+        } catch (err2) {
+          const code = err2 instanceof SyncRefusedError ? err2.decision : err2 instanceof Error ? err2.name : "error";
+          console.error(`[tide] unpair: urgent push to ${shortDeviceId(t.device_id)} failed (${code})`);
+        }
+      }
+    })().catch(() => {
+    });
+  };
   return (op, args) => {
     switch (op) {
       case "device_info": {
@@ -10282,28 +11080,7 @@ function makeSyncDispatcher(sync, core, endpoints) {
       // last-known from the peers table). No localhost fallback exists at
       // this layer — an unresolvable peer is reported, never guessed.
       case "sync_endpoints": {
-        const peers = listTrustedPeers(core.db);
-        const byDevice = new Map(peers.map((p) => [p.device_id, p]));
-        return {
-          endpoints: peers.map((p) => ({
-            device_id: p.device_id,
-            endpoint: resolveEndpoint(
-              endpoints.endpointCache,
-              {
-                deviceIds: () => peers.map((x) => x.device_id),
-                lastKnown: (deviceId) => {
-                  const row = byDevice.get(deviceId);
-                  return row?.last_endpoint_host != null && row.last_endpoint_port != null && row.last_endpoint_seen != null ? {
-                    host: row.last_endpoint_host,
-                    port: row.last_endpoint_port,
-                    seen: row.last_endpoint_seen
-                  } : null;
-                }
-              },
-              p.device_id
-            )?.endpoint ?? null
-          }))
-        };
+        return { endpoints: trustedEndpoints() };
       }
       case "pairing_offer": {
         const offerPromise = createPairingOffer({
@@ -10433,6 +11210,15 @@ function makeSyncDispatcher(sync, core, endpoints) {
         }
         return { ok: true, cleared: sync.unblockPeer(args.device_id) };
       }
+      // DC-27 §4.2/§4.3: Unpair. The sidecar refuses without confirm:true
+      // (P2) — the UI's two-step confirmation is not the only guard.
+      case "unpair_device": {
+        return sync.unpairDevice(args.device_id, args.confirm);
+      }
+      // DC-27 §4.11 / P8: Removed devices + per-peer "told" state.
+      case "list_removed_devices": {
+        return { removed: sync.removedDevices() };
+      }
       default:
         throw new Error(`unknown op: ${op}`);
     }
@@ -10506,7 +11292,7 @@ function main() {
     }
     schedulerHandle.updateSchedulerSettings(partial);
     return { applied: true, next_start_only: "max_incremental_backlog" };
-  })() : op.startsWith("sync_") || op === "device_info" || op === "pairing_offer" || op === "pairing_accept" || op === "cancel_pairing_offer" || op === "list_quarantine" || op === "quarantine_stats" || op === "retry_quarantine" || op === "delete_quarantine" || op === "peer_state" || op === "list_paired_devices" || op === "reset_peer_state" || op === "unblock_peer" ? syncDispatch(op, args) : dispatch(op, args);
+  })() : op.startsWith("sync_") || op === "device_info" || op === "pairing_offer" || op === "pairing_accept" || op === "cancel_pairing_offer" || op === "list_quarantine" || op === "quarantine_stats" || op === "retry_quarantine" || op === "delete_quarantine" || op === "peer_state" || op === "list_paired_devices" || op === "reset_peer_state" || op === "unblock_peer" || op === "unpair_device" || op === "list_removed_devices" ? syncDispatch(op, args) : dispatch(op, args);
   const pairedDeviceIds = () => listTrustedPeers(core.db).map((p) => p.device_id);
   const expectedPrefixes = () => {
     const map = /* @__PURE__ */ new Map();
@@ -10704,6 +11490,7 @@ if (process.env.VITEST === void 0 && /sidecar\.(mjs|ts|cjs)$/.test(self)) {
 export {
   SYNC_CONNECT_TIMEOUT_MS,
   SyncManager,
+  SyncRefusedError,
   dataChangedNoticeLine,
   discoveryKickNoticeLine,
   handleLine,

@@ -2,6 +2,8 @@
 # Unpair a Device (User Flow and Product Wiring of Revocation)
 Status: APPROVED by project owner (2026-11-14).
         Owner approved P1-P12 as recommended ("all recommended").
+AMENDED by project owner (2026-11-14). See Appendix A; supersedes
+        §4.8 ("NOT told why") for the pairing ceremony only.
 Depends on: Architecture Spec v0.3 §17, §18, §19, §25; DC-05 §2.2, §3.3,
             §7.1-§7.3; DC-06 §2.6; DC-07 T5/T6; DC-08 §2.2, §3.7, TR-7;
             DC-10 §2.1-§2.5, §3, E1-E3; DC-13 (Sync now fan-out);
@@ -720,3 +722,151 @@ conflicts_ui.ts); code is cited by function name, not line number.
     V11 Confirm how older builds treat a record with an extra signed
         field (validateRevocationRecord drops unknown keys, so the
         canonical bytes and the signature check would differ).
+
+==================================================================
+APPENDIX A — PAIRING REFUSAL NAMES ITS CAUSE (owner-approved 2026-11-14)
+==================================================================
+
+Problem: §4.8 keeps the removed device uninformed. With P10, a pairing
+attempt by a removed device (same device_id) is refused, and without a
+cause the user cannot tell that a fresh start (§4.13) is the remedy.
+
+A.1  SCOPE. Only the pairing ceremony (DC-05 §5) changes. Sync
+     sessions keep §4.8 and DC-16 D4 unchanged: a refused sync
+     session is still closed after the handshake with no message.
+A.2  WIRE. When the device performing the ceremony finds the remote
+     device_id revoked (P10), before any check or trust write, it
+     sends {"kind":"PAIRING_REFUSED","code":"revoked"} on the pairing
+     channel and ends the ceremony. The message carries a fixed code
+     only: no text, no reason, no device ids.
+A.3  DISPLAY. A device that receives this code shows its own local
+     text, never peer-supplied text:
+       "This device was unpaired earlier. To pair it again, start it
+        fresh first."
+     Any other kind or code is handled as before (pairing fails).
+A.4  DISCLOSURE. The signal is sent only inside a ceremony the user
+     started on both devices, after the Noise handshake. It tells
+     the removed device nothing that a refused ceremony would not
+     already imply, plus the remedy.
+A.5  RESIDUAL. The device that refuses shows no notice of the
+     refusal (tracked in docs/technical-debt.md).
+A.6  EFFECT ON OTHER ITEMS. T2 and O2 stay open for sync sessions
+     ("you were removed" outside the pairing ceremony). This
+     appendix closes them for the pairing ceremony only.
+
+==================================================================
+APPENDIX B — PROPOSAL (not approved): FULL-STATE SNAPSHOTS AND THE
+             HISTORY CUTOFF (TD-041)
+==================================================================
+
+Problem: DC-05 Appendix A.2 filters CHANGE RECORDS of a revoked
+producer above its cutoff. A DC-09 full-state snapshot carries entity
+STATE, not change records, and its application (DC-09 §5) has no such
+filter. Under §4.4 a peer P that applied the removed device's
+above-cutoff changes during the gossip window keeps them; a later
+snapshot from P then delivers them to a device that holds the record,
+even after P itself has learned the revocation.
+
+B.1  EVIDENCE (PROVEN, tests/dc27_unpair.test.ts, "TD-041 ..." tests)
+     Setup: L unpairs W (cutoff 2); W's event created at seq 3 reaches
+     the unaware P; P then learns the record in a session with L.
+       a) New entity: P's snapshot puts W's seq-3 event on L, and L's
+          applied_upto[W] becomes 3 (above the cutoff). Same result
+          when the snapshot enters L's session engine from P as a
+          trusted peer.
+       b) Delete: W deletes an at-or-below-cutoff event at seq 3; P's
+          snapshot carries no tombstone for it, and L's absence rule
+          (DC-09 §5.2) deletes L's legitimate copy.
+       c) Merged entity: W edits the title at seq 3, P later edits the
+          description. P's entry names P as latest producer while its
+          state carries W's above-cutoff title.
+       d) Causal context: an event P created after applying W's seq 3
+          has clock[W] = 3 although it holds no state of W.
+       e) Clock: L never applied W's seq 3 (applied_upto[W] = 2), yet
+          L's own snapshot_clock[W] is 3. snapshot_clock comes from
+          device_clock, which takes in causal context (d). So an
+          untainted L raises a receiver's applied_upto[W] above the
+          cutoff too, and snapshot_clock cannot tell a peer that holds
+          W's above-cutoff state from one that only saw it cited.
+
+B.2  WHY NO RULE FOLLOWS FROM APPENDIX A.2 ALONE
+     A snapshot entry carries the whole row, ONE latest producer
+     (device_id, seq) and the entity's version vector (DC-09 §4.2);
+     the snapshot carries one snapshot_clock. The latest producer
+     misses B.1 c); the version vector over-matches B.1 d); absence
+     (B.1 b) carries no producer; snapshot_clock over-matches B.1 e).
+     Changes are field-level (DC-01), so one row can mix fields from
+     several producers. Any rule is a new decision.
+
+B.3  OPTIONS
+     For each: new entity / merged entity / delete / clocks / sender.
+     "C" is the highest cutoff held for W (Appendix A.2). "Tainted"
+     means the sender's applied_upto[W] > C: it applied W above C.
+
+     a) Declared applied frontier, refuse tainted snapshots
+        [RECOMMENDED].
+        FULL_STATE_OFFER and FULL_STATE_SNAPSHOT gain an additive
+        field "applied_upto" (the sender's applied frontier). A
+        receiver holding C declines the offer (silent, DC-09 §7.4) or
+        does not apply the snapshot (whole snapshot, atomic, DC-09
+        §5.1) when the declared applied_upto[W] > C, or when the field
+        is missing. It never raises its own applied_upto[W] above C
+        from a snapshot.
+        New entity, merged entity, delete: none arrive by snapshot,
+        also from an unaware sender. Clocks: applied_upto[W] stays <= C.
+        Sender: always declares; a tainted sender that holds the record
+        may skip offering. Cost: a tainted peer can no longer serve
+        full state to record holders; incremental sync keeps working
+        (TR-8) and untainted peers still serve full state. A Trigger A
+        or C condition toward that peer re-evaluates every session
+        (DC-09 §7.4). The declaration is trusted like any other field
+        from a paired peer (§5). Touches DC-08 §3.6 (additive field),
+        DC-09 §5 and §5.4; no schema change.
+
+     b) Sender self-restraint, no wire change.
+        A sender that holds C and is tainted neither offers nor answers
+        with full state. A receiver never raises applied_upto[W] above
+        C from a snapshot. Closes the case "after P learns the record";
+        an UNAWARE tainted sender still delivers B.1 a-c to a record
+        holder (the TD-041 window stays open until the record reaches
+        that sender). Touches DC-09 §3 and §5.4.
+
+     c) Latest-producer filter plus clock clamp.
+        Skip entries whose latest producer is W with seq > C (keep the
+        local state); clamp applied_upto[W] to C. New entity: blocked.
+        Merged entity: W's fields still arrive (B.1 c). Delete: still
+        arrives (B.1 b). Partial; the residual joins TD-045. Touches
+        DC-09 §5.2, §5.4.
+
+     d) Version-vector or snapshot_clock filter. Skip entries with
+        clock[W] > C, or whole snapshots with snapshot_clock[W] > C.
+        Drops other producers' legitimate state (B.1 d) and, by B.1 e),
+        blocks full state from nearly every peer once W's above-cutoff
+        changes are cited anywhere. Not recommended.
+
+     e) Per-field provenance. The snapshot carries, per field, the
+        last writer (device_id, seq), and a delete carries its remover;
+        the receiver keeps its local value for fields last written by
+        W above C. Most precise (a tainted peer still serves the rest),
+        but needs a DC-09 §4.2 / DC-08 §3.6 wire change and a durable
+        per-field store (DC-07): the change log that holds this today
+        is removed by compaction (DC-06). Candidate for a later
+        revision.
+
+     f) Accept the gap. Document it as a residual of P12, bounded like
+        TD-045 by the gossip window and by how rarely snapshots fire.
+        No code. Leaves TR-8's intent open for the snapshot path.
+
+B.4  ITEMS COMMON TO a) TO c)
+     - §4.4 KEPT is not changed: nothing already applied is removed.
+     - A declined user-requested resync (DC-09 Trigger B) shows no
+       reason today; whether to show one is a separate UI decision.
+     - Older builds: a missing declaration counts as tainted in a),
+       only on a receiver that holds a cutoff (V11 posture).
+
+B.5  TEST REQUIREMENTS (for the chosen option)
+     TR-16 the three "TD-041 repro" tests pass as ordinary tests (with
+           a); with b) for an aware sender only); a snapshot from an
+           untainted peer still delivers W's at-or-below-cutoff state
+           and other producers' state, and leaves applied_upto[W] at
+           or below C; each new guard has a mutation proof.

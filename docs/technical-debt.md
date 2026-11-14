@@ -465,7 +465,7 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 - **ID:** TD-036
 - **Title:** Inbound sessions (and Sync now to a typed address) ran the sync engine for ANY Noise key; a never-paired device on the network could read the whole calendar and inject changes
 - **Priority:** 10/10 — CRITICAL (confidentiality + integrity; found 2026-11-14 while drafting DC-27)
-- **Status:** RESOLVED (2026-11-14): `SyncManager.runEngineSession` refuses, before any record is served or applied, a session whose remote static key matches no `status='trusted'` peer; refusals logged with a per-kind 1/min throttle. PROVEN by `tests/inbound_trust_gate.test.ts` (fails 2/3 without the fix, passes with it). Blind review: SAFE WITH CONCERNS (minors applied). Still owned by DC-27: nothing writes `peers.status='revoked'` yet, and the gate does not yet use `canSynchronize` / the device_id = hash(key) check.
+- **Status:** RESOLVED (2026-11-14): `SyncManager.runEngineSession` refuses, before any record is served or applied, a session whose remote static key matches no `status='trusted'` peer; refusals logged with a per-kind 1/min throttle. PROVEN by `tests/inbound_trust_gate.test.ts` (fails 2/3 without the fix, passes with it). Blind review: SAFE WITH CONCERNS (minors applied). Completed by DC-27 (2026-11-14, uncommitted at time of writing): the gate now matches the handshake key against ALL peers rows (trusted and revoked), refuses a key whose row is revoked or whose id a stored valid revocation record names (DENY_REVOKED), and runs `canSynchronize` (device_id = hash(stored key), status) before any message; Unpair writes `status='revoked'`. Tests: `tests/inbound_trust_gate.test.ts` (unchanged) + `tests/dc27_unpair.test.ts` TR-1.
 
 ## TD-037 — Conflict resolution always writes entity_type "event" / operation "set"
 - **ID:** TD-037
@@ -480,3 +480,46 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 - **Priority:** 2/10 — LOW (latent: the sidecar is spawned once per app run and the shell has no sidecar-restart path today, so nothing currently depends on the snapshot)
 - **Status:** OPEN (pre-existing; found by the DC-11 Appendix A blind review, 2026-11-14)
 - **Note when fixing:** the snapshot must not store "removed" events, because `applySnapshot` (endpoint_bridge.ts) forces kind "added" and would resurrect a removed peer.
+
+## TD-039 — Windows: settings live inside the data folder
+- **ID:** TD-039
+- **Title:** On Windows `app_config_dir` and `app_data_dir` both resolve to `%APPDATA%\<profile_id>` (`com.tide.app`), so `config.toml` sits in the same folder as the database and the identity key. The DC-27 Path B step "rename the data folder" therefore also resets the Options settings on Windows (Linux keeps them in `~/.config/<profile_id>`). DC-15 §4.1 / DC-24 still name the folder `%APPDATA%\tide`.
+- **Priority:** 3/10 — LOW (settings only; no calendar data at risk)
+- **Status:** OPEN (found while resolving DC-27 V6, 2026-11-14). Evidence: `src-tauri/src/lib.rs` `config_dir()` / data dir in `setup()`; Tauri 2.11.5 `path/desktop.rs` (`dirs::config_dir()` / `dirs::data_dir()`); dirs 6.0.0 `win.rs` (both `known_folder_roaming_app_data`).
+- **Workaround:** copy `config.toml` from the renamed folder into the new one after the first start.
+
+## TD-040 — Pairing scanner stores trust before the other side confirms
+- **ID:** TD-040
+- **Title:** `acceptPairingPayload` (src/network/pairing_manager.ts) stores the displayer as trusted before it receives `PAIRING_OK`. If the displayer refuses (DC-27 P10 `PAIRING_REFUSED`) or fails, the scanner keeps a one-sided trust row (DC-05 Case A).
+- **Priority:** 3/10 — LOW (Case A is refused at the other side's gate; for DC-27 the scanner is the removed device, which already trusted the displayer)
+- **Status:** OPEN (pre-existing ceremony order; observed during DC-27, 2026-11-14)
+
+## TD-041 — Full-state snapshots ignore the revoked-producer cutoff
+- **ID:** TD-041
+- **Title:** DC-27 §4.14 / DC-05 Appendix A.2 drop a revoked producer's change records above the cutoff in `applyBatch`, and pull ranges are clamped. A DC-09 FULL_STATE_SNAPSHOT is applied without that filter, so state the revoked device authored after the cutoff arrives by snapshot from any peer that applied it during the gossip window, also after that peer has learned the revocation. The receiver's applied_upto for the revoked device rises above the cutoff, and an above-cutoff delete removes the receiver's copy through the absence rule.
+- **Priority:** 3/10 — LOW (PROVEN at the `applySnapshot` seam and at the session engine's snapshot handler; snapshots are rare: Trigger A only fires on persistent gaps and `sweep()` has no production caller)
+- **Status:** OPEN (PROVEN 2026-11-14 in `tests/dc27_unpair.test.ts` "TD-041 ..." tests, three of them `test.fails` until fixed). A snapshot entry carries one latest producer and a version vector, not per-field provenance, and the snapshot clock includes causal context, so no rule follows mechanically; options in DC-27 Appendix B (PROPOSAL, not approved). Decision needed.
+
+## TD-042 — Revocation wire shape differs from DC-08 §3.7
+- **ID:** TD-042
+- **Title:** The engine sends `REVOCATION_RECORDS { records: [{ record, signature_hex }] }`; DC-08 §3.7 specifies `{ revocations: [{ record, signature (base64) }] }` (DC-27 S7 / O3). Both ends run the same code, so they interoperate.
+- **Priority:** 2/10 — LOW (contract/code drift; owned by DC-08)
+- **Status:** OPEN (decision needed: amend DC-08 to the implemented shape, or change the code)
+
+## TD-043 — The offering device does not show a refused re-pair
+- **ID:** TD-043
+- **Title:** When a removed device scans this device's pairing code, this device refuses (DC-27 P10) and the scanner shows the refusal text, but the offering device's UI shows nothing: the `pairing_offer` result is consumed by the sidecar and never surfaced (same for any other offer-side failure).
+- **Priority:** 2/10 — LOW (UX; nothing is stored)
+- **Status:** OPEN (pre-existing offer-result plumbing; observed during DC-27, 2026-11-14)
+
+## TD-044 — The urgent-push ACK does not reach the revoking device
+- **ID:** TD-044
+- **Title:** After Unpair, the urgent push session (revoking device dials the peer) delivers the record and the peer accepts it (it refuses the removed device from then on), but the peer's REVOCATIONS_ACK is lost: the peer logs "sync outbound pump failed (carrier error, session fails closed): socket closed". The Removed devices list therefore shows that peer as "waiting" until the next ordinary session in which the ACK arrives (the record is re-sent, DC-10 §3 at-least-once).
+- **Priority:** 4/10 — MEDIUM (display lag only; enforcement is not affected)
+- **Status:** OPEN (OBSERVED 3/3 runs in `tests/probes/three_device_harness.mjs --scenario=unpair_propagation`, 2026-11-14; the in-process TR-6 test does receive the ACK). HYPOTHESIS: the initiator leaves the DC-08 session-end barrier and closes before the responder's ACK (sent after the async signature check) arrives — same class as TD-020. A fix touches the DC-08 barrier and needs its own review.
+
+## TD-045 — Post-cutoff data that reached an unaware peer stays only there
+- **ID:** TD-045
+- **Title:** Changes the removed device made after the cutoff that reached a peer before it learned the revocation stay on that peer (DC-27 §4.4 keeps them), and edits of those entities by that peer are not applied on devices that rejected the original (no row to update). Those devices permanently differ for such entities.
+- **Priority:** 2/10 — LOW (bounded by the Spec §19 gossip window; accepted by DC-27 P12)
+- **Status:** OPEN (OBSERVED in `tests/dc27_unpair.test.ts` "TR-8 an unaware P edits the rejected above-cutoff event": no quarantine row, P's stream keeps advancing, L has no row for the entity)

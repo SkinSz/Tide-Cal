@@ -258,6 +258,8 @@ export interface PeerStateRow {
     trigger_count: number;
   } | null;
   tally: { total_invalid: number; last_invalid_at: number } | null;
+  /** DC-27 P6: our last session attempt with this peer was refused. */
+  refused_us?: boolean;
 }
 
 /** One display row of the per-peer state section. */
@@ -340,8 +342,16 @@ function renderPeerStates(): void {
         const rec = document.createElement("div");
         rec.className = "muted";
         rec.textContent =
-          "Recommendation: unpair this device via the pairing/revocation flow (requires your confirmation; nothing happens automatically).";
-        row.appendChild(rec);
+          "Recommendation: unpair this device (Paired Devices, Unpair...). Nothing happens automatically.";
+        // DC-27 §4.1: Level 4 links to the one Unpair button (Paired
+        // Devices row); it opens that dialog and never unpairs by itself.
+        const open = document.createElement("button");
+        open.type = "button";
+        open.textContent = "Open Paired Devices";
+        open.addEventListener("click", () => {
+          document.getElementById("btn-paired-devices")?.click();
+        });
+        row.append(rec, open);
       }
       box.appendChild(row);
     }

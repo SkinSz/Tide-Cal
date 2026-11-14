@@ -695,7 +695,7 @@ async fn sync_op(
     op: String,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    const ALLOWED: [&str; 24] = [
+    const ALLOWED: [&str; 26] = [
         "device_info",
         "pairing_offer",
         "pairing_accept",
@@ -711,6 +711,10 @@ async fn sync_op(
         "list_paired_devices",
         "reset_peer_state",
         "unblock_peer",
+        // DC-27: Unpair (sidecar refuses without confirm:true) + the
+        // read-only Removed devices listing.
+        "unpair_device",
+        "list_removed_devices",
         "list_series",
         // DC-22: reminder member write path (event dialog "Remind me").
         "get_reminder",

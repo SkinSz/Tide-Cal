@@ -128,11 +128,18 @@ async function acceptPairing(): Promise<void> {
     setOfferPending(false); // successful pair closes the offer side too
     await renderDeviceInfo();
   } catch (err) {
-    log(`pairing failed: ${String(err)}`);
+    // DC-27 P10: a refused re-pair of an unpaired device shows the exact
+    // sentence (own local text, never peer-supplied).
+    const text = String(err);
+    log(text.includes(REVOKED_REPAIR_TEXT) ? REVOKED_REPAIR_TEXT : `pairing failed: ${text}`);
   } finally {
     setBusy(false);
   }
 }
+
+/** DC-27 §4.13 P10 wording (mirrors REVOKED_REPAIR_MESSAGE in the sidecar). */
+export const REVOKED_REPAIR_TEXT =
+  "This device was unpaired earlier. To pair it again, start it fresh first.";
 
 function log(msg: string): void {
   const box = el<HTMLDivElement>("devices-log");

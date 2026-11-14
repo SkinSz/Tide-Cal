@@ -2,7 +2,7 @@
 // One source of truth for table creation. Encryption-at-rest is applied at
 // connection level (SQLCipher key pragma) by the caller, not here.
 
-export const SCHEMA_VERSION = 8; // v2: TD-001 skipped_seqs; v3: TD-005 quarantine lifecycle (resolved_at_hlc, resolved_reason); v4: TD-006/DC-16 hard_blocks + peer_invalid_tally; v5: TD-005 quarantine_prune_stats (retention-cap bookkeeping); v6: Pkg1 entity_versions (durable per-entity version vectors, compaction-proof snapshots); v7: DC-21 peers.last_endpoint_host/port/seen (non-authoritative last-known endpoints); v8: GATE-2026-09-22 all-day end_date repair (exclusive-ms -> inclusive date, DC-07 'inclusive' semantics restored; no DDL change, data-only)
+export const SCHEMA_VERSION = 9; // v2: TD-001 skipped_seqs; v3: TD-005 quarantine lifecycle (resolved_at_hlc, resolved_reason); v4: TD-006/DC-16 hard_blocks + peer_invalid_tally; v5: TD-005 quarantine_prune_stats (retention-cap bookkeeping); v6: Pkg1 entity_versions (durable per-entity version vectors, compaction-proof snapshots); v7: DC-21 peers.last_endpoint_host/port/seen (non-authoritative last-known endpoints); v8: GATE-2026-09-22 all-day end_date repair (exclusive-ms -> inclusive date, DC-07 'inclusive' semantics restored; no DDL change, data-only); v9: DC-27 revocation_records.revoked_after_seq (DC-05 Appendix A cutoff) + revocation_acks (DC-07 Appendix X.1 persisted ACK store)
 
 export const DDL = `
 CREATE TABLE calendars (
@@ -206,7 +206,23 @@ CREATE TABLE revocation_records (
     verification_state   TEXT NOT NULL CHECK
                          (verification_state IN ('pending','valid','invalid')),
     received_at_hlc      INTEGER NOT NULL,
+    -- DC-27 P12 / DC-05 Appendix A: history cutoff carried in the signed
+    -- record (NULL for records signed without the field).
+    revoked_after_seq    INTEGER,
     PRIMARY KEY (revoked_device_id, revoked_by_device_id, revoked_at_hlc)
+);
+
+-- DC-27 P5 / DC-07 Appendix X.1: which revocation records each peer has
+-- ACKed (DC-10 §2.5 revocation_ack[peer][triple]). Never reset except by
+-- local data loss. Knowledge only: never feeds enforcement.
+CREATE TABLE revocation_acks (
+    peer_device_id       TEXT NOT NULL,
+    revoked_device_id    TEXT NOT NULL,
+    revoked_by_device_id TEXT NOT NULL,
+    revoked_at_hlc       INTEGER NOT NULL,
+    acked_at             INTEGER NOT NULL,
+    PRIMARY KEY (peer_device_id, revoked_device_id, revoked_by_device_id,
+                 revoked_at_hlc)
 );
 
 CREATE TABLE quarantine (

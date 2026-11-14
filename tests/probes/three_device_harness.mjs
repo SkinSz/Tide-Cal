@@ -761,6 +761,92 @@ SCENARIOS.stall_repro = async (rec, portBase) => {
   }
 };
 
+SCENARIOS.unpair_propagation = async (rec, portBase) => {
+  // DC-27 TR-6 / TR-11 / P6 on the BUILT bundle: A unpairs B; the urgent
+  // push tells C (endpoint known from an mDNS event, as in production); B is
+  // then refused by A and by C; A and C keep B's earlier event; B cannot
+  // re-pair under its old id.
+  const [a, b, c] = await spawnAndPair(rec, portBase, 3);
+  rec.pairing.push(await pair(b, c)); // full mesh: C must trust B for the refusal to matter
+  const expected = new ExpectedState();
+  rec.stages = [];
+  await mkEvent(b, expected, "from-B-before", 1, 9);
+  rec.sync_sessions = [];
+  rec.sync_sessions.push(await syncAttempt(b, a, false));
+  rec.sync_sessions.push(await syncAttempt(b, c, false));
+  rec.sync_sessions.push(await syncAttempt(c, a, false));
+  // C's endpoint reaches A the way the shell delivers it (mdns_event notification).
+  const cInfo = await c.rpc("device_info");
+  a.proc.stdin.write(
+    JSON.stringify({
+      id: null,
+      notification: "mdns_event",
+      args: {
+        kind: "added", instance_name: cInfo.instance_name, host: "127.0.0.1", port: c.port,
+        interface: "lo", observed_at: Date.now(), ttl_ms: 120000,
+      },
+    }) + "\n",
+  );
+  await pace();
+  let noConfirm = null;
+  try {
+    await a.rpc("unpair_device", { device_id: b.deviceId });
+  } catch (e) {
+    noConfirm = String(e.message ?? e);
+  }
+  rec.stages.push(`unpair without confirm: ${noConfirm}`);
+  if (!noConfirm || !noConfirm.includes("ERR_CONFIRM")) throw new Error("unpair_device ran without confirm:true");
+  const res = await a.rpc("unpair_device", { device_id: b.deviceId, confirm: true });
+  rec.unpair_result = { already: res.already, peers_to_tell: res.peers_to_tell };
+  if (res.already !== false || res.peers_to_tell !== 1) throw new Error(`unexpected unpair result ${JSON.stringify(rec.unpair_result)}`);
+  // urgent push: C learns the record without any manual A<->C sync. Proof:
+  // C refuses B. (Wait for A's push session to finish first.)
+  const toldNow = async () => {
+    const r = await a.rpc("list_removed_devices");
+    return r.removed.length === 1 && r.removed[0].told.length === 1 && r.removed[0].told[0].done === true;
+  };
+  await pace(1500);
+  await mkEvent(b, new ExpectedState(), "from-B-after", 1, 11);
+  const toC = await syncAttempt(b, c);
+  const toA = await syncAttempt(b, a);
+  rec.sync_sessions.push(toA, toC);
+  const refused = (s) => typeof s.error === "string" && s.error.includes("expected HELLO, got closed");
+  if (!refused(toA) || !refused(toC)) throw new Error(`B was not refused: A=${toA.error ?? "ok"} C=${toC.error ?? "ok"}`);
+  // "told" = C's ACK reached A (DC-10 §3 at-least-once: a lost ACK is
+  // repaired by the next ordinary session, which re-sends the record).
+  const toldAfterPush = await toldNow();
+  rec.stages.push(`A shows C told after the urgent push: ${toldAfterPush}`);
+  let toldAfterNext = toldAfterPush;
+  if (!toldAfterPush) {
+    rec.sync_sessions.push(await syncAttempt(c, a, false));
+    await pace();
+    toldAfterNext = await toldNow();
+    rec.stages.push(`A shows C told after one more C->A session: ${toldAfterNext}`);
+  }
+  if (!toldAfterNext) throw new Error("C's ACK never reached A");
+  const bDevices = await b.rpc("list_paired_devices");
+  const hint = (bDevices.devices ?? []).find((d) => d.device_id === a.deviceId)?.refused_us === true;
+  rec.stages.push(`P6 hint on B for A: ${hint}`);
+  const aDevices = await a.rpc("list_paired_devices");
+  if ((aDevices.devices ?? []).some((d) => d.device_id === b.deviceId)) throw new Error("B still listed on A");
+  // same-id re-pair refused (P10)
+  let repair = null;
+  try {
+    const offer = await a.rpc("pairing_offer", { name: a.name });
+    await b.rpc("pairing_accept", { qr_text: offer.qr_text, name: b.name });
+  } catch (e) {
+    repair = String(e.message ?? e);
+  }
+  rec.stages.push(`same-id re-pair: ${repair}`);
+  const repairRefused = repair !== null && repair.includes("This device was unpaired earlier. To pair it again, start it fresh first.");
+  a._lastListEvents = await readEvents(a);
+  c._lastListEvents = await readEvents(c);
+  rec.expected_events = expected.array();
+  rec.result = verifyDevices([a, c], expected);
+  rec.pass = rec.result.ok && hint && repairRefused;
+  if (!rec.pass) rec.error = rec.result.detail.join(" | ") || `hint=${hint} repairRefused=${repairRefused}`;
+};
+
 // --- report formatting -------------------------------------------------------
 function markdownDigest(run) {
   const L = [];

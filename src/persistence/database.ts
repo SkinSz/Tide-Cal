@@ -82,6 +82,9 @@ function initializeSchema(db: Database.Database): void {
       });
       tx();
     }
+    // DC-27 v9 repair (idempotent): a DB stamped v9 must carry the
+    // revocation cutoff column and the ACK store.
+    db.transaction(() => ensureRevocationSchemaV9(db))();
   } else if (row.version < SCHEMA_VERSION) {
     // Forward migrations (run oldest-first, inside one transaction).
     const tx = db.transaction(() => {
@@ -231,10 +234,49 @@ function initializeSchema(db: Database.Database): void {
           `);
         }
       }
+      if (row!.version < 9) {
+        // DC-27 P5/P12 (DC-07 Appendix X.1, DC-05 Appendix A): additive.
+        ensureRevocationSchemaV9(db);
+      }
       db.prepare("UPDATE schema_version SET version = ?").run(SCHEMA_VERSION);
     });
     tx();
   }
+}
+
+/**
+ * DC-27 v9 schema pieces, guarded so the migration and the == v9 repair can
+ * both run it: revocation_records (created if a hand-built DB lacks it) with
+ * the revoked_after_seq cutoff column, and the persisted revocation ACK
+ * store. Additive only: no existing row is changed.
+ */
+function ensureRevocationSchemaV9(db: Database.Database): void {
+  db.exec(`CREATE TABLE IF NOT EXISTS revocation_records (
+    revoked_device_id    TEXT NOT NULL,
+    revoked_by_device_id TEXT NOT NULL,
+    revoked_at_hlc       INTEGER NOT NULL,
+    reason               TEXT,
+    record_bytes         BLOB NOT NULL,
+    signature            BLOB NOT NULL,
+    verification_state   TEXT NOT NULL CHECK
+                         (verification_state IN ('pending','valid','invalid')),
+    received_at_hlc      INTEGER NOT NULL,
+    revoked_after_seq    INTEGER,
+    PRIMARY KEY (revoked_device_id, revoked_by_device_id, revoked_at_hlc))`);
+  const cols = (
+    db.prepare("PRAGMA table_info(revocation_records)").all() as Array<{ name: string }>
+  ).map((c) => c.name);
+  if (!cols.includes("revoked_after_seq")) {
+    db.exec("ALTER TABLE revocation_records ADD COLUMN revoked_after_seq INTEGER");
+  }
+  db.exec(`CREATE TABLE IF NOT EXISTS revocation_acks (
+    peer_device_id       TEXT NOT NULL,
+    revoked_device_id    TEXT NOT NULL,
+    revoked_by_device_id TEXT NOT NULL,
+    revoked_at_hlc       INTEGER NOT NULL,
+    acked_at             INTEGER NOT NULL,
+    PRIMARY KEY (peer_device_id, revoked_device_id, revoked_by_device_id,
+                 revoked_at_hlc))`);
 }
 
 // ---------------------------------------------------------------------------

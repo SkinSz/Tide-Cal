@@ -18,6 +18,7 @@ import {
   type PairingPayload,
 } from "../security/pairing.ts";
 import { ed25519ToX25519PublicKey } from "../network/noise_transport.ts";
+import { isKnownRevoked } from "../security/revocation_store.ts";
 import {
   serveSync,
   connectSync,
@@ -33,12 +34,33 @@ export interface TrustedPeerStore {
     displayName: string;
     pairedAtMs: number;
   }): boolean;
+  /**
+   * DC-27 P10 / DC-10 Appendix A.1: true when `deviceId` is 'revoked' here.
+   * A ceremony with such an id is refused before any trust is stored.
+   */
+  isRevoked?(deviceId: string): boolean;
+}
+
+/** DC-27 P10: the user-visible refusal (exact §4.13 wording). */
+export const REVOKED_REPAIR_MESSAGE =
+  "This device was unpaired earlier. To pair it again, start it fresh first.";
+
+export class PairingRefusedError extends Error {
+  constructor() {
+    super(REVOKED_REPAIR_MESSAGE);
+    this.name = "PairingRefusedError";
+  }
 }
 
 /** SQL-backed store over the DC-07 peers table. */
 export function sqlPeerStore(db: Database): TrustedPeerStore {
   return {
     store({ deviceId, publicKey, displayName, pairedAtMs }): boolean {
+      // DC-27 P10 (S8): the upsert can never flip a 'revoked' row back to
+      // trusted — the WHERE guard makes it a no-op, and a no-op is refused.
+      // An id named by a stored valid record is refused too (no peers row
+      // needed: known-revoked by gossip, DC-05 §7.3).
+      if (isKnownRevoked(db, deviceId)) throw new PairingRefusedError();
       const info = db
         .prepare(
           `INSERT INTO peers (device_id, public_key, display_name, paired_at,
@@ -48,7 +70,8 @@ export function sqlPeerStore(db: Database): TrustedPeerStore {
              public_key = excluded.public_key,
              display_name = excluded.display_name,
              paired_at = excluded.paired_at,
-             status = 'trusted'`,
+             status = 'trusted'
+           WHERE peers.status = 'trusted'`,
         )
         .run(
           deviceId,
@@ -56,7 +79,11 @@ export function sqlPeerStore(db: Database): TrustedPeerStore {
           displayName,
           Math.floor(pairedAtMs / 1000),
         );
+      if (info.changes === 0) throw new PairingRefusedError();
       return true;
+    },
+    isRevoked(deviceId: string): boolean {
+      return isKnownRevoked(db, deviceId);
     },
   };
 }
@@ -173,6 +200,16 @@ export async function createPairingOffer(opts: {
       };
       await session.json.send(localPayload);
       const remoteRaw = (await session.json.receive()) as PairingPayload;
+      // DC-27 P10: refuse a revoked id as soon as it is known, before any
+      // check or trust write; tell the scanner by CODE (it shows its own
+      // local text, never peer-supplied text).
+      if (
+        typeof remoteRaw?.device_id === "string" &&
+        opts.store.isRevoked?.(remoteRaw.device_id) === true
+      ) {
+        await session.json.send({ kind: "PAIRING_REFUSED", code: "revoked" });
+        throw new PairingRefusedError();
+      }
 
       const ps = new PairingSession();
       ps.exchangePayloads(localPayload, remoteRaw);
@@ -276,6 +313,11 @@ export async function acceptPairingPayload(opts: {
 }): Promise<ScanResult> {
   const remote = decodePairingPayload(opts.qrText); // strict validation + TR-9
   if (!remote.connect) throw new Error("payload has no connect hint");
+  // DC-27 P10: the remote id is known from the code itself — refuse before
+  // connecting, so nothing is exchanged and nothing is stored.
+  if (opts.store.isRevoked?.(remote.device_id) === true) {
+    throw new PairingRefusedError();
+  }
 
   const conn = await connectSync(
     opts.identity.privateKey,
@@ -317,7 +359,11 @@ export async function acceptPairingPayload(opts: {
       }),
     );
 
-    const ok = (await json.receive()) as { kind?: string };
+    const ok = (await json.receive()) as { kind?: string; code?: string };
+    if (ok?.kind === "PAIRING_REFUSED" && ok.code === "revoked") {
+      // The OTHER device unpaired this one earlier (its §4.13 refusal).
+      throw new PairingRefusedError();
+    }
     if (ok.kind !== "PAIRING_OK") {
       throw new Error("pairing not confirmed by other side");
     }

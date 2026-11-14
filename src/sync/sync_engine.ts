@@ -194,6 +194,37 @@ export interface RevocationChannel {
   acceptedTriples(): RevocationTriple[];
   /** §2.5: mark the peer's ack claims; stops re-sending to them. */
   recordAck(fromPeer: string, triples: RevocationTriple[]): void;
+  /**
+   * DC-05 Appendix A.2 (DC-27 P12): per known-revoked producer, the highest
+   * history cutoff held. Changes with seq > cutoff are dropped on arrival
+   * and never requested. Optional: channels without it reject nothing.
+   */
+  revokedCutoffs?(): Map<string, number>;
+}
+
+/**
+ * DC-08 §3.7 / TR-7 (DC-27 TR-10): a VALID revocation naming the CURRENT
+ * peer was accepted. The session stops: no further requests, batches or
+ * ACKs (not even the REVOCATIONS_ACK for the record itself).
+ */
+export class PeerRevokedCutoff extends Error {
+  constructor() {
+    super("session ended: the peer was revoked during this session");
+    this.name = "PeerRevokedCutoff";
+  }
+}
+
+/**
+ * DC-27 V8: the peer closed the channel before sending HELLO. Thrown only
+ * after the transport (TCP + Noise handshake) was established, so a caller
+ * can tell "closed after handshake" (e.g. the peer refused us at its trust
+ * gate) from "unreachable" (connect/handshake failure).
+ */
+export class PeerClosedBeforeHelloError extends Error {
+  constructor() {
+    super("protocol violation: expected HELLO, got closed");
+    this.name = "PeerClosedBeforeHelloError";
+  }
 }
 
 export interface SyncTransport {
@@ -272,6 +303,13 @@ export interface SessionStats {
    * Counted apart from receivedApplied so its meaning stays unchanged.
    */
   snapshotDeletions?: number;
+  /**
+   * DC-27 §4.14: changes dropped because their producer is known-revoked
+   * and their seq is above the held cutoff (no quarantine row, no skip row).
+   */
+  receivedRejectedRevoked?: number;
+  /** DC-27 TR-10: true when the session ended by the mid-session cutoff. */
+  peerRevoked?: boolean;
   /**
    * Pkg6 (item 8): true when this session's HELLO carried the DC-02 §4.1
    * "impossible under honest operation" anomaly — the peer advertised a
@@ -549,6 +587,25 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
       receivedQuarantined: 0,
       receivedDroppedIntake: 0,
     };
+    try {
+      return await runSessionInner(transport, stats);
+    } catch (err) {
+      if (!(err instanceof PeerRevokedCutoff)) throw err;
+      // DC-08 §3.7: close the session cleanly; nothing further is sent.
+      try {
+        transport.close?.();
+      } catch {
+        /* close must never mask the session's own outcome */
+      }
+      stats.peerRevoked = true;
+      return stats;
+    }
+  }
+
+  async function runSessionInner(
+    transport: SyncTransport,
+    stats: SessionStats,
+  ): Promise<SessionStats> {
     // DC-09 §3.5: offers_made_this_session is in-memory only; a new session
     // gets fresh dedup state.
     sessionDedup = new OfferDedup();
@@ -599,7 +656,9 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     // local by definition, and requesting them back left the range
     // permanently unservable-by-advancement, firing Trigger A on every
     // session between converged peers (see neededRanges doc).
-    let ranges = neededRanges(holder.knowledge, peerHello.device_clock, deps.selfDeviceId);
+    let ranges = clampRevoked(
+      neededRanges(holder.knowledge, peerHello.device_clock, deps.selfDeviceId),
+    );
     let gapRetries = 0;
     // M-5: absolute cap on total pull iterations. A peer that keeps changing
     // its advertised ranges must not extend the loop forever; gapRetries
@@ -617,9 +676,10 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
       if (batch === null) break; // peer sent a request instead; serve loop follows
       applyBatch(batch.changes, stats);
       const before = JSON.stringify(ranges);
-      ranges =
+      ranges = clampRevoked(
         batch.remaining_ranges ??
-        neededRanges(holder.knowledge, peerHello.device_clock, deps.selfDeviceId);
+          neededRanges(holder.knowledge, peerHello.device_clock, deps.selfDeviceId),
+      );
       if (JSON.stringify(ranges) === before) {
         gapRetries++; // unservable gap (compacted on peer): DC-09 Trigger A
         triggers.recordGapRound(peerKey);
@@ -969,12 +1029,26 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     const ch = revocations();
     if (ch === undefined) return;
     const peer = deps.peerDeviceId ?? "unknown";
-    for (const wire of msg.records) {
-      await ch.acceptInbound(
+    let namesPeer = false;
+    for (const wire of Array.isArray(msg.records) ? msg.records : []) {
+      if (wire === null || typeof wire !== "object" || typeof wire.signature_hex !== "string") {
+        continue; // malformed wire entry: nothing to verify
+      }
+      const accepted = await ch.acceptInbound(
         { record: wire.record, signature: sigFromHex(wire.signature_hex) },
         peer,
       );
+      if (
+        accepted &&
+        deps.peerDeviceId !== undefined &&
+        (wire.record as { revoked_device_id?: unknown } | null)?.revoked_device_id ===
+          deps.peerDeviceId
+      ) {
+        namesPeer = true;
+      }
     }
+    // DC-08 §3.7 / TR-7: one abort path for all three receive loops.
+    if (namesPeer) throw new PeerRevokedCutoff();
     await transport.send({
       v: 1,
       type: "REVOCATIONS_ACK",
@@ -1022,6 +1096,7 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     transport: SyncTransport,
     stats: SessionStats,
   ): Promise<void> {
+    assertPeerNotRevoked();
     const chunks: Snapshot[] = [];
     buildSnapshot(deps.db, (s) => chunks.push(s));
     if (chunks.length === 0) {
@@ -1046,6 +1121,7 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     msg: Extract<SyncMessage, { type: "FULL_STATE_SNAPSHOT" }>,
     stats: SessionStats,
   ): void {
+    assertPeerNotRevoked();
     const result = applySnapshot(
       deps.db,
       {
@@ -1198,7 +1274,48 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     return null;
   }
 
+  /** DC-27 §4.14: current cutoffs (re-read per call: mid-session acceptance). */
+  function currentCutoffs(): Map<string, number> {
+    return deps.revocations?.revokedCutoffs?.() ?? new Map();
+  }
+
+  /**
+   * DC-27 V5: never REQUEST a revoked producer's seqs above the cutoff. They
+   * would be dropped on arrival, the range would never shrink, and the pull
+   * loop would count persistent gap rounds (DC-09 Trigger A) every session.
+   */
+  function clampRevoked(
+    ranges: Array<{ device_id: string; lo: number; hi: number }>,
+  ): Array<{ device_id: string; lo: number; hi: number }> {
+    const cutoffs = currentCutoffs();
+    if (cutoffs.size === 0) return ranges;
+    const out: Array<{ device_id: string; lo: number; hi: number }> = [];
+    for (const r of ranges) {
+      const c = cutoffs.get(r.device_id);
+      if (c === undefined) {
+        out.push(r);
+        continue;
+      }
+      const hi = Math.min(r.hi, c);
+      if (r.lo <= hi) out.push({ device_id: r.device_id, lo: r.lo, hi });
+    }
+    return out;
+  }
+
+  /**
+   * DC-08 §3.7 / DC-27 §4.3: once the CURRENT peer is known-revoked (local
+   * unpair, or a record accepted in any session), nothing more is applied
+   * from it or served to it: the session ends at this message boundary.
+   */
+  function assertPeerNotRevoked(cutoffs: Map<string, number> = currentCutoffs()): void {
+    if (deps.peerDeviceId !== undefined && cutoffs.has(deps.peerDeviceId)) {
+      throw new PeerRevokedCutoff();
+    }
+  }
+
   function applyBatch(changes: ChangeRecord[], stats: SessionStats): void {
+    const cutoffs = currentCutoffs();
+    assertPeerNotRevoked(cutoffs);
     for (const raw of changes) {
       // TD-006 / DC-16 §2.1: per-PRODUCER key from the batch envelope's
       // record itself (cheap field read — no JSON parse / validation yet).
@@ -1215,6 +1332,19 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
       // Requests FROM the peer are still answered (serveRequests is
       // untouched; this gate is receive-of-data only).
       if (isHardBlocked(producer)) continue;
+
+      // --- DC-05 §7.3 as amended (Appendix A.2, DC-27 P12): a change of a
+      // known-revoked producer above the highest held cutoff is dropped on
+      // arrival: no quarantine row, no skip row, no clock merge, no ladder
+      // feed. Other producers' streams are untouched (V5).
+      const revokedCutoff = cutoffs.get(producer);
+      if (revokedCutoff !== undefined) {
+        const seq = (raw as { local_seq?: unknown } | null)?.local_seq;
+        if (typeof seq === "number" && Number.isInteger(seq) && seq > revokedCutoff) {
+          stats.receivedRejectedRevoked = (stats.receivedRejectedRevoked ?? 0) + 1;
+          continue;
+        }
+      }
 
       // --- TD-006 Tier 1 Level 2/3 (in-memory): throttle/suspend intake
       // drop. No quarantine rows, no skip entries, no per-packet UI
@@ -1317,6 +1447,7 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
   function fetchRanges(
     ranges: Array<{ device_id: string; lo: number; hi: number }>,
   ): ChangeRecord[] {
+    assertPeerNotRevoked();
     const out: ChangeRecord[] = [];
     const stmt = deps.db.prepare(`
       SELECT change_id, device_id, local_seq, entity_id, entity_type,
@@ -1369,6 +1500,7 @@ async function expectType<T extends SyncMessage["type"]>(
   type: T,
 ): Promise<Extract<SyncMessage, { type: T }>> {
   const msg = await nextMessage();
+  if (msg === null && type === "HELLO") throw new PeerClosedBeforeHelloError();
   if (msg === null || msg.type !== type || (msg as { v?: number }).v !== 1) {
     throw new Error(`protocol violation: expected ${type}, got ${msg?.type ?? "closed"}`);
   }
