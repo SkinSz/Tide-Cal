@@ -423,3 +423,28 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 - **Priority:** 2/10 — LOW (leftover rules are inert once the program path is gone)
 - **Status:** OPEN (INFERRED, not yet verified on Windows)
 - **Verify:** uninstall on a test PC, then `netsh advfirewall firewall show rule name="Tide sync"`.
+
+## TD-030 — Conflict dialog shows raw data instead of readable values
+- **ID:** TD-030
+- **Title:** Conflict candidates render as JSON (`{"startMs":…,"endMs":…}`), field names as internal paths (`schedule`), devices as ids
+- **Priority:** 7/10 — HIGH (users cannot make an informed choice; owner report 2026-11-14)
+- **Status:** OPEN — needs a design decision (formatting per field type: dates/times in the user's locale and time format, titles as text, recurrence rules in words, device by name)
+- **Relevant files:** `frontend/conflicts.ts` (`formatCandidateValue`, `describeConflict`, `describeCandidateSide`), `src/application/conflicts_ui.ts`
+
+## TD-031 — Conflicts badge count goes stale
+- **ID:** TD-031
+- **Title:** Badge count is read only at startup and after a resolution; a conflict created by a later sync shows "(0)" until restart
+- **Priority:** 7/10 — HIGH (conflicts go unnoticed; owner report 2026-11-14)
+- **Status:** RESOLVED (2026-11-14, DC-26): the badge re-reads after every calendar redraw (`tide:rendered`) and every sync that changed data (DC-26 TR-8)
+
+## TD-032 — Long device ids truncated with "…" in Devices / Sync views
+- **ID:** TD-032
+- **Title:** Device ids are cut off; the paired-devices list should show either the short id or a friendly name
+- **Priority:** 4/10 — MEDIUM
+- **Status:** OPEN — depends on the friendly-device-name design (future contract)
+
+## TD-033 — Layout breaks in small windows
+- **ID:** TD-033
+- **Title:** Below a certain window size the layout stops scaling and scroll bars appear
+- **Priority:** 4/10 — MEDIUM
+- **Status:** MITIGATED (2026-11-14, owner: "whatever is easier for now"): main window minimum size = the 800×600 default (`tauri.conf.json` minWidth/minHeight), the size the layout is known to work at. A responsive layout remains possible later.
