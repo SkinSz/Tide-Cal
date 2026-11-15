@@ -54,7 +54,7 @@ describe("sidecar stdio pipeline awaits async ops", () => {
     // stringified directly.
     expect(typeof res.result.qr_text).toBe("string");
     expect(res.result.qr_text!.length).toBeGreaterThan(0);
-    expect(res.result.qr_text!.startsWith('{"v":1')).toBe(true);
+    expect(res.result.qr_text!.startsWith('{"v":2')).toBe(true);
     core.db.close();
   });
 

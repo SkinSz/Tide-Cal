@@ -565,7 +565,8 @@ export type XxRole = "initiator" | "responder";
  * (e.g. length-prefix-framed TCP from sync_runtime) and return the encrypted
  * session transport bound to that carrier.
  *
- * DC-05 §5.3 roles: QR displayer = INITIATOR, scanner = RESPONDER; for
+ * DC-05 §5.3 roles as amended by Appendix B.11 (P11): the displayer listens
+ * and is the RESPONDER, the scanner connects and is the INITIATOR; for
  * post-pairing sync sessions either role assignment is valid (XX symmetry).
  *
  * Same fail-closed semantics as makeLocalDuplexPair: any handshake error

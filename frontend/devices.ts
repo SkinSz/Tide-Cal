@@ -108,11 +108,76 @@ function setOfferPending(pending: boolean): void {
   if (btn) btn.hidden = !pending;
 }
 
+/**
+ * The single text for every refused or ended pairing code (older format,
+ * expired, used up, ended after wrong attempts, malformed). Mirrors
+ * PAIRING_CODE_INVALID_MESSAGE in the backend.
+ */
+export const CODE_INVALID_TEXT = "This pairing code is no longer valid. Create a new one.";
+
+/** The other device could not be reached (mirrors PAIRING_UNREACHABLE_MESSAGE). */
+export const UNREACHABLE_TEXT =
+  "The other device could not be reached. Check that both devices are on the same network, then try again.";
+
+/** How often the shown code's state is checked while the dialog is open. */
+export const OFFER_POLL_MS = 2000;
+let offerPoll: ReturnType<typeof setTimeout> | null = null;
+
+function stopOfferPoll(): void {
+  if (offerPoll !== null) clearTimeout(offerPoll);
+  offerPoll = null;
+}
+
+function scheduleOfferPoll(): void {
+  stopOfferPoll();
+  offerPoll = setTimeout(() => void pollOffer(), OFFER_POLL_MS);
+}
+
+/** The shown code is dead: remove it (it carries a one-time secret). */
+function clearShownCode(): void {
+  const out = el<HTMLTextAreaElement>("pairing-code-out");
+  if (out) out.value = "";
+  setOfferPending(false);
+}
+
+/**
+ * Check the shown code once. An ended offer (too many wrong attempts, or
+ * its lifetime ran out, or a failed pairing) replaces the code with the
+ * single text; a completed pairing refreshes the list. Runs only while the
+ * dialog is open.
+ */
+export async function pollOffer(): Promise<void> {
+  offerPoll = null;
+  if (!dlg()?.open) return;
+  let status: unknown;
+  try {
+    status = (await syncOp<{ status?: unknown }>("pairing_offer_status")).status;
+  } catch {
+    status = undefined; // try again on the next tick
+  }
+  if (status === "ended") {
+    clearShownCode();
+    log(CODE_INVALID_TEXT);
+    return;
+  }
+  if (status === "paired") {
+    clearShownCode();
+    await renderDeviceInfo();
+    return;
+  }
+  if (status === "cancelled" || status === "none") {
+    clearShownCode();
+    return;
+  }
+  scheduleOfferPoll(); // open, pairing, or not readable right now
+}
+
 async function cancelPairingOffer(): Promise<void> {
   setBusy(true);
   try {
     await syncOp("cancel_pairing_offer", {});
-    setOfferPending(false);
+    stopOfferPoll();
+    clearShownCode();
     log(`Pairing offer cancelled`);
   } catch (err) {
     log(`pairing offer cancel failed: ${String(err)}`);
@@ -166,6 +231,7 @@ async function showPairingCode(): Promise<void> {
     out.value = res.qr_text;
     setOfferPending(true); // supersede of an older offer keeps it visible
     log(`pairing offer created — paste the code on the other device.`);
+    scheduleOfferPoll();
   } catch (err) {
     setOfferPending(false);
     log(`pairing offer failed: ${String(err)}`);
@@ -193,9 +259,18 @@ async function acceptPairing(): Promise<void> {
     await renderDeviceInfo();
   } catch (err) {
     // DC-27 P10: a refused re-pair of an unpaired device shows the exact
-    // sentence (own local text, never peer-supplied).
+    // sentence; every refused code shows the single code text. Both are
+    // own local texts, never peer-supplied.
     const text = String(err);
-    log(text.includes(REVOKED_REPAIR_TEXT) ? REVOKED_REPAIR_TEXT : `pairing failed: ${text}`);
+    log(
+      text.includes(REVOKED_REPAIR_TEXT)
+        ? REVOKED_REPAIR_TEXT
+        : text.includes(CODE_INVALID_TEXT)
+          ? CODE_INVALID_TEXT
+          : text.includes(UNREACHABLE_TEXT)
+            ? UNREACHABLE_TEXT
+            : `pairing failed: ${text}`,
+    );
   } finally {
     setBusy(false);
   }
@@ -288,6 +363,8 @@ export function initDevices(): void {
     ?.addEventListener("click", () => {
       dlg().showModal();
       void renderDeviceInfo();
+      // A code still shown from before: check whether it is still valid.
+      if (el<HTMLTextAreaElement>("pairing-code-out")?.value) void pollOffer();
     });
   document
     .getElementById("devices-close")
@@ -307,6 +384,7 @@ export function initDevices(): void {
   // Closing the dialog hides a pending offer's Cancel affordance; the offer
   // itself is still torn down server-side (stdin-EOF shutdown).
   dlg()?.addEventListener("close", () => {
+    stopOfferPoll();
     setOfferPending(false);
     const host = document.getElementById("self-name-editor");
     if (host) host.textContent = ""; // an unsaved rename is discarded

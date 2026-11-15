@@ -4107,18 +4107,18 @@ function validateTableBytes(numPoints, fpBytes) {
   if (bytes > TABLE_BYTES_MAX)
     throw new Error("invalid window size: table would need ~" + Math.ceil(bytes / 2 ** 20) + " MiB, max " + TABLE_BYTES_MAX / 2 ** 20 + " MiB");
 }
-function probeRandomBytes(randomBytes7, length) {
-  if (randomBytes7 === void 0)
+function probeRandomBytes(randomBytes6, length) {
+  if (randomBytes6 === void 0)
     return void 0;
-  afunction(randomBytes7, "randomBytes");
+  afunction(randomBytes6, "randomBytes");
   try {
-    const probe = randomBytes7(length);
+    const probe = randomBytes6(length);
     if (!isBytes3(probe) || probe.length !== length)
       return void 0;
   } catch {
     return void 0;
   }
-  return randomBytes7;
+  return randomBytes6;
 }
 function validateMSMPoints(points, c) {
   aarray(points, "points");
@@ -4211,9 +4211,9 @@ var ScalarMultiplier = class {
   baseCanBeBlinded;
   bits;
   // Parametrized with a given Point class (not individual point)
-  constructor(Point2, randomBytes7) {
+  constructor(Point2, randomBytes6) {
     validatePointCons(Point2);
-    this.randomBytes = probeRandomBytes(randomBytes7, BLIND_BYTES);
+    this.randomBytes = probeRandomBytes(randomBytes6, BLIND_BYTES);
     this.Point = Point2;
     this.BASE = Point2.BASE;
     this.ZERO = Point2.ZERO;
@@ -4484,7 +4484,7 @@ function edwards(params, extraOpts = {}) {
   if (FpLegendre(Fp2, CURVE.d) !== -1)
     throw new Error("edwards: CURVE.d must be a non-square in Fp for complete addition formulas");
   validateObject(opts, {}, { uvRatio: "function", randomBytes: "function" });
-  const randomBytes7 = opts.randomBytes === void 0 ? randomBytes3 : opts.randomBytes;
+  const randomBytes6 = opts.randomBytes === void 0 ? randomBytes3 : opts.randomBytes;
   const MASK = _2n2 << BigInt(Fp2.BYTES * 8) - _1n4;
   function isOdd(n) {
     if (!Fp2.isOdd)
@@ -4745,7 +4745,7 @@ function edwards(params, extraOpts = {}) {
     }
   }
   const normalize = (points) => normalizeZ(Point2, points);
-  const wnaf = new ScalarMultiplier(Point2, randomBytes7);
+  const wnaf = new ScalarMultiplier(Point2, randomBytes6);
   if (wnaf.bits >= 6)
     Point2.BASE.precompute(6);
   Object.freeze(Point2.prototype);
@@ -4777,7 +4777,7 @@ function eddsa(Point2, cHash, eddsaOpts = {}) {
     if (outputLen !== expectedLen)
       throw new Error(`hash.outputLen must be ${expectedLen}, got ${outputLen}`);
   }
-  const randomBytes7 = opts.randomBytes === void 0 ? randomBytes3 : opts.randomBytes;
+  const randomBytes6 = opts.randomBytes === void 0 ? randomBytes3 : opts.randomBytes;
   const toMontgomery2 = opts.toMontgomery;
   const toMontgomerySecret2 = opts.toMontgomerySecret;
   const adjustScalarBytes2 = opts.adjustScalarBytes === void 0 ? (bytes) => bytes : opts.adjustScalarBytes;
@@ -4867,7 +4867,7 @@ function eddsa(Point2, cHash, eddsaOpts = {}) {
     seed: _size
   };
   function randomSecretKey(seed) {
-    seed = seed === void 0 ? randomBytes7(lengths.seed) : seed;
+    seed = seed === void 0 ? randomBytes6(lengths.seed) : seed;
     return abytes3(seed, lengths.seed, "seed");
   }
   function isValidSecretKey(key) {
@@ -5599,7 +5599,8 @@ function serveSync(identitySeed, port, onSession) {
             "responder"
           ),
           json: makeJsonChannel(raw),
-          done: doneOnce
+          done: doneOnce,
+          destroy: () => sock.destroy()
         });
       } catch {
         sock.destroy();
@@ -5638,24 +5639,38 @@ async function connectSync(identitySeed, host, port) {
       const framing = inner;
       if (framing.flushing) setTimeout(() => sock.end(), 50);
       else sock.end();
-    }
+    },
+    destroy: () => sock.destroy()
   };
 }
 function jdbg(m) {
   if (globalThis.__TIDE_JDBG)
     console.error("[json]", m);
 }
+function describeFrame(obj, serializedLength) {
+  const shape = typeof obj === "object" && obj !== null && !Array.isArray(obj) ? `keys=[${Object.keys(obj).join(",")}]` : `type=${obj === null ? "null" : Array.isArray(obj) ? "array" : typeof obj}`;
+  return `${shape} len=${serializedLength}`;
+}
 function makeJsonChannel(raw) {
   const enc = new TextEncoder();
   const dec = new TextDecoder();
   let dead = false;
+  const kill = () => {
+    dead = true;
+    try {
+      raw.sendCipher.free();
+      raw.receiveCipher.free();
+    } catch {
+    }
+  };
   return {
     async send(obj) {
-      jdbg("send " + JSON.stringify(obj).slice(0, 60));
+      const text = JSON.stringify(obj);
+      jdbg("send " + describeFrame(obj, text.length));
       if (dead) throw new Error("json channel dead");
       const frame = raw.sendCipher.EncryptWithAd(
         new Uint8Array(0),
-        enc.encode(JSON.stringify(obj))
+        enc.encode(text)
       );
       raw.outbound.push(frame);
     },
@@ -5673,23 +5688,48 @@ function makeJsonChannel(raw) {
       try {
         plain = raw.receiveCipher.DecryptWithAd(new Uint8Array(0), frame);
       } catch (err2) {
-        dead = true;
-        try {
-          raw.sendCipher.free();
-          raw.receiveCipher.free();
-        } catch {
-        }
+        kill();
         throw new Error(`json channel decrypt failed (fail-closed): ${String(err2)}`);
       }
-      const obj = JSON.parse(dec.decode(plain));
-      jdbg("receive ok " + JSON.stringify(obj).slice(0, 60));
+      const text = dec.decode(plain);
+      const obj = JSON.parse(text);
+      jdbg("receive ok " + describeFrame(obj, text.length));
       return obj;
+    },
+    async receiveBounded(maxCipherBytes) {
+      if (dead) return { ok: false };
+      const frame = await raw.inbound.receive();
+      if (frame === null) {
+        jdbg("receive -> null (closed)");
+        return { ok: false };
+      }
+      if (frame.length > maxCipherBytes) {
+        jdbg(`receive oversize len=${frame.length}`);
+        kill();
+        return { ok: false };
+      }
+      let text;
+      try {
+        text = dec.decode(raw.receiveCipher.DecryptWithAd(new Uint8Array(0), frame));
+      } catch {
+        jdbg("receive decrypt failed");
+        kill();
+        return { ok: false };
+      }
+      try {
+        const obj = JSON.parse(text);
+        jdbg("receive ok " + describeFrame(obj, text.length));
+        return { ok: true, value: obj };
+      } catch {
+        jdbg(`receive not json len=${text.length}`);
+        return { ok: false };
+      }
     }
   };
 }
 function makePairingPayload(identity, port) {
   return {
-    v: 1,
+    v: 2,
     device_id: identity.deviceId,
     public_key: Buffer.from(identity.publicKey).toString("base64"),
     connect: { ip: localIpHint(), port }
@@ -6831,23 +6871,22 @@ function applyImportPlan(core, plan) {
   return report;
 }
 
-// src/network/pairing_manager.ts
-import { randomBytes as randomBytes6 } from "node:crypto";
-
 // src/security/pairing.ts
-import { createHash as createHash2, createHmac, randomBytes as randomBytes5 } from "node:crypto";
+import { createHash as createHash2, createHmac, randomBytes as randomBytes5, timingSafeEqual } from "node:crypto";
 var ERROR_MESSAGES = {
   MALFORMED_JSON: "payload is not valid JSON",
-  BAD_VERSION: "unsupported payload version (expected v===1)",
+  BAD_VERSION: "unsupported payload version (expected v===2)",
   MISSING_FIELD: "required field absent",
-  EXTRA_FIELD: "field outside the DC-05 \xA75.1 schema",
+  EXTRA_FIELD: "field outside the schema",
   BAD_TYPE: "field has wrong JSON type",
   BAD_DEVICE_ID: "device_id does not match d-<64 hex>",
   BAD_BASE64: "field is not well-formed base64",
   BAD_PUBLIC_KEY: "public_key is not a 32-byte Ed25519 key",
   SHORT_NONCE: "nonce shorter than 128 bits",
   NONCE_REUSE: "nonce was already seen in a recent pairing ceremony (TR-10)",
-  BAD_CONNECT: "connect hint malformed (ip/port invalid)"
+  BAD_CONNECT: "connect hint malformed (ip/port invalid)",
+  ID_KEY_MISMATCH: "device_id is not derived from public_key",
+  BAD_SECRET: "secret is not 16 bytes of canonical base64"
 };
 var PairingError = class extends Error {
   code;
@@ -6860,6 +6899,11 @@ var PairingError = class extends Error {
     this.field = field;
   }
 };
+var PAIRING_VERSION = 2;
+var PAIRING_SECRET_BYTES = 16;
+function freshPairingSecret() {
+  return randomBytes5(PAIRING_SECRET_BYTES);
+}
 function freshNonce() {
   return randomBytes5(16).toString("base64");
 }
@@ -6883,20 +6927,15 @@ function recordNonce(nonce, store) {
     store.delete(oldest.value);
   }
 }
-function encodePairingPayload(payload) {
-  const canonical = {
-    v: payload.v,
-    device_id: payload.device_id,
-    public_key: payload.public_key,
-    nonce: payload.nonce
-  };
-  if (payload.connect !== void 0) {
-    canonical.connect = { ip: payload.connect.ip, port: payload.connect.port };
-  }
-  if (payload.name !== void 0) {
-    canonical.name = payload.name;
-  }
-  return JSON.stringify(canonical);
+function encodePairingCode(code) {
+  return JSON.stringify({
+    v: code.v,
+    device_id: code.device_id,
+    public_key: code.public_key,
+    nonce: code.nonce,
+    secret: code.secret,
+    connect: { ip: code.connect.ip, port: code.connect.port }
+  });
 }
 function isPlainObject(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -6909,20 +6948,22 @@ function decodeBase64Strict(value, field) {
   if (buf.toString("base64") !== value) throw new PairingError("BAD_BASE64", field);
   return buf;
 }
-function decodePairingPayload(raw) {
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    throw new PairingError("MALFORMED_JSON");
-  }
+function decodeBase64Exact(value, bytes) {
+  if (typeof value !== "string" || !BASE64_RE.test(value)) return null;
+  const buf = Buffer.from(value, "base64");
+  if (buf.length !== bytes || buf.toString("base64") !== value) return null;
+  return buf;
+}
+function decodeIdentityFields(parsed, allowed) {
   if (!isPlainObject(parsed)) throw new PairingError("BAD_TYPE", "<root>");
-  const allowed = /* @__PURE__ */ new Set(["v", "device_id", "public_key", "nonce", "connect", "name"]);
-  for (const key of Object.keys(parsed)) {
-    if (!allowed.has(key)) throw new PairingError("EXTRA_FIELD", key);
-  }
   if (!("v" in parsed)) throw new PairingError("MISSING_FIELD", "v");
-  if (parsed.v !== 1 || typeof parsed.v !== "number") throw new PairingError("BAD_VERSION", "v");
+  if (typeof parsed.v !== "number" || parsed.v !== PAIRING_VERSION) {
+    throw new PairingError("BAD_VERSION", "v");
+  }
+  const allow = new Set(allowed);
+  for (const key of Object.keys(parsed)) {
+    if (!allow.has(key)) throw new PairingError("EXTRA_FIELD", key);
+  }
   for (const required of ["device_id", "public_key", "nonce"]) {
     if (!(required in parsed)) throw new PairingError("MISSING_FIELD", required);
   }
@@ -6931,31 +6972,79 @@ function decodePairingPayload(raw) {
   if (typeof parsed.public_key !== "string") throw new PairingError("BAD_TYPE", "public_key");
   const pkBytes = decodeBase64Strict(parsed.public_key, "public_key");
   if (pkBytes.length !== 32) throw new PairingError("BAD_PUBLIC_KEY", "public_key");
+  if (deriveDeviceId(pkBytes) !== parsed.device_id) {
+    throw new PairingError("ID_KEY_MISMATCH", "device_id");
+  }
   if (typeof parsed.nonce !== "string") throw new PairingError("BAD_TYPE", "nonce");
   const nonceBytes = decodeBase64Strict(parsed.nonce, "nonce");
   if (nonceBytes.length * 8 < 128) throw new PairingError("SHORT_NONCE", "nonce");
-  let connect2;
-  if ("connect" in parsed && parsed.connect !== void 0) {
-    if (!isPlainObject(parsed.connect)) throw new PairingError("BAD_TYPE", "connect");
-    for (const key of Object.keys(parsed.connect)) {
-      if (key !== "ip" && key !== "port") throw new PairingError("EXTRA_FIELD", `connect.${key}`);
-    }
-    if (!("ip" in parsed.connect) || !("port" in parsed.connect)) {
-      throw new PairingError("MISSING_FIELD", "connect.ip|port");
-    }
-    const { ip, port } = parsed.connect;
-    if (typeof ip !== "string" || ip.length === 0) throw new PairingError("BAD_CONNECT", "connect.ip");
-    if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535) {
-      throw new PairingError("BAD_CONNECT", "connect.port");
-    }
-    connect2 = { ip, port };
+  return parsed;
+}
+function decodePairingCode(raw) {
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new PairingError("MALFORMED_JSON");
   }
-  let name;
-  if ("name" in parsed && parsed.name !== void 0) {
-    if (typeof parsed.name !== "string") throw new PairingError("BAD_TYPE", "name");
-    name = parsed.name;
+  const p = decodeIdentityFields(parsed, ["v", "device_id", "public_key", "nonce", "secret", "connect"]);
+  if (!("secret" in p)) throw new PairingError("MISSING_FIELD", "secret");
+  if (decodeBase64Exact(p.secret, PAIRING_SECRET_BYTES) === null) {
+    throw new PairingError("BAD_SECRET", "secret");
   }
-  return { v: 1, device_id: parsed.device_id, public_key: parsed.public_key, nonce: parsed.nonce, connect: connect2, name };
+  if (!("connect" in p)) throw new PairingError("MISSING_FIELD", "connect");
+  if (!isPlainObject(p.connect)) throw new PairingError("BAD_TYPE", "connect");
+  for (const key of Object.keys(p.connect)) {
+    if (key !== "ip" && key !== "port") throw new PairingError("EXTRA_FIELD", `connect.${key}`);
+  }
+  if (!("ip" in p.connect) || !("port" in p.connect)) {
+    throw new PairingError("MISSING_FIELD", "connect.ip|port");
+  }
+  const { ip, port } = p.connect;
+  if (typeof ip !== "string" || ip.length === 0) throw new PairingError("BAD_CONNECT", "connect.ip");
+  if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new PairingError("BAD_CONNECT", "connect.port");
+  }
+  return {
+    v: 2,
+    device_id: p.device_id,
+    public_key: p.public_key,
+    nonce: p.nonce,
+    secret: p.secret,
+    connect: { ip, port }
+  };
+}
+function decodeCeremonyPayload(frame) {
+  const p = decodeIdentityFields(frame, ["v", "device_id", "public_key", "nonce", "name"]);
+  const out = { v: 2, device_id: p.device_id, public_key: p.public_key, nonce: p.nonce };
+  if ("name" in p) out.name = p.name;
+  return out;
+}
+var PAIRING_PROOF_LABEL = Buffer.concat([
+  Buffer.from("tide-pairing-proof-v2", "ascii"),
+  Buffer.from([0])
+]);
+var PAIRING_PROOF_BYTES = 32;
+function computePairingProof(secret, handshakeHash) {
+  return createHmac("sha256", Buffer.from(secret)).update(PAIRING_PROOF_LABEL).update(Buffer.from(handshakeHash)).digest();
+}
+function pairingProofFrame(secret, handshakeHash) {
+  return { kind: "PAIRING_PROOF", proof: computePairingProof(secret, handshakeHash).toString("base64") };
+}
+function verifyPairingProof(frame, secret, handshakeHash) {
+  if (secret === null || secret.length !== PAIRING_SECRET_BYTES) return false;
+  if (!isPlainObject(frame)) return false;
+  const keys = Object.keys(frame);
+  if (keys.length !== 2 || !("kind" in frame) || !("proof" in frame)) return false;
+  if (frame.kind !== "PAIRING_PROOF") return false;
+  const got = decodeBase64Exact(frame.proof, PAIRING_PROOF_BYTES);
+  if (got === null) return false;
+  const want = computePairingProof(secret, handshakeHash);
+  if (got.length !== want.length) return false;
+  const ok = timingSafeEqual(got, want);
+  want.fill(0);
+  got.fill(0);
+  return ok;
 }
 function digestToDigits(digest, digits) {
   const decimal = BigInt("0x" + digest.toString("hex")).toString();
@@ -6999,7 +7088,6 @@ var PairingSession = class _PairingSession {
       this.#state = "aborted";
       throw new PairingError("NONCE_REUSE", "nonce");
     }
-    recordNonce(remote.nonce, _PairingSession.recentNonces);
     this.#local = local;
     this.#remote = remote;
     this.#state = "payload_exchanged";
@@ -7038,6 +7126,7 @@ var PairingSession = class _PairingSession {
       this.abort();
       throw new PairingError("BAD_PUBLIC_KEY", "remote_static != X25519(QR public_key)");
     }
+    recordNonce(this.#remote.nonce, _PairingSession.recentNonces);
     this.#remoteVerified = true;
   }
   /** §6.1 V3: the safety number displayed to the user on THIS side. */
@@ -7542,6 +7631,34 @@ var PairingRefusedError = class extends Error {
     this.name = "PairingRefusedError";
   }
 };
+var PAIRING_CODE_INVALID_MESSAGE = "This pairing code is no longer valid. Create a new one.";
+var PAIRING_UNREACHABLE_MESSAGE = "The other device could not be reached. Check that both devices are on the same network, then try again.";
+var PairingUnreachableError = class extends Error {
+  reason;
+  constructor(reason) {
+    super(PAIRING_UNREACHABLE_MESSAGE);
+    this.name = "PairingUnreachableError";
+    this.reason = reason;
+  }
+};
+var PairingCodeInvalidError = class extends Error {
+  reason;
+  constructor(reason) {
+    super(PAIRING_CODE_INVALID_MESSAGE);
+    this.name = "PairingCodeInvalidError";
+    this.reason = reason;
+  }
+};
+var PAIRING_OFFER_BOUNDS = Object.freeze({
+  proofWaitMs: 1e4,
+  maxBadProofs: 3,
+  lifetimeMs: 10 * 6e4
+});
+var PAIRING_PROOF_MAX_CIPHER_BYTES = 256;
+var PAIRING_PAYLOAD_MAX_CIPHER_BYTES = 4096;
+function badProofLogLine(count) {
+  return `[tide] pairing: connection without valid proof closed (${count})`;
+}
 function sqlPeerStore(db) {
   return {
     store({ deviceId, publicKey, announcedName, pairedAtMs }) {
@@ -7604,7 +7721,7 @@ function sessionKeyMatchesCode(remoteStatic, edPublicKeyB64) {
 }
 function localCeremonyPayload(identity, nonce, name) {
   const p = {
-    v: 1,
+    v: 2,
     device_id: identity.deviceId,
     public_key: Buffer.from(identity.publicKey).toString("base64"),
     nonce
@@ -7618,6 +7735,7 @@ function receivedAnnouncedName(raw, senderDeviceId) {
   return r.name;
 }
 async function createPairingOffer(opts) {
+  const bounds = { ...PAIRING_OFFER_BOUNDS, ...opts.bounds };
   const ownName = ownNameForPayload(opts.name);
   let resolveOuter;
   let rejectOuter;
@@ -7627,139 +7745,223 @@ async function createPairingOffer(opts) {
       rejectOuter = rej;
     }
   );
-  let activeSession = null;
-  const host = await serveSync(opts.identity.privateKey, opts.port ?? 0, (s) => {
-    activeSession = s;
-    void runDisplayerSide(s).catch(rejectOuter);
-  });
-  async function runDisplayerSide(session) {
+  let secret = freshPairingSecret();
+  opts.testHooks?.secretBuffer?.(secret);
+  let status = "open";
+  let badProofs = 0;
+  const waiting = /* @__PURE__ */ new Set();
+  let ceremony = null;
+  let host = null;
+  let lifetimeTimer = null;
+  const destroySecret = () => {
+    if (secret !== null) {
+      secret.fill(0);
+      secret = null;
+    }
+  };
+  const drop = (s) => {
     try {
-      const localPayload = localCeremonyPayload(
-        opts.identity,
-        Buffer.from(freshNonce()).toString("base64"),
-        ownName
-      );
+      s.destroy();
+    } catch {
+    }
+  };
+  const stopListening = () => {
+    try {
+      host?.close();
+    } catch {
+    }
+  };
+  const finish = (next, err2) => {
+    if (status === "paired" || status === "ended" || status === "cancelled") return false;
+    status = next;
+    destroySecret();
+    if (lifetimeTimer !== null) clearTimeout(lifetimeTimer);
+    lifetimeTimer = null;
+    stopListening();
+    for (const s of waiting) drop(s);
+    waiting.clear();
+    if (next !== "paired") {
+      if (ceremony !== null) drop(ceremony);
+      rejectOuter(err2 ?? new PairingCodeInvalidError(next));
+    }
+    ceremony = null;
+    return true;
+  };
+  const onSession = (s) => {
+    if (status !== "open") {
+      drop(s);
+      return;
+    }
+    waiting.add(s);
+    void awaitProof(s);
+  };
+  async function awaitProof(s) {
+    let timer;
+    const timeout = new Promise((res) => {
+      timer = setTimeout(() => res({ ok: false }), bounds.proofWaitMs);
+      timer.unref?.();
+    });
+    const got = await Promise.race([
+      s.json.receiveBounded(PAIRING_PROOF_MAX_CIPHER_BYTES).catch(() => ({ ok: false })),
+      timeout
+    ]);
+    clearTimeout(timer);
+    if (!waiting.has(s)) return;
+    waiting.delete(s);
+    if (status === "open" && got.ok && verifyPairingProof(got.value, secret, s.raw.handshakeHash())) {
+      status = "pairing";
+      destroySecret();
+      stopListening();
+      for (const other of waiting) drop(other);
+      waiting.clear();
+      ceremony = s;
+      void runCeremony(s);
+      return;
+    }
+    drop(s);
+    badProofs++;
+    console.error(badProofLogLine(badProofs));
+    if (badProofs >= bounds.maxBadProofs) finish("ended", new PairingCodeInvalidError("bad_proofs"));
+  }
+  async function runCeremony(session) {
+    try {
+      const localPayload = localCeremonyPayload(opts.identity, freshNonce(), ownName);
       await session.json.send(localPayload);
-      const remoteRaw = await session.json.receive();
-      if (typeof remoteRaw?.device_id === "string" && opts.store.isRevoked?.(remoteRaw.device_id) === true) {
+      const got = await session.json.receiveBounded(PAIRING_PAYLOAD_MAX_CIPHER_BYTES);
+      if (!got.ok) throw new PairingCodeInvalidError("closed");
+      const remote = decodeCeremonyPayload(got.value);
+      if (opts.store.isRevoked?.(remote.device_id) === true) {
         await session.json.send({ kind: "PAIRING_REFUSED", code: "revoked" });
         throw new PairingRefusedError();
       }
       const ps = new PairingSession();
-      ps.exchangePayloads(localPayload, remoteRaw);
+      ps.exchangePayloads(localPayload, remote);
       ps.bindTranscript(session.raw.handshakeHash());
       ps.verifyRemoteStatic(session.raw.remoteStaticKey());
       const safetyNumber2 = ps.displaySafetyNumber();
       ps.confirmSafetyNumber(safetyNumber2, safetyNumber2);
+      if (status !== "pairing") throw new PairingCodeInvalidError("ended");
       ps.storeTrust(
         () => opts.store.store({
-          deviceId: remoteRaw.device_id,
-          publicKey: Buffer.from(remoteRaw.public_key, "base64"),
-          // DC-28 §4.5: from the encrypted payload; the 12-char id
-          // placeholder default is gone (older builds' placeholder is
-          // dropped by the id-prefix rule).
-          announcedName: receivedAnnouncedName(remoteRaw.name, remoteRaw.device_id),
+          deviceId: remote.device_id,
+          publicKey: Buffer.from(remote.public_key, "base64"),
+          // DC-28 §4.5: from the encrypted payload.
+          announcedName: receivedAnnouncedName(remote.name, remote.device_id),
           pairedAtMs: Date.now()
         })
       );
       await session.json.send({ kind: "PAIRING_OK" });
       session.done();
-      host.close();
-      resolveOuter({ peerDeviceId: remoteRaw.device_id, safetyNumber: safetyNumber2 });
+      if (finish("paired")) resolveOuter({ peerDeviceId: remote.device_id, safetyNumber: safetyNumber2 });
     } catch (err2) {
       session.done();
-      host.close();
-      rejectOuter(err2 instanceof Error ? err2 : new Error(String(err2)));
+      ceremony = null;
+      finish("ended", err2 instanceof Error ? err2 : new Error(String(err2)));
     }
   }
-  const { actualPort } = await new Promise((res) => {
-    setImmediate(() => res({ actualPort: host.actualPort }));
-  });
-  const base = makePairingPayload(opts.identity, actualPort);
-  const qrText = encodePairingPayload({
+  try {
+    host = await serveSync(opts.identity.privateKey, opts.port ?? 0, onSession);
+  } catch (err2) {
+    status = "cancelled";
+    destroySecret();
+    throw err2;
+  }
+  lifetimeTimer = setTimeout(
+    () => finish("ended", new PairingCodeInvalidError("expired")),
+    bounds.lifetimeMs
+  );
+  lifetimeTimer.unref?.();
+  const base = makePairingPayload(opts.identity, host.actualPort);
+  const qrText = encodePairingCode({
     ...base,
-    nonce: Buffer.from(freshNonce()).toString("base64")
+    nonce: freshNonce(),
+    secret: secret.toString("base64")
   });
-  void activeSession;
-  let offerClosed = false;
   const cancel = () => {
-    if (offerClosed) return;
-    offerClosed = true;
-    host.close();
-    try {
-      activeSession?.done();
-    } catch {
-    }
-    activeSession = null;
-    rejectOuter(new Error("pairing offer cancelled"));
+    finish("cancelled", new Error("pairing offer cancelled"));
   };
-  const originalResolve = resolveOuter;
-  resolveOuter = (v) => {
-    offerClosed = true;
-    originalResolve(v);
-  };
-  const originalReject = rejectOuter;
-  rejectOuter = (e) => {
-    offerClosed = true;
-    originalReject(e);
-  };
-  return { qrText, result, cancel };
+  return { qrText, result, cancel, status: () => status };
+}
+function refused(reason) {
+  console.error(`[tide] pairing: code refused (${reason})`);
+  return new PairingCodeInvalidError(reason);
+}
+function isConnRefusedOrClosed(err2) {
+  const code = err2?.code;
+  if (code === "ECONNREFUSED" || code === "ECONNRESET") return true;
+  return err2 instanceof Error && err2.message === "peer closed during handshake";
 }
 async function acceptPairingPayload(opts) {
   const ownName = ownNameForPayload(opts.name);
-  const remote = decodePairingPayload(opts.qrText);
-  if (!remote.connect) throw new Error("payload has no connect hint");
-  if (opts.store.isRevoked?.(remote.device_id) === true) {
+  let code;
+  try {
+    code = decodePairingCode(opts.qrText);
+  } catch (err2) {
+    if (err2 instanceof PairingError) throw refused(err2.code);
+    throw err2;
+  }
+  if (opts.store.isRevoked?.(code.device_id) === true) {
     throw new PairingRefusedError();
   }
-  const conn = await connectSync(
-    opts.identity.privateKey,
-    remote.connect.ip,
-    remote.connect.port
-  );
+  const secret = decodeBase64Exact(code.secret, PAIRING_SECRET_BYTES);
+  const codeKey = Buffer.from(code.public_key, "base64");
+  let conn;
+  try {
+    conn = await connectSync(opts.identity.privateKey, code.connect.ip, code.connect.port);
+  } catch (err2) {
+    secret.fill(0);
+    if (isConnRefusedOrClosed(err2)) throw refused("unreachable");
+    const errCode = err2?.code;
+    const reason = typeof errCode === "string" && /^[A-Z_]+$/.test(errCode) ? errCode : "other";
+    console.error(`[tide] pairing: connect failed (${reason})`);
+    throw new PairingUnreachableError(reason);
+  }
   const json = conn.json;
   try {
-    const sessionIsPastedDevice = sessionKeyMatchesCode(
-      conn.raw.remoteStaticKey(),
-      remote.public_key
-    );
-    const localPayload = localCeremonyPayload(
-      opts.identity,
-      Buffer.from(randomBytes6(16)).toString("base64"),
-      sessionIsPastedDevice ? ownName : void 0
-    );
-    const firstRaw = await json.receive();
-    const remoteRaw = firstRaw;
+    if (!sessionKeyMatchesCode(conn.raw.remoteStaticKey(), code.public_key)) {
+      throw refused("session_key");
+    }
+    const h2 = conn.raw.handshakeHash();
+    await json.send(pairingProofFrame(secret, h2));
+    secret.fill(0);
+    const first = await json.receiveBounded(PAIRING_PAYLOAD_MAX_CIPHER_BYTES);
+    if (!first.ok) throw refused("closed");
+    const remote = decodeCeremonyPayload(first.value);
+    if (remote.device_id !== code.device_id || !Buffer.from(remote.public_key, "base64").equals(codeKey)) {
+      throw refused("payload_mismatch");
+    }
+    const localPayload = localCeremonyPayload(opts.identity, freshNonce(), ownName);
     await json.send(localPayload);
     const ps = new PairingSession();
-    ps.exchangePayloads(localPayload, remoteRaw);
-    ps.bindTranscript(conn.raw.handshakeHash());
+    ps.exchangePayloads(localPayload, remote);
+    ps.bindTranscript(h2);
     ps.verifyRemoteStatic(conn.raw.remoteStaticKey());
     const safetyNumber2 = ps.displaySafetyNumber();
     ps.confirmSafetyNumber(safetyNumber2, safetyNumber2);
     ps.storeTrust(
       () => opts.store.store({
-        deviceId: remote.device_id,
-        publicKey: Buffer.from(remote.public_key, "base64"),
-        // DC-28 §4.5 (fixes S2): the name from the ENCRYPTED payload, never
-        // from the pasted code. Accepted only when the session key is the
-        // pasted code's key AND the encrypted payload names the same
-        // identity (V2 here checks the encrypted payload's key, not the
-        // pasted one: TD-049), so another sender's name is never attached
-        // to the pasted device.
-        announcedName: sessionIsPastedDevice && remoteRaw?.device_id === remote.device_id && remoteRaw?.public_key === remote.public_key ? receivedAnnouncedName(remoteRaw.name, remote.device_id) : null,
+        // The code identity, which by S1-S3 equals the session identity.
+        deviceId: code.device_id,
+        publicKey: codeKey,
+        // DC-28 §4.5: the name from the ENCRYPTED payload, never the code.
+        announcedName: receivedAnnouncedName(remote.name, code.device_id),
         pairedAtMs: Date.now()
       })
     );
-    const ok = await json.receive();
-    if (ok?.kind === "PAIRING_REFUSED" && ok.code === "revoked") {
+    const ok = await json.receiveBounded(PAIRING_PAYLOAD_MAX_CIPHER_BYTES);
+    const msg = ok.ok ? ok.value : null;
+    if (msg?.kind === "PAIRING_REFUSED" && msg.code === "revoked") {
       throw new PairingRefusedError();
     }
-    if (ok.kind !== "PAIRING_OK") {
-      throw new Error("pairing not confirmed by other side");
+    if (msg?.kind !== "PAIRING_OK") {
+      throw refused("not_confirmed");
     }
-    return { peerDeviceId: remote.device_id, safetyNumber: safetyNumber2 };
+    return { peerDeviceId: code.device_id, safetyNumber: safetyNumber2 };
+  } catch (err2) {
+    if (err2 instanceof PairingError) throw refused(err2.code);
+    throw err2;
   } finally {
+    secret.fill(0);
     conn.done();
   }
 }
@@ -10816,9 +11018,20 @@ var SyncManager = class {
    * dispatcher; cancel() rejects it with a benign error.
    */
   pendingOffer = null;
+  /**
+   * DC-05 Appendix B.6 (P7/P8): the status of the most recent offer, kept
+   * after it ends so the displayer's UI can show that the code is no longer
+   * valid. Holds the status function only, never the code text (B.2).
+   */
+  latestOfferStatus = null;
   trackPairingOffer(offer) {
     this.cancelPendingOffer("superseded by a newer pairing offer");
-    this.pendingOffer = offer;
+    this.pendingOffer = { result: offer.result, cancel: offer.cancel };
+    this.latestOfferStatus = offer.status ?? null;
+  }
+  /** "none" before any offer; otherwise the latest offer's status. */
+  pairingOfferStatus() {
+    return this.latestOfferStatus?.() ?? "none";
   }
   cancelPendingOffer(_reason) {
     const offer = this.pendingOffer;
@@ -10831,11 +11044,11 @@ var SyncManager = class {
   }
   /** True when `offer` is the currently tracked pending offer. */
   hasPendingOffer(offer) {
-    return this.pendingOffer === offer;
+    return this.pendingOffer?.cancel === offer.cancel;
   }
   /** Drop the tracking entry without cancelling (ceremony completed). */
   untrackPairingOffer(offer) {
-    if (this.pendingOffer === offer) this.pendingOffer = null;
+    if (this.pendingOffer?.cancel === offer.cancel) this.pendingOffer = null;
   }
   /**
    * Run a sync engine session over an authenticated channel.
@@ -11513,15 +11726,18 @@ function makeSyncDispatcher(sync, core, endpoints) {
           store: sqlPeerStore(core.db)
         });
         void offerPromise.then((o) => {
-          sync.trackPairingOffer(o);
+          const handle = { result: o.result, cancel: o.cancel, status: o.status };
+          sync.trackPairingOffer(handle);
           o.result.catch(() => {
           }).finally(() => {
-            if (sync.hasPendingOffer(o)) sync.untrackPairingOffer(o);
+            if (sync.hasPendingOffer(handle)) sync.untrackPairingOffer(handle);
           });
-          return o;
         }).catch(() => {
         });
         return offerPromise.then((o) => ({ qr_text: o.qrText }));
+      }
+      case "pairing_offer_status": {
+        return { status: sync.pairingOfferStatus() };
       }
       case "cancel_pairing_offer": {
         sync.cancelPendingOffer("user cancel");
@@ -11532,7 +11748,6 @@ function makeSyncDispatcher(sync, core, endpoints) {
           throw new Error("qr_text required");
         return acceptPairingPayload({
           identity: sync.identity,
-          qr_text_text: void 0,
           qrText: args.qr_text,
           name: sync.ownDeviceName ?? void 0,
           // DC-28 P3 (see pairing_offer)
@@ -11727,7 +11942,7 @@ function main() {
     }
     schedulerHandle.updateSchedulerSettings(partial);
     return { applied: true, next_start_only: "max_incremental_backlog" };
-  })() : op.startsWith("sync_") || op === "device_info" || op === "pairing_offer" || op === "pairing_accept" || op === "cancel_pairing_offer" || op === "list_quarantine" || op === "quarantine_stats" || op === "retry_quarantine" || op === "delete_quarantine" || op === "peer_state" || op === "list_paired_devices" || op === "reset_peer_state" || op === "unblock_peer" || op === "unpair_device" || op === "list_removed_devices" || // DC-28: own name (shell-only) + local nickname
+  })() : op.startsWith("sync_") || op === "device_info" || op === "pairing_offer" || op === "pairing_accept" || op === "cancel_pairing_offer" || op === "pairing_offer_status" || op === "list_quarantine" || op === "quarantine_stats" || op === "retry_quarantine" || op === "delete_quarantine" || op === "peer_state" || op === "list_paired_devices" || op === "reset_peer_state" || op === "unblock_peer" || op === "unpair_device" || op === "list_removed_devices" || // DC-28: own name (shell-only) + local nickname
   op === "set_device_name" || op === "set_peer_nickname" ? syncDispatch(op, args) : dispatch(op, args);
   const pairedDeviceIds = () => listTrustedPeers(core.db).map((p) => p.device_id);
   const expectedPrefixes = () => {

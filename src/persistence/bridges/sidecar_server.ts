@@ -369,14 +369,28 @@ export class SyncManager {
     cancel: () => void;
   } | null = null;
 
+  /**
+   * DC-05 Appendix B.6 (P7/P8): the status of the most recent offer, kept
+   * after it ends so the displayer's UI can show that the code is no longer
+   * valid. Holds the status function only, never the code text (B.2).
+   */
+  private latestOfferStatus: (() => string) | null = null;
+
   trackPairingOffer(offer: {
     result: Promise<unknown>;
     cancel: () => void;
+    status?: () => string;
   }): void {
     // One live offer at a time: a newer offer supersedes (and closes) the
     // previous listener.
     this.cancelPendingOffer("superseded by a newer pairing offer");
-    this.pendingOffer = offer;
+    this.pendingOffer = { result: offer.result, cancel: offer.cancel };
+    this.latestOfferStatus = offer.status ?? null;
+  }
+
+  /** "none" before any offer; otherwise the latest offer's status. */
+  pairingOfferStatus(): string {
+    return this.latestOfferStatus?.() ?? "none";
   }
 
   cancelPendingOffer(_reason: string): void {
@@ -392,12 +406,12 @@ export class SyncManager {
 
   /** True when `offer` is the currently tracked pending offer. */
   hasPendingOffer(offer: { cancel: () => void }): boolean {
-    return this.pendingOffer === offer;
+    return this.pendingOffer?.cancel === offer.cancel;
   }
 
   /** Drop the tracking entry without cancelling (ceremony completed). */
   untrackPairingOffer(offer: { cancel: () => void }): void {
-    if (this.pendingOffer === offer) this.pendingOffer = null;
+    if (this.pendingOffer?.cancel === offer.cancel) this.pendingOffer = null;
   }
 
   /**
@@ -1325,7 +1339,7 @@ export function makeSyncDispatcher(
       }
       case "pairing_offer": {
         // NOTE: synchronous snapshot of an async ceremony — the offer object
-        // keeps working after return; result arrives via pairing_status polls.
+        // keeps working after return; its state is read with pairing_offer_status.
         // The offer is TRACKED on the SyncManager: a newer offer supersedes
         // it, cancel_pairing_offer closes it, and stdin-EOF shutdown closes
         // it — an uncancelled offer would be a live pairing listener that
@@ -1341,16 +1355,23 @@ export function makeSyncDispatcher(
         });
         void offerPromise
           .then((o) => {
-            sync.trackPairingOffer(o);
+            // Tracked WITHOUT the code text (DC-05 Appendix B.2).
+            const handle = { result: o.result, cancel: o.cancel, status: o.status };
+            sync.trackPairingOffer(handle);
             // Self-untrack when the ceremony completes either way (paired,
             // errored, or cancelled): nothing left to cancel afterwards.
             o.result.catch(() => {}).finally(() => {
-              if (sync.hasPendingOffer(o)) sync.untrackPairingOffer(o);
+              if (sync.hasPendingOffer(handle)) sync.untrackPairingOffer(handle);
             });
-            return o;
           })
           .catch(() => {});
         return offerPromise.then((o) => ({ qr_text: o.qrText }));
+      }
+      case "pairing_offer_status": {
+        // DC-05 Appendix B.6 (P7/P8): read-only; lets the displayer's UI
+        // replace an ended code with the single "no longer valid" text.
+        // Values: none | open | pairing | paired | ended | cancelled.
+        return { status: sync.pairingOfferStatus() };
       }
       case "cancel_pairing_offer": {
         // Explicit user cancellation of the pending offer (Devices dialog).
@@ -1361,13 +1382,14 @@ export function makeSyncDispatcher(
       case "pairing_accept": {
         if (typeof args.qr_text !== "string")
           throw new Error("qr_text required");
+        // Errors: the DC-27 refusal text, or the single DC-05 P13 text for
+        // every refused code (classified in acceptPairingPayload).
         return acceptPairingPayload({
           identity: sync.identity,
-          qr_text_text: undefined,
           qrText: args.qr_text,
           name: sync.ownDeviceName ?? undefined, // DC-28 P3 (see pairing_offer)
           store: sqlPeerStore(core.db),
-        } as never).then((r) => ({
+        }).then((r) => ({
           peer_device_id: r.peerDeviceId,
           safety_number: r.safetyNumber,
         }));
@@ -1620,7 +1642,7 @@ function main(): void {
         })()
       : op.startsWith("sync_") || op === "device_info" ||
     op === "pairing_offer" || op === "pairing_accept" ||
-    op === "cancel_pairing_offer" ||
+    op === "cancel_pairing_offer" || op === "pairing_offer_status" ||
     op === "list_quarantine" || op === "quarantine_stats" ||
     op === "retry_quarantine" || op === "delete_quarantine" ||
     op === "peer_state" || op === "list_paired_devices" ||

@@ -2,19 +2,29 @@
 // REAL Noise_XX session over TCP (via sync_runtime) and persists trust into
 // the `peers` table. Composition only — all checks stay in the security layer.
 //
-// Flow (initiator = QR displayer side):
-//   1. createPairingOffer()  -> payload string to show as QR (+ we listen)
-//   2. scanner scans, calls acceptPairingPayload(raw, host, port)
-//   3. both sides complete Noise_XX over TCP; remote static is verified
-//      against the announced QR key (V1/V2), transcript bound (V3),
-//      safety numbers compared by humans (V3), then stored (V4).
-import { randomBytes } from "node:crypto";
+// Flow (DC-05 §5 with Appendix B, v2 codes). Roles per B.11: the displayer
+// LISTENS (Noise responder), the scanner CONNECTS (Noise initiator).
+//   1. createPairingOffer()  -> v2 code (with a one-time secret) to show
+//   2. the code is pasted on the scanner: acceptPairingPayload(code)
+//   3. Noise_XX over TCP; the scanner checks the session key against the
+//      code (S1) and sends PAIRING_PROOF = HMAC(secret, label || h) first
+//   4. the displayer answers ONLY after a valid proof (B.4): its payload,
+//      then the scanner's payload (after S2/S3), then PAIRING_OK/REFUSED
+//   5. both sides strictly decode the received payload (B.7), bind it to
+//      the session key (V2), transcript bound (V3), then store (V4).
 import type { Database } from "better-sqlite3";
 import {
+  PairingError,
   PairingSession,
+  PAIRING_SECRET_BYTES,
+  decodeBase64Exact,
+  decodeCeremonyPayload,
+  decodePairingCode,
+  encodePairingCode,
   freshNonce,
-  encodePairingPayload,
-  decodePairingPayload,
+  freshPairingSecret,
+  pairingProofFrame,
+  verifyPairingProof,
   type PairingPayload,
 } from "../security/pairing.ts";
 import { ed25519ToX25519PublicKey } from "../network/noise_transport.ts";
@@ -56,6 +66,74 @@ export class PairingRefusedError extends Error {
     super(REVOKED_REPAIR_MESSAGE);
     this.name = "PairingRefusedError";
   }
+}
+
+/**
+ * DC-05 Appendix B.10 (P13, owner decision B.D): ONE user-visible text for
+ * every refused code (older format, expired, used up, ended by too many
+ * bad proofs or by its lifetime, malformed).
+ */
+export const PAIRING_CODE_INVALID_MESSAGE =
+  "This pairing code is no longer valid. Create a new one.";
+
+/**
+ * A refused code. The message is always the single P13 text; `reason` is a
+ * fixed machine token for logs and tests (never a field value, never the
+ * secret or the proof).
+ */
+/**
+ * The other device could not be reached for a reason other than a refused
+ * or closed connection (EHOSTUNREACH, ETIMEDOUT, a name that does not
+ * resolve, ...). Plain text only; the detail goes to the log.
+ */
+export const PAIRING_UNREACHABLE_MESSAGE =
+  "The other device could not be reached. Check that both devices are on the same network, then try again.";
+
+export class PairingUnreachableError extends Error {
+  readonly reason: string;
+  constructor(reason: string) {
+    super(PAIRING_UNREACHABLE_MESSAGE);
+    this.name = "PairingUnreachableError";
+    this.reason = reason;
+  }
+}
+
+export class PairingCodeInvalidError extends Error {
+  readonly reason: string;
+  constructor(reason: string) {
+    super(PAIRING_CODE_INVALID_MESSAGE);
+    this.name = "PairingCodeInvalidError";
+    this.reason = reason;
+  }
+}
+
+/** B.6 bounds of an open offer (P6, P7, P8). */
+export interface PairingOfferBounds {
+  /** P6: a handshaken connection must deliver its proof within this time. */
+  proofWaitMs: number;
+  /** P7: the offer ends after this many bad proofs. */
+  maxBadProofs: number;
+  /** P8: the offer ends this long after it was created. */
+  lifetimeMs: number;
+}
+
+export const PAIRING_OFFER_BOUNDS: Readonly<PairingOfferBounds> = Object.freeze({
+  proofWaitMs: 10_000,
+  maxBadProofs: 3,
+  lifetimeMs: 10 * 60_000,
+});
+
+/**
+ * Ciphertext caps BEFORE decryption: the proof frame is ~70 bytes of JSON
+ * plus the 16-byte tag; a ceremony payload with a DC-28 name stays well
+ * under the payload cap.
+ */
+export const PAIRING_PROOF_MAX_CIPHER_BYTES = 256;
+export const PAIRING_PAYLOAD_MAX_CIPHER_BYTES = 4096;
+
+/** B.4: the one fixed line for a connection closed without a valid proof. */
+export function badProofLogLine(count: number): string {
+  return `[tide] pairing: connection without valid proof closed (${count})`;
 }
 
 /** SQL-backed store over the DC-07 peers table. */
@@ -177,7 +255,7 @@ function localCeremonyPayload(
   name: string | undefined,
 ): PairingPayload {
   const p: PairingPayload = {
-    v: 1,
+    v: 2,
     device_id: identity.deviceId,
     public_key: Buffer.from(identity.publicKey).toString("base64"),
     nonce,
@@ -198,30 +276,49 @@ export function receivedAnnouncedName(raw: unknown, senderDeviceId: string): str
 }
 
 // ---------------------------------------------------------------------------
-// Side A — QR displayer (Noise INITIATOR role per DC-05 §5.3, but roles are
-// symmetric in XX; here displayer HOSTS and shows the offer with its port).
+// Side A — displayer (shows the code, LISTENS: Noise responder, B.11).
 // ---------------------------------------------------------------------------
 
+/**
+ * open      listening, waiting for a valid proof
+ * pairing   a valid proof was accepted; the ceremony runs on that connection
+ * paired    trust stored, PAIRING_OK sent
+ * ended     the code is no longer valid (P7 bad proofs, P8 lifetime, or a
+ *           failed ceremony after the proof, B.5)
+ * cancelled cancelled, superseded or shut down
+ */
+export type PairingOfferStatus = "open" | "pairing" | "paired" | "ended" | "cancelled";
+
 export interface PairingOffer {
-  /** JSON string to render as QR (or paste on the other device). */
+  /** The v2 code to show (paste on the other device). Contains the secret. */
   qrText: string;
   /** Resolves after the ceremony completes (or rejects with reason). */
   result: Promise<{ peerDeviceId: string; safetyNumber: string }>;
   /**
-   * Close the one-shot pairing listener WITHOUT waiting for a scanner.
-   * Callers MUST keep this to cancel an offer (GUI close, superseded by a
-   * newer offer, sidecar shutdown): an uncancelled offer keeps a live
-   * listener that still accepts pairing handshakes — a security surface,
-   * not just a resource leak. Idempotent; after the ceremony self-closes
-   * the host this is a no-op.
+   * Close the offer WITHOUT waiting for a scanner: the listener, every open
+   * connection, and the secret. Callers MUST keep this to cancel an offer
+   * (GUI close, superseded by a newer offer, sidecar shutdown): an
+   * uncancelled offer keeps a live listener. Idempotent; a no-op once the
+   * offer has ended.
    */
   cancel: () => void;
+  /** Current state of the offer (for the displayer's UI, P7/P8). */
+  status: () => PairingOfferStatus;
 }
 
 /**
- * Create a pairing offer: start listening, build the QR payload including
- * our real port. The returned promise settles when a scanner completes
- * the ceremony against us.
+ * Create a pairing offer: start listening, build the v2 code including our
+ * real port and a fresh one-time secret (B.2). The returned promise settles
+ * when the ceremony ends.
+ *
+ * Appendix B rules enforced here:
+ *   B.4  nothing is sent, parsed or looked up on a connection before a
+ *        valid proof; a bad proof gets a silent close and one counter line;
+ *   B.5  the first valid proof consumes the secret in the same synchronous
+ *        step that verifies it, stops the listener and closes every other
+ *        connection without a message;
+ *   B.6  P6 proof wait, P7 bad-proof limit, P8 lifetime; every end
+ *        destroys the secret.
  */
 export async function createPairingOffer(opts: {
   identity: {
@@ -233,7 +330,12 @@ export async function createPairingOffer(opts: {
   /** DC-28: the saved own name (validated again here); undefined = none. */
   name?: string;
   store: TrustedPeerStore;
+  /** B.6 bounds; tests only. Production uses PAIRING_OFFER_BOUNDS. */
+  bounds?: Partial<PairingOfferBounds>;
+  /** Tests only (TR-B9): observe that every end wipes the secret buffer. */
+  testHooks?: { secretBuffer?: (secret: Buffer) => void };
 }): Promise<PairingOffer> {
+  const bounds: PairingOfferBounds = { ...PAIRING_OFFER_BOUNDS, ...opts.bounds };
   const ownName = ownNameForPayload(opts.name);
   let resolveOuter!: (v: { peerDeviceId: string; safetyNumber: string }) => void;
   let rejectOuter!: (e: Error) => void;
@@ -244,119 +346,188 @@ export async function createPairingOffer(opts: {
     },
   );
 
-  let activeSession: InboundSession | null = null;
-  const host = await serveSync(opts.identity.privateKey, opts.port ?? 0, (s) => {
-    activeSession = s;
-    void runDisplayerSide(s).catch(rejectOuter);
-  });
+  // B.2: held in memory only; never persisted, logged or sent.
+  let secret: Buffer | null = freshPairingSecret();
+  opts.testHooks?.secretBuffer?.(secret);
+  let status: PairingOfferStatus = "open";
+  let badProofs = 0;
+  /** Handshaken connections that have not delivered a valid proof yet. */
+  const waiting = new Set<InboundSession>();
+  /** The one connection that proved the secret (B.5). */
+  let ceremony: InboundSession | null = null;
+  let host: { actualPort: number; close(): void } | null = null;
+  let lifetimeTimer: ReturnType<typeof setTimeout> | null = null;
 
-  async function runDisplayerSide(session: InboundSession): Promise<void> {
+  const destroySecret = (): void => {
+    if (secret !== null) {
+      secret.fill(0); // VB-6: overwrite in place, then drop the reference
+      secret = null;
+    }
+  };
+  const drop = (s: InboundSession): void => {
     try {
-      // We are INITIATOR of the app-level exchange: send our payload first
-      // over the encrypted JSON channel (pairing has its own framing; the
-      // DC-08 SyncMessage union stays reserved for the engine).
-      const localPayload = localCeremonyPayload(
-        opts.identity,
-        Buffer.from(freshNonce()).toString("base64"),
-        ownName,
-      );
+      s.destroy();
+    } catch {
+      /* already closed */
+    }
+  };
+  const stopListening = (): void => {
+    try {
+      host?.close();
+    } catch {
+      /* already closed */
+    }
+  };
+  /** Every end path: secret destroyed, timers cleared, listener closed. */
+  const finish = (next: "paired" | "ended" | "cancelled", err?: Error): boolean => {
+    if (status === "paired" || status === "ended" || status === "cancelled") return false;
+    status = next;
+    destroySecret();
+    if (lifetimeTimer !== null) clearTimeout(lifetimeTimer);
+    lifetimeTimer = null;
+    stopListening();
+    for (const s of waiting) drop(s);
+    waiting.clear();
+    if (next !== "paired") {
+      if (ceremony !== null) drop(ceremony);
+      rejectOuter(err ?? new PairingCodeInvalidError(next));
+    }
+    ceremony = null;
+    return true;
+  };
+
+  const onSession = (s: InboundSession): void => {
+    // A handshake that completes after the offer was consumed or ended
+    // gets nothing (B.5); it is not counted.
+    if (status !== "open") {
+      drop(s);
+      return;
+    }
+    waiting.add(s);
+    void awaitProof(s);
+  };
+
+  async function awaitProof(s: InboundSession): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<{ ok: false }>((res) => {
+      timer = setTimeout(() => res({ ok: false }), bounds.proofWaitMs);
+      timer.unref?.();
+    });
+    const got = await Promise.race([
+      s.json.receiveBounded(PAIRING_PROOF_MAX_CIPHER_BYTES).catch(() => ({ ok: false as const })),
+      timeout,
+    ]);
+    clearTimeout(timer);
+    // Closed meanwhile by B.5 (another connection proved) or by an end of
+    // the offer: not counted.
+    if (!waiting.has(s)) return;
+    waiting.delete(s);
+    // B.5: verify and consume in ONE synchronous step (no await between).
+    if (
+      status === "open" &&
+      got.ok &&
+      verifyPairingProof(got.value, secret, s.raw.handshakeHash())
+    ) {
+      status = "pairing";
+      destroySecret();
+      stopListening();
+      for (const other of waiting) drop(other);
+      waiting.clear();
+      ceremony = s;
+      void runCeremony(s);
+      return;
+    }
+    // B.4: wrong, malformed, oversize or missing proof (also a clean close
+    // or silence past the P6 wait): silent close, one fixed counter line.
+    drop(s);
+    badProofs++;
+    console.error(badProofLogLine(badProofs));
+    if (badProofs >= bounds.maxBadProofs) finish("ended", new PairingCodeInvalidError("bad_proofs"));
+  }
+
+  async function runCeremony(session: InboundSession): Promise<void> {
+    try {
+      // P4: after the proof the order is unchanged: our payload first.
+      const localPayload = localCeremonyPayload(opts.identity, freshNonce(), ownName);
       await session.json.send(localPayload);
-      const remoteRaw = (await session.json.receive()) as PairingPayload;
-      // DC-27 P10: refuse a revoked id as soon as it is known, before any
-      // check or trust write; tell the scanner by CODE (it shows its own
-      // local text, never peer-supplied text).
-      if (
-        typeof remoteRaw?.device_id === "string" &&
-        opts.store.isRevoked?.(remoteRaw.device_id) === true
-      ) {
+      const got = await session.json.receiveBounded(PAIRING_PAYLOAD_MAX_CIPHER_BYTES);
+      if (!got.ok) throw new PairingCodeInvalidError("closed");
+      // P10 step 1: strict decode (B.7).
+      const remote = decodeCeremonyPayload(got.value);
+      // P10 step 2: DC-27 A.2 refusal, reached only by a party that holds
+      // the code. Tell the scanner by CODE (it shows its own local text).
+      if (opts.store.isRevoked?.(remote.device_id) === true) {
         await session.json.send({ kind: "PAIRING_REFUSED", code: "revoked" });
         throw new PairingRefusedError();
       }
-
+      // P10 step 3: binding (§6.1 V2 for the displayer is a real check:
+      // remote_static == X25519(P.public_key)), V3, then trust.
       const ps = new PairingSession();
-      ps.exchangePayloads(localPayload, remoteRaw);
+      ps.exchangePayloads(localPayload, remote);
       ps.bindTranscript(session.raw.handshakeHash());
       ps.verifyRemoteStatic(session.raw.remoteStaticKey());
       const safetyNumber = ps.displaySafetyNumber();
 
-      // Single-device flow (same human sees both numbers): self-confirm.
-      // Production two-device UI compares across screens; until the Devices
-      // UI renders both, auto-confirm mirrors the test-path behavior.
-      // TODO(ui): surface both safety numbers for human comparison.
+      // TODO(ui): surface both safety numbers for human comparison
+      // (deferred, Appendix B.8 / P12).
       ps.confirmSafetyNumber(safetyNumber, safetyNumber);
+      // Cancelled or expired while the ceremony ran: store nothing.
+      if (status !== "pairing") throw new PairingCodeInvalidError("ended");
       ps.storeTrust(() =>
         opts.store.store({
-          deviceId: remoteRaw.device_id,
-          publicKey: Buffer.from(remoteRaw.public_key, "base64"),
-          // DC-28 §4.5: from the encrypted payload; the 12-char id
-          // placeholder default is gone (older builds' placeholder is
-          // dropped by the id-prefix rule).
-          announcedName: receivedAnnouncedName(remoteRaw.name, remoteRaw.device_id),
+          deviceId: remote.device_id,
+          publicKey: Buffer.from(remote.public_key, "base64"),
+          // DC-28 §4.5: from the encrypted payload.
+          announcedName: receivedAnnouncedName(remote.name, remote.device_id),
           pairedAtMs: Date.now(),
         }),
       );
 
       await session.json.send({ kind: "PAIRING_OK" });
       session.done();
-      host.close(); // one-shot pairing listener
-      resolveOuter({ peerDeviceId: remoteRaw.device_id, safetyNumber });
+      if (finish("paired")) resolveOuter({ peerDeviceId: remote.device_id, safetyNumber });
     } catch (err) {
+      // B.5 (P5): a failure after the proof ends the offer; a new code is needed.
       session.done();
-      host.close();
-      rejectOuter(err instanceof Error ? err : new Error(String(err)));
+      ceremony = null;
+      finish("ended", err instanceof Error ? err : new Error(String(err)));
     }
   }
 
-  // Build QR text AFTER we know our actual listening port.
-  const { actualPort } = await new Promise<{ actualPort: number }>((res) => {
-    // serveSync resolved already before returning? It resolves synchronously
-    // enough for this call chain; poll once via address probe:
-    setImmediate(() => res({ actualPort: (host as { actualPort: number }).actualPort }));
-  });
-  // DC-28 P5: the QR / pasted code carries NO name (it travels through
-  // screens and clipboards; the peer gets it from the encrypted payload).
-  const base = makePairingPayload(opts.identity, actualPort);
-  const qrText = encodePairingPayload({
-    ...(base as unknown as PairingPayload),
-    nonce: Buffer.from(freshNonce()).toString("base64"),
+  try {
+    host = await serveSync(opts.identity.privateKey, opts.port ?? 0, onSession);
+  } catch (err) {
+    // The listener could not start (e.g. EADDRINUSE on a given port): the
+    // offer never existed, and its secret is wiped like on any end (B.2).
+    status = "cancelled";
+    destroySecret();
+    throw err;
+  }
+
+  // P8: the offer ends `lifetimeMs` after it was created, also while a
+  // ceremony runs (a stalled scanner cannot hold it open).
+  lifetimeTimer = setTimeout(
+    () => finish("ended", new PairingCodeInvalidError("expired")),
+    bounds.lifetimeMs,
+  );
+  lifetimeTimer.unref?.();
+
+  // DC-28 P5: the code carries NO name. B.2: the secret travels only here.
+  const base = makePairingPayload(opts.identity, host.actualPort);
+  const qrText = encodePairingCode({
+    ...base,
+    nonce: freshNonce(),
+    secret: secret!.toString("base64"),
   });
 
-  void activeSession;
-  let offerClosed = false;
   const cancel = (): void => {
-    if (offerClosed) return;
-    offerClosed = true;
-    // Close the listener AND any in-flight ceremony session: without the
-    // session teardown, a scanner that already completed the Noise
-    // handshake could finish the ceremony and persist trust AFTER the
-    // offer was cancelled (blind-review finding, 2026-08-29).
-    host.close();
-    try {
-      activeSession?.done();
-    } catch {
-      // session may already be closed
-    }
-    activeSession = null;
-    rejectOuter(new Error("pairing offer cancelled"));
+    finish("cancelled", new Error("pairing offer cancelled"));
   };
-  // Disarm symmetrically: whichever side settles first (resolve from the
-  // ceremony, reject from the ceremony, or cancel) closes the gate so the
-  // others become harmless no-ops afterwards.
-  const originalResolve = resolveOuter;
-  resolveOuter = (v) => {
-    offerClosed = true;
-    originalResolve(v);
-  };
-  const originalReject = rejectOuter;
-  rejectOuter = (e) => {
-    offerClosed = true;
-    originalReject(e);
-  };
-  return { qrText, result, cancel };
+  return { qrText, result, cancel, status: () => status };
 }
 
 // ---------------------------------------------------------------------------
-// Side B — scanner (pastes/scans the QR, connects out).
+// Side B — scanner (the code is pasted here; CONNECTS: Noise initiator).
 // ---------------------------------------------------------------------------
 
 export interface ScanResult {
@@ -364,9 +535,25 @@ export interface ScanResult {
   safetyNumber: string;
 }
 
+/** Fixed scanner-side line for a refused code: the reason token only. */
+function refused(reason: string): PairingCodeInvalidError {
+  console.error(`[tide] pairing: code refused (${reason})`);
+  return new PairingCodeInvalidError(reason);
+}
+
+function isConnRefusedOrClosed(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null)?.code;
+  if (code === "ECONNREFUSED" || code === "ECONNRESET") return true;
+  return err instanceof Error && err.message === "peer closed during handshake";
+}
+
 /**
- * Accept a scanned/pasted pairing payload: connect to its hinted endpoint,
- * run the mirrored ceremony, store trust.
+ * Accept a pasted v2 code: connect to its hinted endpoint, bind the session
+ * to the code (B.1), prove the secret (B.3), run the ceremony, store trust.
+ *
+ * Errors: PairingRefusedError (DC-27 text) when either side has the other
+ * id revoked; PairingCodeInvalidError (the single P13 text) for every
+ * refused code and for every abort of B.1/B.7; other errors unchanged.
  */
 export async function acceptPairingPayload(opts: {
   identity: { deviceId: string; publicKey: Uint8Array; privateKey: Uint8Array };
@@ -376,85 +563,101 @@ export async function acceptPairingPayload(opts: {
   store: TrustedPeerStore;
 }): Promise<ScanResult> {
   const ownName = ownNameForPayload(opts.name);
-  // decodePairingPayload still ACCEPTS "name" (older builds put it in the
-  // code), but DC-28 §4.5 never stores it: the name comes only from the
-  // encrypted payload below.
-  const remote = decodePairingPayload(opts.qrText); // strict validation + TR-9
-  if (!remote.connect) throw new Error("payload has no connect hint");
+  let code;
+  try {
+    code = decodePairingCode(opts.qrText); // TR-9, TR-B5, TR-B6
+  } catch (err) {
+    if (err instanceof PairingError) throw refused(err.code);
+    throw err;
+  }
   // DC-27 P10: the remote id is known from the code itself — refuse before
   // connecting, so nothing is exchanged and nothing is stored.
-  if (opts.store.isRevoked?.(remote.device_id) === true) {
+  if (opts.store.isRevoked?.(code.device_id) === true) {
     throw new PairingRefusedError();
   }
+  const secret = decodeBase64Exact(code.secret, PAIRING_SECRET_BYTES)!;
+  const codeKey = Buffer.from(code.public_key, "base64");
 
-  const conn = await connectSync(
-    opts.identity.privateKey,
-    remote.connect.ip,
-    remote.connect.port,
-  );
+  let conn: InboundSession;
+  try {
+    conn = await connectSync(opts.identity.privateKey, code.connect.ip, code.connect.port);
+  } catch (err) {
+    secret.fill(0);
+    if (isConnRefusedOrClosed(err)) throw refused("unreachable");
+    // Detail (error code) in the log only; the user sees a plain sentence.
+    const errCode = (err as { code?: unknown } | null)?.code;
+    const reason = typeof errCode === "string" && /^[A-Z_]+$/.test(errCode) ? errCode : "other";
+    console.error(`[tide] pairing: connect failed (${reason})`);
+    throw new PairingUnreachableError(reason);
+  }
   const json = conn.json;
 
   try {
-    // DC-28 §4.3: the own name goes ONLY to "the one device being paired".
-    // The session key must be the pasted code's key (its bound X25519
-    // form) before our name is put in the payload; otherwise someone else
-    // answered at the hinted address, and our payload carries no name.
-    // (Trust decisions are unchanged here: TD-049.)
-    const sessionIsPastedDevice = sessionKeyMatchesCode(
-      conn.raw.remoteStaticKey(),
-      remote.public_key,
-    );
-    const localPayload = localCeremonyPayload(
-      opts.identity,
-      Buffer.from(randomBytes(16)).toString("base64"),
-      sessionIsPastedDevice ? ownName : undefined,
-    );
+    // B.1 S1: before ANY frame, the session key must be the code's key.
+    // Otherwise someone else answered: no proof, no payload, no name.
+    if (!sessionKeyMatchesCode(conn.raw.remoteStaticKey(), code.public_key)) {
+      throw refused("session_key");
+    }
+    const h = conn.raw.handshakeHash();
+    // B.3: the proof is our FIRST frame; the secret is wiped right after.
+    await json.send(pairingProofFrame(secret, h));
+    secret.fill(0);
 
-    // Displayer side speaks first (app-level convention); payload arrives
-    // as a parsed object over the encrypted JSON channel.
-    const firstRaw = await json.receive();
-    const remoteRaw = firstRaw as PairingPayload;
-    // Mirror our own payload so BOTH sides can run the full V1-V4 checks
-    // (DC-05 §5.2: payloads are exchanged, not one-way announcements).
+    // A displayer that refuses the proof (wrong, used up, expired) closes
+    // without a message.
+    const first = await json.receiveBounded(PAIRING_PAYLOAD_MAX_CIPHER_BYTES);
+    if (!first.ok) throw refused("closed");
+    // B.7 strict decode; VB-8: an older displayer's v1 payload fails here
+    // (BAD_VERSION) and we send nothing more.
+    const remote = decodeCeremonyPayload(first.value);
+    // B.1 S2/S3: the payload names exactly the code's identity.
+    if (
+      remote.device_id !== code.device_id ||
+      !Buffer.from(remote.public_key, "base64").equals(codeKey)
+    ) {
+      throw refused("payload_mismatch");
+    }
+
+    // DC-28 §4.3: our name goes only to the device being paired, which
+    // S1-S3 have now established.
+    const localPayload = localCeremonyPayload(opts.identity, freshNonce(), ownName);
     await json.send(localPayload);
 
     const ps = new PairingSession();
-    ps.exchangePayloads(localPayload, remoteRaw);
-    ps.bindTranscript(conn.raw.handshakeHash());
+    ps.exchangePayloads(localPayload, remote);
+    ps.bindTranscript(h);
     ps.verifyRemoteStatic(conn.raw.remoteStaticKey());
     const safetyNumber = ps.displaySafetyNumber();
-    // TODO(ui): compare across screens; see createPairingSide note.
+    // TODO(ui): compare across screens (deferred, Appendix B.8 / P12).
     ps.confirmSafetyNumber(safetyNumber, safetyNumber);
     ps.storeTrust(() =>
       opts.store.store({
-        deviceId: remote.device_id,
-        publicKey: Buffer.from(remote.public_key, "base64"),
-        // DC-28 §4.5 (fixes S2): the name from the ENCRYPTED payload, never
-        // from the pasted code. Accepted only when the session key is the
-        // pasted code's key AND the encrypted payload names the same
-        // identity (V2 here checks the encrypted payload's key, not the
-        // pasted one: TD-049), so another sender's name is never attached
-        // to the pasted device.
-        announcedName:
-          sessionIsPastedDevice &&
-          remoteRaw?.device_id === remote.device_id &&
-          remoteRaw?.public_key === remote.public_key
-            ? receivedAnnouncedName(remoteRaw.name, remote.device_id)
-            : null,
+        // The code identity, which by S1-S3 equals the session identity.
+        deviceId: code.device_id,
+        publicKey: codeKey,
+        // DC-28 §4.5: the name from the ENCRYPTED payload, never the code.
+        announcedName: receivedAnnouncedName(remote.name, code.device_id),
         pairedAtMs: Date.now(),
       }),
     );
 
-    const ok = (await json.receive()) as { kind?: string; code?: string };
-    if (ok?.kind === "PAIRING_REFUSED" && ok.code === "revoked") {
+    const ok = await json.receiveBounded(PAIRING_PAYLOAD_MAX_CIPHER_BYTES);
+    const msg = (ok.ok ? ok.value : null) as { kind?: unknown; code?: unknown } | null;
+    if (msg?.kind === "PAIRING_REFUSED" && msg.code === "revoked") {
       // The OTHER device unpaired this one earlier (its §4.13 refusal).
       throw new PairingRefusedError();
     }
-    if (ok.kind !== "PAIRING_OK") {
-      throw new Error("pairing not confirmed by other side");
+    if (msg?.kind !== "PAIRING_OK") {
+      // The displayer closed after the proof (code used up, cancelled or
+      // expired mid-ceremony) or answered something else: B.10 "used up".
+      throw refused("not_confirmed");
     }
-    return { peerDeviceId: remote.device_id, safetyNumber };
+    return { peerDeviceId: code.device_id, safetyNumber };
+  } catch (err) {
+    if (err instanceof PairingError) throw refused(err.code);
+    throw err;
   } finally {
+    secret.fill(0);
     conn.done(); // close socket; no lingering reads
   }
 }

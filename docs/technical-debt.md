@@ -547,7 +547,7 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 - **ID:** TD-049
 - **Title:** In `acceptPairingPayload` (src/network/pairing_manager.ts:403-405) the scanner runs DC-05 §6.1 V2 against the payload the connected party sent over the encrypted channel (`exchangePayloads(localPayload, remoteRaw)`, `verifyRemoteStatic`), not against the `public_key` of the pasted code, and `connectSync` is given no expected key. Trust is then stored for the PASTED id and key (line 411). DC-05 §6.1 V2 says the scanner verifies the session key against the QR payload `public_key` (the authoritative out-of-band binding). Related: neither side runs the received encrypted payload through `decodePairingPayload`, and the displayer (line 279) stores `remoteRaw.device_id` without checking that it is derived from `remoteRaw.public_key`.
 - **Priority:** 5/10 — MEDIUM (pairing ceremony binding; INFERRED impact: whoever answers at the pasted address can complete the ceremony with the scanner, which then stores trust in the pasted device's key; the safety-number comparison is still auto-confirmed, see the TODO(ui) in the same file)
-- **Status:** OPEN (OBSERVED by source reading during DC-28, 2026-11-14; no exploit probe written). DC-28 does not depend on the fix: the scanner stores the peer's announced name only when the encrypted payload names the same id and key as the pasted code, so a mismatching sender's name is never attached to the pasted device. A fix changes the pairing ceremony and needs its own review.
+- **Status:** RESOLVED 2026-11-15 by DC-05 Appendix B (B.1, B.7), implemented in src/network/pairing_manager.ts (`acceptPairingPayload`) and src/security/pairing.ts (`decodePairingCode`, `decodeCeremonyPayload`). The scanner now checks the session key against the pasted code before sending any frame (S1), strictly decodes the received payload, and aborts unless its device_id and public_key equal the code's (S2/S3); both decoders check device_id = "d-" + hex(SHA-256(public_key)). Tests: `tests/dc05b_pairing_proof.test.ts` TR-B2, TR-B3, TR-B6, TR-B7. Remaining: the safety-number comparison is still auto-confirmed (deferred by Appendix B.8 / P12, owner-approved), and the scanner stores trust before it receives PAIRING_OK (TD-058).
 
 ## TD-050 — A peer can announce a name that reads like another label
 - **ID:** TD-050
@@ -559,7 +559,7 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 - **ID:** TD-051
 - **Title:** In the pairing ceremony the displayer (the device showing the code) sends its encrypted payload first (DC-05 §5.2 order, `createPairingOffer` in src/network/pairing_manager.ts), before it knows who connected: the offer listener has no expected key. With DC-28 that payload carries the saved own name, so any device that reaches the open offer port while the code is shown receives the name, even without the code. The scanner side does not have this gap (it checks the session key against the pasted code before adding its name).
 - **Priority:** 2/10 — LOW (the name is display text the user chose to share when pairing, P3; the window is the open offer only; no identity or trust impact)
-- **Status:** OPEN (INFERRED from the ceremony order, 2026-11-14). Fix options: the displayer sends its name only after it received the scanner's payload, or the code carries a one-time secret the scanner must prove. Both change the ceremony (DC-05) and need their own review. Owner decision (2026-11-14): fix before v0.2 with a one-time secret in the pairing code, which the scanner must prove before the displayer sends anything (a DC-05 ceremony amendment, drafted separately; not part of DC-28).
+- **Status:** RESOLVED 2026-11-15 by DC-05 Appendix B (B.2-B.6), implemented in src/network/pairing_manager.ts (`createPairingOffer`). The v2 code carries a one-time 16-byte secret; the displayer sends nothing, parses nothing and consults neither store until the scanner's first frame proves the secret (HMAC-SHA256 over the session's handshake hash, compared in constant time); a wrong or missing proof gets a silent close and one counter line. Tests: `tests/dc05b_pairing_proof.test.ts` TR-B1, TR-B4, TR-B8, TR-B9, TR-B10. Residual (accepted, Appendix B.9 R1/P14): a connector without the code still learns the displayer's Noise static key from the handshake itself.
 
 ## TD-052 — A snapshot from a lagging sender deletes history it never held
 - **ID:** TD-052
@@ -591,3 +591,32 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 - **Priority:** 1/10 — LOW (cosmetic; Save still validates the normalized name)
 - **Status:** OPEN (found by the DC-28 blind review, 2026-11-14). Fix: measure the trimmed/collapsed form.
 
+## TD-058 — The pairing scanner stores trust before the other side confirms
+- **ID:** TD-058
+- **Title:** In `acceptPairingPayload` (src/network/pairing_manager.ts) the scanner writes its trust entry for the displayer and only then waits for PAIRING_OK. If the displayer then refuses (DC-27 A.2 "revoked"), fails its own checks (B.7 V2, store error) or the connection drops, the scanner keeps a trusted row for a device that did not store it back: one-sided trust (DC-05 TR-4: no session carries data, both sides deny; the row shows in Paired Devices).
+- **Priority:** 5/10 — MEDIUM (one-sided trust after a failed pairing, PROVEN on the built sidecar; no data flows over it and it is removable by Unpair, but the user sees a "paired" device that the other side does not trust)
+- **Status:** OPEN. PROVEN 2026-11-15 by the blind review of the DC-05 Appendix B change, on the built sidecar bundle, in two cases: (1) the displayer refuses with PAIRING_REFUSED "revoked" (DC-27 A.2) after the scanner's payload: the scanner shows the refusal text but keeps a trusted row for the displayer; (2) the displayer closes after the proof without PAIRING_OK (code used up, cancelled or expired mid-ceremony): the scanner shows the single "no longer valid" text and keeps a trusted row. Appendix B adds further failure paths after the scanner's trust write, each with the same effect: the displayer's strict payload decode (B.7), its session-key binding (V2), cancel or the 10-minute lifetime (P8) during the ceremony, and a store error on the displayer. First found by source reading during the same work; pre-existing, ordering unchanged because Appendix B P4 keeps the frame order. Fix options: store on the scanner only after PAIRING_OK (then a displayer that stored and sent OK can still be left one-sided if the scanner's own store fails), or roll the scanner's entry back on refusal. Either needs a DC-05 decision.
+
+## TD-059 — The pairing code text cannot be wiped from memory
+- **ID:** TD-059
+- **Title:** DC-05 Appendix B.2 asks to overwrite the one-time secret when the offer ends. The secret's Buffer is zeroed on both sides (VB-6), but the code is also a JavaScript string (the `qr_text` reply, the NDJSON line, the Rust reply, the webview textarea). Strings are immutable and are freed only by garbage collection, so "destroy" for those copies means dropping the references: the sidecar tracks the offer without its text, and the Devices dialog clears the shown code once the offer has ended.
+- **Priority:** 1/10 — LOW (local process memory only; the secret is dead once the offer ends, which the displayer enforces)
+- **Status:** OPEN (accepted residual of VB-6, 2026-11-15). No fix planned in the JavaScript runtime.
+
+## TD-060 — A connection that stalls inside the Noise handshake is never timed out
+- **ID:** TD-060
+- **Title:** `serveSync` (src/network/sync_runtime.ts) runs the Noise handshake with no time limit. A peer that opens TCP and never finishes the handshake keeps that socket open. On a pairing offer this is not counted as a bad proof (DC-05 Appendix B P6, as specified) and survives the end of the offer until the peer closes; the standing sync listener has the same behaviour.
+- **Priority:** 2/10 — LOW (denial of service, out of scope per DC-05 §8 N4; no data exposed)
+- **Status:** OPEN (OBSERVED by source reading, 2026-11-15; pre-existing). Fix option: a handshake deadline in `serveSync`; a sync-protocol decision (DC-05 §10 "session timeouts").
+
+## TD-061 — DC-27 A.2 and DC-28 §4.5 wording predates DC-05 Appendix B
+- **ID:** TD-061
+- **Title:** Two contract texts owned elsewhere still describe the pre-Appendix-B ceremony: DC-27 Appendix A.2 says the refusal is sent "before any check or trust write" (Appendix B P10, approved: after the proof and the strict decode, before binding; open item OB-1), and DC-28 §4.5 says "decodePairingPayload keeps accepting name" (Appendix B P2: a v2 code with "name" is refused; OB-2). The implementation follows Appendix B.
+- **Priority:** 1/10 — LOW (documentation consistency)
+- **Status:** OPEN (2026-11-15). Fix: a one-line note in each of DC-27 A.2 and DC-28 §4.5 pointing to DC-05 Appendix B.
+
+## TD-062 — A listener-port test writes to /tmp whatever TMPDIR says
+- **ID:** TD-062
+- **Title:** `freeDir()` in tests/ensure_listener_port.test.ts (line 29-30) builds its data folders as `path.join("/tmp", "tide-port-test-…")` instead of `os.tmpdir()`, so every full test run leaves `/tmp/tide-port-test-*` folders behind even when TMPDIR points elsewhere, and the folders are not removed afterwards.
+- **Priority:** 1/10 — LOW (test hygiene only; no product code involved)
+- **Status:** OPEN (OBSERVED 2026-11-15: two new folders after each full `npx vitest run` with TMPDIR set). Fix: use `os.tmpdir()` and remove the folder in the test's cleanup.

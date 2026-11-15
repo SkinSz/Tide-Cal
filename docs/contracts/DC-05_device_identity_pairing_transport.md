@@ -234,8 +234,10 @@ Conceptual flow is fixed by Spec §17. Concrete specification:
 
 5.3  Handshake roles
 
-     QR displayer = Noise INITIATOR; scanner = RESPONDER (roles chosen
-     arbitrarily; symmetry holds because XX authenticates both statics).
+     Amended by Appendix B.11 (P11): the displayer LISTENS and is the
+     Noise RESPONDER; the scanner CONNECTS and is the INITIATOR.
+     Symmetry holds because XX authenticates both statics. (Original v1
+     text: displayer = initiator, scanner = responder.)
 
 5.4  Mutual confirmation (fingerprint / safety number)
 

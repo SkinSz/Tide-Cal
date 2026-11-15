@@ -882,11 +882,13 @@ async fn sync_op(
     op: String,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    const ALLOWED: [&str; 27] = [
+    const ALLOWED: [&str; 28] = [
         "device_info",
         "pairing_offer",
         "pairing_accept",
         "cancel_pairing_offer",
+        // DC-05 Appendix B.6: read-only status of the latest pairing offer.
+        "pairing_offer_status",
         "sync_now",
         // TD-005/DC-16 quarantine + peer-misbehavior surface (sync_errors,
         // paired_devices dialogs):
@@ -2119,5 +2121,16 @@ mod dc28_device_name_config_tests {
         assert!(src.contains("\"set_peer_nickname\","));
         assert!(src.contains("            get_device_name,\n            set_device_name,"));
         assert!(src.contains("#[tauri::command(rename_all = \"snake_case\")]\nasync fn set_device_name("));
+    }
+
+    #[test]
+    fn dc05b_pairing_offer_status_in_allowed() {
+        // DC-05 Appendix B.6: the displayer's UI polls this read-only op
+        // through the sync_op passthrough (no typed command, no input struct:
+        // it takes no arguments).
+        let src = include_str!("lib.rs");
+        let start = src.find("const ALLOWED: [&str; ").expect("ALLOWED list");
+        let list = &src[start..start + src[start..].find("];").expect("end of ALLOWED")];
+        assert!(list.contains("\"pairing_offer_status\","));
     }
 }

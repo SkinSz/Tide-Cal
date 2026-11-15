@@ -20,11 +20,18 @@ import {
 import { EndpointCache } from "../src/network/endpoint_bridge.ts";
 import { connectSync, loadOrCreateIdentity, serveSync } from "../src/network/sync_runtime.ts";
 import {
+  PAIRING_CODE_INVALID_MESSAGE,
   acceptPairingPayload,
   createPairingOffer,
   sqlPeerStore,
 } from "../src/network/pairing_manager.ts";
-import { decodePairingPayload, encodePairingPayload, freshNonce } from "../src/security/pairing.ts";
+import {
+  decodeBase64Exact,
+  decodePairingCode,
+  encodePairingCode,
+  freshNonce,
+  pairingProofFrame,
+} from "../src/security/pairing.ts";
 import { openDatabase, ensurePeerNamesSchemaV10 } from "../src/persistence/database.ts";
 import { SCHEMA_VERSION } from "../src/persistence/schema.ts";
 import { buildTxtRecord } from "../src/network/discovery.ts";
@@ -144,7 +151,7 @@ function pairingPayloads(json: string[]): Array<Record<string, unknown>> {
     if (!t.startsWith("{")) continue;
     try {
       const o = JSON.parse(t) as Record<string, unknown>;
-      if (o.v === 1 && typeof o.device_id === "string" && typeof o.public_key === "string" && "nonce" in o)
+      if (o.v === 2 && typeof o.device_id === "string" && typeof o.public_key === "string" && "nonce" in o)
         out.push(o);
     } catch {
       /* not JSON */
@@ -158,12 +165,14 @@ function pairingPayloads(json: string[]): Array<Record<string, unknown>> {
  * names on the wire that a real Tide build would never send).
  */
 async function craftedScanner(qrText: string, d: Dev, extra: Record<string, unknown>): Promise<unknown> {
-  const remote = decodePairingPayload(qrText);
-  const conn = await connectSync(d.identity.privateKey, remote.connect!.ip, remote.connect!.port);
+  const remote = decodePairingCode(qrText);
+  const conn = await connectSync(d.identity.privateKey, remote.connect.ip, remote.connect.port);
   try {
-    await conn.json.receive(); // the displayer speaks first
+    // DC-05 B.3: the proof of the code's secret goes first.
+    await conn.json.send(pairingProofFrame(decodeBase64Exact(remote.secret, 16)!, conn.raw.handshakeHash()));
+    await conn.json.receive(); // then the displayer speaks
     await conn.json.send({
-      v: 1,
+      v: 2,
       device_id: d.identity.deviceId,
       public_key: Buffer.from(d.identity.publicKey).toString("base64"),
       nonce: freshNonce(),
@@ -200,12 +209,15 @@ describe("TR-2 the own name arrives from the ENCRYPTED payload on both sides", (
     expect((await call(L, "set_device_name", { name: "Linux PC" })).device_name).toBe("Linux PC");
     expect((await call(W, "set_device_name", { name: " Windows  PC " })).device_name).toBe("Windows PC");
     const offer = await call<{ qr_text: string }>(L, "pairing_offer", {});
-    // tamper the pasted code with a DIFFERENT name (older builds put one there)
     const pasted = JSON.parse(offer.qr_text) as Record<string, unknown>;
     expect("name" in pasted).toBe(false); // P5
-    pasted.name = "Pasted Name";
+    // DC-05 Appendix B.2 (P2, OB-2): a v2 code with a "name" is refused at
+    // paste (EXTRA_FIELD) with the single P13 text; the offer stays usable.
+    await expect(
+      call(W, "pairing_accept", { qr_text: JSON.stringify({ ...pasted, name: "Pasted Name" }) }),
+    ).rejects.toThrow(PAIRING_CODE_INVALID_MESSAGE);
     const cap = await capture(async () => {
-      await call(W, "pairing_accept", { qr_text: JSON.stringify(pasted) });
+      await call(W, "pairing_accept", { qr_text: offer.qr_text });
       for (let i = 0; i < 300 && announcedOf(L, W.identity.deviceId) === undefined; i++) await sleep(10);
     });
     // scanner (W) stored the displayer's ENCRYPTED name, not the pasted one
@@ -237,7 +249,7 @@ describe("TR-3 no own name set -> no name anywhere", () => {
     const W = makeDev("W");
     const cap = await capture(() => pairViaOps(L, W));
     const qr = JSON.parse(cap.result) as Record<string, unknown>;
-    expect(Object.keys(qr).sort()).toEqual(["connect", "device_id", "nonce", "public_key", "v"]);
+    expect(Object.keys(qr).sort()).toEqual(["connect", "device_id", "nonce", "public_key", "secret", "v"]);
     const payloads = pairingPayloads(cap.json);
     const senders = new Set(payloads.map((p) => p.device_id));
     expect(senders).toEqual(new Set([L.identity.deviceId, W.identity.deviceId]));
@@ -591,14 +603,19 @@ describe("V1 unknown fields in HELLO are ignored by the engine", () => {
 // ---------------------------------------------------------------------------
 
 /**
- * A fake displayer listening with `host`'s key. It sends `payload` first,
+ * A fake displayer listening with `host`'s key. It waits for the scanner's
+ * first frame (the proof, DC-05 B.3; recorded in `proofs`), sends `payload`,
  * records what the scanner sends back, and confirms with PAIRING_OK.
  */
 async function craftedDisplayer(host: Dev, payload: Record<string, unknown>) {
   const got: Array<Record<string, unknown>> = [];
+  const proofs: unknown[] = [];
   const srv = await serveSync(host.identity.privateKey, 0, (sess) => {
     void (async () => {
       try {
+        const first = await sess.json.receive();
+        if (first === null) return;
+        proofs.push(first);
         await sess.json.send(payload);
         got.push((await sess.json.receive()) as Record<string, unknown>);
         await sess.json.send({ kind: "PAIRING_OK" });
@@ -609,17 +626,17 @@ async function craftedDisplayer(host: Dev, payload: Record<string, unknown>) {
       }
     })();
   });
-  return { got, port: srv.actualPort, close: () => srv.close() };
+  return { got, proofs, port: srv.actualPort, close: () => srv.close() };
 }
 const payloadOf = (d: Dev, extra: Record<string, unknown> = {}) => ({
-  v: 1 as const,
+  v: 2 as const,
   device_id: d.identity.deviceId,
   public_key: Buffer.from(d.identity.publicKey).toString("base64"),
   nonce: freshNonce(),
   ...extra,
 });
 const codeFor = (d: Dev, port: number) =>
-  encodePairingPayload({ ...payloadOf(d), connect: { ip: "127.0.0.1", port } });
+  encodePairingCode({ ...payloadOf(d), secret: freshNonce(), connect: { ip: "127.0.0.1", port } });
 
 describe("TR-2 / TR-4 scanner side against a hand-made displayer", () => {
   test("TR-2 the scanner sends its name only when the session key is the pasted code's key", { timeout: 30_000 }, async () => {
@@ -629,10 +646,12 @@ describe("TR-2 / TR-4 scanner side against a hand-made displayer", () => {
     await call(W, "set_device_name", { name: "Windows PC" });
     const fake = await craftedDisplayer(F, payloadOf(F, { name: "Fake name" }));
     try {
-      // mismatch: the code names X, F answers
+      // mismatch: the code names X, F answers. DC-05 Appendix B.1 S1: the
+      // scanner aborts before ANY frame (no proof, no payload, no name).
       await call(W, "pairing_accept", { qr_text: codeFor(X, fake.port) }).catch(() => {});
-      expect(fake.got).toHaveLength(1);
-      expect("name" in fake.got[0]!).toBe(false);
+      await sleep(100);
+      expect(fake.proofs).toHaveLength(0);
+      expect(fake.got).toHaveLength(0);
       expect(announcedOf(W, X.identity.deviceId) ?? null).toBeNull();
       expect(announcedOf(W, F.identity.deviceId) ?? null).toBeNull();
     } finally {

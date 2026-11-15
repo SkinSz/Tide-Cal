@@ -114,7 +114,7 @@ export async function pairDevices(a: Device, b: Device): Promise<void> {
     },
   });
   const payloadFor = (d: Device): PairingPayload => ({
-    v: 1,
+    v: 2,
     device_id: d.identity.deviceId,
     public_key: Buffer.from(d.identity.publicKey).toString("base64"),
     nonce: Buffer.from(freshNonce()).toString("base64"),
