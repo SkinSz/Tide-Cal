@@ -620,3 +620,63 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 - **Title:** `freeDir()` in tests/ensure_listener_port.test.ts (line 29-30) builds its data folders as `path.join("/tmp", "tide-port-test-…")` instead of `os.tmpdir()`, so every full test run leaves `/tmp/tide-port-test-*` folders behind even when TMPDIR points elsewhere, and the folders are not removed afterwards.
 - **Priority:** 1/10 — LOW (test hygiene only; no product code involved)
 - **Status:** OPEN (OBSERVED 2026-11-15: two new folders after each full `npx vitest run` with TMPDIR set). Fix: use `os.tmpdir()` and remove the folder in the test's cleanup.
+
+## TD-070 — Concurrent edits to series, occurrence overrides and calendars are not detected as conflicts
+- **ID:** TD-070
+- **Title:** `detectAndRecordConflict` (src/persistence/database.ts) returns "apply" for every entity type except events, so two devices that edit the same series rule, the same occurrence override field or the same calendar field at the same time create no conflict record. Each device keeps whichever change it applied last, so devices can end with different values depending on the order the changes arrived in. Events do not have this problem.
+- **Priority:** 6/10 — MEDIUM (data differs between devices without any warning; no loss of history, every change is stored and every device holds the same set of changes)
+- **Status:** OPEN. Known convergence defect: the calendar state of two devices holding the same changes should be identical. Scheduled for the conflict-engine work.
+
+## TD-071 — The unpairing cutoff can differ between devices
+- **ID:** TD-071
+- **Title:** When a device is unpaired, the unpairing device signs a record with a cutoff: the highest change number of the removed device that it had applied. Every other device uses the highest cutoff among the unpairing records it has accepted (`revokedCutoffs`, src/security/revocation_store.ts). A record is accepted only from a device that is directly paired with the receiver. Two devices can therefore hold different cutoffs for the same removed device, and a device that applied the removed device's changes before it learned the record keeps them. Devices can end up holding different data from a removed device.
+- **Priority:** 4/10 — MEDIUM-LOW (affects only data written by a removed device after the unpairing point; no effect on devices that never synced with it)
+- **Status:** OPEN. Known limitation of the unpairing design (DC-27, section 4.4 and Appendix B). To be revisited with the unpairing-warning work.
+
+## TD-072 — A device can advertise sequence numbers it cannot serve
+- **ID:** TD-072
+- **Title:** A device's advertised clock (`device_clock`) merges the clock entries cited by every change it receives or holds, not only the changes it has applied. A device that holds a change citing another device's sequence numbers therefore advertises numbers it cannot serve. A downstream device asks for them every session, gets an empty answer and counts a persistent gap. While full-state snapshots were on, that gap ended in needless full-state offers. With snapshots off (the default in this release) the effect is only needless requests: on a four-device chain, 16 range requests over 4 sessions, no offers, and nothing logged by the gap itself.
+- **Priority:** 3/10 — LOW (extra requests only; no data loss; no loop, each session asks at most twice per advertised range)
+- **Status:** OPEN. Reproduced on a four-device chain (8 offers in 4 sessions before snapshots were switched off, 0 after). Recorded, not fixed. Candidate fix: advertise only the applied frontier.
+
+## TD-073 — Reminder changes from other devices are stored but not written to the reminders table
+- **ID:** TD-073
+- **Title:** Reminder changes (member add, update, remove) received from another device are stored in the change history but not written to the `reminders` table: the change applier accepts and ignores that entity type, so reminders do not sync between devices. A later fix has to replay the reminder changes already stored in the history. A reminder also references its event (a second referenced object), so the same rule for a missing referenced object applies to it.
+- **Priority:** 6/10 — MEDIUM (a reminder set on one device never appears on the others)
+- **Status:** OPEN. Reminder changes already stored in history must be replayed when this is fixed.
+
+## TD-074 — Concurrent sync sessions can leave a stale hold counter or waiting notice
+- **ID:** TD-074
+- **Title:** If two sync sessions run at the same time and one of them applies a change that the other still counts as held, the held-session counter (`held_changes`) or the "waiting on a change" notice for that change can briefly stay behind. It is cleaned up at the end of the next session or at the next engine start.
+- **Priority:** 1/10 — LOW (transient; no effect on data)
+- **Status:** OPEN. Known limitation.
+
+## TD-075 — Rejection proofs live in the display list of quarantined records
+- **ID:** TD-075
+- **Title:** The prerequisite rule for a change whose target is missing needs to know whether a change it depends on was rejected. That proof is read from the quarantine table, which is also the list the user sees. Sync correctness should not depend on display rows. The retention cap now exempts the rows that serve as proof, and a row whose stored record cannot be read is no proof.
+- **Priority:** 3/10 — LOW (works today; fragile if display rows are changed or removed)
+- **Status:** OPEN. To revisit with the conflict-engine work.
+
+## TD-076 — A genuine create of a non-default calendar can be quarantined by an unrelated rejected change
+- **ID:** TD-076
+- **Title:** A create of a non-default calendar is quarantined when its clock covers an unrelated change from another device that this device rejected: the prerequisite rule treats the rejected change as a prerequisite of the create (`sync_service.ts`, calendar apply path, together with the rejection-proof lookup in `database.ts`). Not reachable today, because only the default calendar exists.
+- **Priority:** 2/10 — LOW (not reachable today)
+- **Status:** OPEN. To fix before multiple calendars ship.
+
+## TD-077 — When one (device, sequence number) exists with two contents, the first copy to arrive is stored
+- **ID:** TD-077
+- **Title:** A change is identified only by its origin device and sequence number. When two different copies of the same (device, sequence number) exist (for example after a device was restored from an older backup and reused the number), whichever copy arrives first is stored, and the other is reported as a duplicate-content warning. If the real copy is held and the other copy arrives first, the other copy is stored and the existing warning describes the stored copy; the real copy raises no new warning, because warnings of this kind are de-duplicated. Detection only; nothing is repaired. See TD-079.
+- **Priority:** 4/10 — MEDIUM (needs a restored device reusing sequence numbers)
+- **Status:** OPEN. To resolve together with TD-079.
+
+## TD-078 — The revalidation allow-list matches invalid-record reasons by text prefix
+- **ID:** TD-078
+- **Title:** The restart-time revalidation re-checks unresolved rows whose reason is "depends on quarantined change" or starts with the invalid-record prefix. A future reason that happens to start with the same prefix would be re-checked automatically. Fix: fixed reason codes instead of free-text reasons, ideally together with TD-075.
+- **Priority:** 2/10 — LOW (no such reason exists today)
+- **Status:** OPEN.
+
+## TD-079 — A device restored from an older backup reuses sequence numbers
+- **ID:** TD-079
+- **Title:** The next sequence number is taken from the local database only, so restoring an older backup rewinds it and the device can write new changes under numbers its peers already hold. Today this is detected and shown as a warning only (TD-077); devices can end up holding different content for the same change. Intended direction: a restored install gets a new device identity and the old identity is unpaired (as the architecture specification already requires for restores). Open question: how a restore is detected.
+- **Priority:** 6/10 — MEDIUM (silent divergence after a restore)
+- **Status:** OPEN.

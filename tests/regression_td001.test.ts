@@ -35,6 +35,7 @@ import {
 } from "../src/sync/knowledge_state.ts";
 import type { ChangeRecord, VectorClock } from "../src/sync/change_record.ts";
 import type { Database } from "better-sqlite3";
+import { seedEvent } from "./sync_seed_helpers.ts";
 
 const T0 = Date.UTC(2026, 8, 1, 9, 0, 0); // fixed epoch ms — deterministic
 const PRODUCER = "d-bad";
@@ -193,6 +194,7 @@ describe("TD-001 §3.1 quarantine of N", () => {
 
 describe("TD-001 §3.2 later sequences progress", () => {
   test("seq 1 applied + seq 2 quarantined, then 3..6 apply and drain", async () => {
+    seedEvent(db, "evt-td001");
     // Session 1: valid seq 1 applies; invalid seq 2 quarantined+skipped.
     const s1 = await runReceiverSession(db, { [PRODUCER]: 2 }, [
       makeRecord({ local_seq: 1 }),
@@ -227,6 +229,7 @@ describe("TD-001 §3.2 later sequences progress", () => {
 
 describe("TD-001 §3.3 restart durability", () => {
   test("quarantine row (verbatim raw, countable) and skip row survive", async () => {
+    seedEvent(db, "evt-td001");
     const bad = invalidRecord(2);
     await runReceiverSession(db, { [PRODUCER]: 2 }, [
       makeRecord({ local_seq: 1 }),
@@ -265,6 +268,7 @@ describe("TD-001 §3.3 restart durability", () => {
 
 describe("TD-001 §3.4 restart-time revalidation attempted", () => {
   test("every row examined; still-invalid rows remain quarantined+skipped", async () => {
+    seedEvent(db, "evt-td001");
     const bad1 = invalidRecord(2);
     const bad3 = invalidRecord(4);
     await runReceiverSession(db, { [PRODUCER]: 2 }, [

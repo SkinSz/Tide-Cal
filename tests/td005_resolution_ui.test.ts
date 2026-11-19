@@ -42,6 +42,7 @@ import {
 import { EventCore } from "../src/persistence/bridges/event_core.ts";
 import { loadOrCreateIdentity } from "../src/network/sync_runtime.ts";
 import type { Database } from "better-sqlite3";
+import { seedEvent } from "./sync_seed_helpers.ts";
 
 const T0 = Date.UTC(2026, 8, 1, 9, 0, 0); // fixed epoch ms — deterministic
 const PRODUCER = "d-td005b";
@@ -94,6 +95,7 @@ function quarantine(seq: number, valid = true): number {
 // ---------------------------------------------------------------------------
 describe("TD-005 remainder: per-item retry", () => {
   test("success: applies the record, marks resolved 'retried_by_user', removes skip row", () => {
+    seedEvent(db, "evt-td005b");
     const id = quarantine(1, true); // record is NOW valid (e.g. sender fixed it)
     markSeqSkipped(db, PRODUCER, 1);
     expect(isSeqSkipped(db, PRODUCER, 1)).toBe(true);
@@ -122,6 +124,7 @@ describe("TD-005 remainder: per-item retry", () => {
   });
 
   test("idempotent: retry of an already-resolved row is a no-op; missing id reported", () => {
+    seedEvent(db, "evt-td005b");
     const id = quarantine(1, true);
     markSeqSkipped(db, PRODUCER, 1);
     expect(retryQuarantineRecord(db, id, makeEntityMutator()).outcome).toBe("applied");
@@ -182,6 +185,7 @@ describe("TD-005 remainder: per-item delete (give up)", () => {
   });
 
   test("stream stays unblocked: seq N+1 applies after delete", () => {
+    seedEvent(db, "evt-td005b");
     const id = quarantine(1, false);
     markSeqSkipped(db, PRODUCER, 1);
     deleteQuarantineByUser(db, id, { confirm: true });

@@ -104,6 +104,7 @@ import {
   listPeerInvalidTally,
   // TD-005 remainder: per-item retry/delete + resolved-row retention cap.
   deleteQuarantineByUser,
+  dismissQuarantineWarning,
   pruneResolvedQuarantine,
 } from "../database.ts";
 // TD-005 remainder: per-item Retry shares the restart revalidation apply path.
@@ -1478,6 +1479,19 @@ export function makeSyncDispatcher(
         pruneResolvedQuarantine(core.db);
         return result;
       }
+      // Dismiss a duplicate-content warning: hides the warning row only.
+      // Never skips a change (no skipped_seqs row, no change state touched).
+      case "dismiss_quarantine_warning": {
+        if (
+          typeof args.quarantine_id !== "number" ||
+          !Number.isInteger(args.quarantine_id)
+        ) {
+          throw new Error("quarantine_id required");
+        }
+        const result = dismissQuarantineWarning(core.db, args.quarantine_id);
+        pruneResolvedQuarantine(core.db);
+        return result;
+      }
       // --- TD-006 / DC-16 §4: peer misbehavior visibility + recovery ------
       // Read-only per-peer state (Sync-Errors badge section + Paired Devices).
       case "peer_state": {
@@ -1645,6 +1659,7 @@ function main(): void {
     op === "cancel_pairing_offer" || op === "pairing_offer_status" ||
     op === "list_quarantine" || op === "quarantine_stats" ||
     op === "retry_quarantine" || op === "delete_quarantine" ||
+    op === "dismiss_quarantine_warning" ||
     op === "peer_state" || op === "list_paired_devices" ||
     op === "reset_peer_state" || op === "unblock_peer" ||
     op === "unpair_device" || op === "list_removed_devices" ||

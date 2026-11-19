@@ -1,4 +1,4 @@
-// Delivery-order regression test (sync batch 1, item 1).
+// Delivery-order regression test: convergence across three devices with relay.
 //
 // WHAT THIS BUILDS
 //   Three REAL devices (A, B, C): each is an EventCore (real SQLite database,
@@ -32,6 +32,17 @@
 //   (edit before create, etc.). The step counts per scenario are printed in
 //   the test names and asserted not to exceed MAX_ORDERS.
 //
+// FINAL SETTLE ROUND (after every enumerated order, before the checks)
+//   The fixed unfiltered round A<->B, B<->C, A<->B that the setup also uses.
+//   Reason: a change whose target entity is not created yet is held (not
+//   stored, read position not advanced) and is re-requested on the next
+//   ordinary sync. The enumerated steps are single-origin pulls and never
+//   re-request a held origin, so without this round the held change would
+//   simply never be asked for again. The checks therefore describe the state
+//   after one ordinary sync following each delivery order. With the round,
+//   code before the fixes (cbce6a6) still fails 4 checks, so it does not
+//   hide the defects.
+//
 // WHAT IS NOT ENUMERATED
 //   - Each scenario starts from a fixed, unenumerated setup (every device's
 //     bootstrap calendar change exchanged, and for S3/S4 the base event
@@ -64,9 +75,9 @@
 //       (device_id, local_seq) instead, detected_at_hlc and resolved_at_hlc
 //       (local detection / resolution times).
 //
-// EXPECTED FAILURES use vitest test.fails and link to the owner's problem
-// numbers (#1 dropped-but-acknowledged edits, #2 non-event types never written,
-// #5 conflict contents depend on arrival order, #6-#10 resolution defects).
+// EXPECTED FAILURES use vitest test.fails and name the known defect they show:
+// unresolved concurrent edits keep different values per device, and conflict
+// records for a delete versus an edit depend on arrival order.
 // Which checks are marked is determined empirically against cbce6a6; a check
 // that passes there is a plain test.
 import { afterAll, describe, expect, test } from "vitest";
@@ -223,8 +234,8 @@ const ev = (title: string) => ({ title, description: "d", startMs: T0, endMs: T0
 // record shape of EventCore.updateSeriesRule / updateOccurrence (same
 // entity_type, field_path, payload) and the same row write, guarded by "series
 // row exists locally". The real EventCore methods cannot be used because on
-// current code B never receives the series row (defect #2) and they throw
-// "series not found" (OBSERVED in a first run). After fix #3 the guard is true
+// current code B never receives the series row (non-event item types were not written) and they throw
+// "series not found" (OBSERVED in a first run). Once non-event types are written, the guard is true
 // and the row write happens, so the same op is the correct chain.
 function seriesRuleWrite(d: Device, seriesId: string, rule: string): void {
   const hlc = d.core.hlcNow();
@@ -455,6 +466,7 @@ async function runOrder(sc: Scenario, order: string[]): Promise<{ obs: Observed;
       await pullSession(d[srcFor(s.dst, origin)], d[s.dst], d[origin], w.seqAfter[s.op]!);
     }
   }
+  await settle(w);
   const obs: Observed = {
     changes: {} as never, state: {} as never, conflicts: {} as never,
   };
@@ -562,21 +574,21 @@ function register(sc: Scenario, marks: Marks, notes: { state?: string; conflicts
 
 // Marks were set from a run against cbce6a6. "pass" = plain test. For the
 // causally ordered scenarios (S1, S2a-c) check (b) is deliberately a PLAIN test:
-// it FAILS on current code (S1: defect #1, S2a-c: defect #2) and must pass after
-// fixes 2 and 3. "fail" = vitest test.fails (expected failure, evidence).
+// it FAILS on current code (S1: an edit arriving before its create was lost; S2a-c: non-event
+// types were not written) and must pass once those defects are fixed. "fail" = vitest test.fails (expected failure, evidence).
 register(S1, { changes: "pass", state: "pass", conflicts: "pass" }, {});
 register(S2a, { changes: "pass", state: "pass", conflicts: "pass" }, {});
 register(S2b, { changes: "pass", state: "pass", conflicts: "pass" }, {});
 register(S2c, { changes: "pass", state: "pass", conflicts: "pass" }, {});
-// S3: concurrent same-field edits. (b) EXPECTED FAILURE, problems #5-#10 (each
+// S3: concurrent same-field edits. (b) EXPECTED FAILURE, unresolved conflicts (each
 // device keeps its own edit; the conflict never changes the materialized row).
 // (c) PASSES on current code (conflict records agree), so it is a plain test.
 register(S3, { changes: "pass", state: "fail", conflicts: "pass" }, {});
-// S4: concurrent delete vs edit. (b) EXPECTED FAILURE (#9/#10 family: devices
-// disagree on whether the event exists). (c) EXPECTED FAILURE: evidence for
-// problem #5 (A holds a conflict that B lacks, and vice versa).
+// S4: concurrent delete vs edit. (b) EXPECTED FAILURE (devices
+// disagree on whether the event exists). (c) EXPECTED FAILURE: evidence that conflict
+// contents depend on arrival order (A holds a conflict that B lacks, and vice versa).
 register(S4, { changes: "pass", state: "fail", conflicts: "fail" }, {});
-// S5: (b) EXPECTED FAILURE, problems #5-#10 family (180 of 180 orders: each
+// S5: (b) EXPECTED FAILURE, unresolved conflicts (180 of 180 orders: each
 // device keeps its own latest edit, the conflict never reaches the row).
 // (a) and (c) PASS on current code, so they are plain tests.
 register(S5, { changes: "pass", state: "fail", conflicts: "pass" }, {});

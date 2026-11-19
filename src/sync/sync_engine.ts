@@ -15,7 +15,18 @@ import {
   emptyKnowledge,
 } from "../sync/knowledge_state.ts";
 import {
-  applyRemoteChange,
+  applyRemoteChangeDetailed,
+  reapplyQuarantinedInPlace,
+  recordWaitingNotice,
+  missingPrerequisiteOrigin,
+  DEPENDS_ON_QUARANTINED_REASON,
+  DUPLICATE_DIFFERENT_CONTENT_REASON,
+  WAITING_ON_CHANGE_REASON,
+  appliedFrontierOf,
+  bumpHeldSessions,
+  gcHeldChanges,
+  type ApplyOutcomeDetailed,
+  type EntityMutator,
   quarantineRecord,
   markSeqSkipped,
   isSeqSkipped,
@@ -260,7 +271,7 @@ export interface SyncEngineDeps {
   selfDeviceId: string;
   knowledge?: import("../sync/knowledge_state.ts").KnowledgeState;
   /** Entity mutation for an applied change (domain layer hook). */
-  mutateEntity?: (db: Database, record: ChangeRecord) => void;
+  mutateEntity?: EntityMutator;
   maxBatchRecords?: number;
   /**
    * DC-09 §3 trigger bookkeeping (streaks persist across sessions when
@@ -289,6 +300,15 @@ export interface SyncEngineDeps {
    * large transfers. Tests inject small values (e.g. 300) for speed.
    */
   idleTimeoutMs?: number;
+  /**
+   * Full-state snapshots (offers, streams, applying them). Default OFF in
+   * this release: a device never offers one, declines every incoming offer
+   * and drops unsolicited snapshot messages. A gap that cannot be served is
+   * simply requested again in the next session. Tests that exercise
+   * snapshot traffic opt in with `snapshots: true`. The snapshot library
+   * functions themselves are unaffected.
+   */
+  snapshots?: boolean;
 }
 
 export interface SyncEngine {
@@ -300,6 +320,23 @@ export interface SessionStats {
   receivedApplied: number;
   receivedBuffered: number;
   receivedDuplicate: number;
+  /**
+   * Changes whose target entity does not exist here yet (edit before create).
+   * Not stored, read position not advanced; retried by the next pull.
+   */
+  receivedNotApplicableYet?: number;
+  /**
+   * Changes whose target (row) is gone while every prerequisite is in (e.g. an
+   * edit of a deleted event, DC-27 TR-8): stored in history, read position
+   * advances, no row write.
+   */
+  receivedTargetGone?: number;
+  /**
+   * A change (origin device, seq) arrived again with content that differs
+   * from the stored copy (possible restore from an older backup). Detection
+   * only: the stored copy is kept and a quarantine row records the arrival.
+   */
+  receivedDuplicateDifferentContent?: number;
   /** TD-001: records durably quarantined (outcome class is exclusive). */
   receivedQuarantined: number;
   /**
@@ -357,12 +394,28 @@ interface KnowledgeHolder {
   };
 }
 
+/**
+ * A change held (not applicable yet: a prerequisite from another device has
+ * not arrived) at the END of this many sessions gets a visible "waiting on a
+ * change from device X" item in the Sync Errors list. The count is stored in
+ * the database (held_changes), so it survives a restart. The item never skips
+ * the seq: the change keeps being held and re-requested.
+ */
+export const HELD_SESSIONS_BEFORE_NOTICE = 3;
+
 export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
   const knowledge = deps.knowledge ?? loadKnowledgeFromDb(deps.db);
-  // TD-001 (6): restart-time revalidation — every durable quarantine row is
-  // re-checked against current state; now-valid records apply idempotently
-  // (skip row removed, frontier may advance); still-invalid ones remain
-  // quarantined with their skip row. Validation is NOT weakened.
+  // TD-001 (6): restart-time revalidation. ONLY unresolved rows whose reason
+  // is explicitly retryable are re-checked (allow-list, see
+  // revalidateQuarantine): now-valid records apply idempotently (skip row
+  // removed, frontier may advance); still-invalid ones remain quarantined
+  // with their skip row. Validation is NOT weakened.
+  // Keep this an allow-list. Do NOT turn it into "all rows except ...":
+  // re-running a duplicate-content warning applies its OTHER copy (the real
+  // change is then replaced or skipped), and re-running a row the user
+  // resolved undoes "Skip this change on this device". Any new quarantine
+  // reason is therefore NOT re-checked unless it is added to the allow-list
+  // deliberately.
   revalidateQuarantine(deps.db, deps.mutateEntity, knowledge);
   // TD-005 hook (one line, per integration note): after a revalidation pass
   // that applied formerly-quarantined records, mark those rows resolved.
@@ -596,7 +649,26 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     }
   }
 
+  /** Changes held in the current session that were not applied later in it. */
+  const sessionHeld = new Map<string, ChangeRecord>();
+  const heldKey = (r: ChangeRecord): string => `${r.device_id}#${r.local_seq}`;
+  function noteHeldAtSessionEnd(): void {
+    gcHeldChanges(deps.db);
+    for (const record of sessionHeld.values()) {
+      const n = bumpHeldSessions(deps.db, record.device_id, record.local_seq);
+      if (n >= HELD_SESSIONS_BEFORE_NOTICE) {
+        recordWaitingNotice(
+          deps.db,
+          record,
+          missingPrerequisiteOrigin(deps.db, record) ?? record.device_id,
+        );
+      }
+    }
+    sessionHeld.clear();
+  }
+
   async function runSession(transport: SyncTransport): Promise<SessionStats> {
+    sessionHeld.clear();
     const stats: SessionStats = {
       sent: 0,
       receivedApplied: 0,
@@ -621,6 +693,7 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
       // DC-09 §7.2 (TD-047): a stream the session did not finish writes
       // nothing; drop its staged rows.
       dropSnapshotStream();
+      noteHeldAtSessionEnd();
     }
   }
 
@@ -698,12 +771,23 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
       stats.sent++;
       const batch = await expectBatchOrPeerRequest(nextMessage(transport), transport, stats);
       if (batch === null) break; // peer sent a request instead; serve loop follows
+      const notYetBefore = stats.receivedNotApplicableYet ?? 0;
       applyBatch(batch.changes, stats);
       const before = JSON.stringify(ranges);
       ranges = clampRevoked(
         batch.remaining_ranges ??
           neededRanges(holder.knowledge, peerHello.device_clock, deps.selfDeviceId),
       );
+      if (
+        JSON.stringify(ranges) === before &&
+        (stats.receivedNotApplicableYet ?? 0) > notYetBefore
+      ) {
+        // No progress because a change is not applicable yet (its entity's
+        // creating change has not arrived). That is NOT an unservable gap
+        // (DC-09 Trigger A): do not count a gap round and do not offer a
+        // snapshot. The read position is held; the next pull retries.
+        break;
+      }
       if (JSON.stringify(ranges) === before) {
         gapRetries++; // unservable gap (compacted on peer): DC-09 Trigger A
         triggers.recordGapRound(peerKey);
@@ -715,7 +799,9 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
 
     // --- DC-09 §3 Trigger A: persistent unservable gaps -> FULL_STATE_OFFER
     // (the once-per-session-per-direction dedup of §3.5 applies) ---
-    if (gapRetries > 0 && triggers.shouldOfferTriggerA(peerKey)) {
+    // Snapshots are off by default in this release: no offer is made, the
+    // unserved range is requested again next session.
+    if (deps.snapshots === true && gapRetries > 0 && triggers.shouldOfferTriggerA(peerKey)) {
       const key = offerSessionKey(deps.selfDeviceId, peerKey, "OUTGOING");
       if (sessionDedup.shouldOffer(key, "GAP_ROUNDS")) {
         sessionDedup.markOffered(key);
@@ -1170,6 +1256,13 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     stats: SessionStats,
   ): void {
     assertPeerNotRevoked();
+    // Snapshots are off by default in this release: an unsolicited snapshot
+    // message is dropped, not applied.
+    if (deps.snapshots !== true) {
+      stats.snapshotsDeclined = (stats.snapshotsDeclined ?? 0) + 1;
+      console.warn("[tide][sync] full-state snapshot message dropped: snapshots are off in this version");
+      return;
+    }
     // DC-09 Appendix A.2: once one message of a stream is declined, the
     // rest of that stream (up to `final`) is declined too.
     if (snapshotStreamDeclined) {
@@ -1289,6 +1382,12 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     transport: SyncTransport,
     stats: SessionStats,
   ): Promise<void> {
+    // Snapshots are off by default in this release: decline every offer the
+    // way DC-09 Appendix A.2 declines one (counted, no ACCEPT sent).
+    if (deps.snapshots !== true) {
+      stats.snapshotsDeclined = (stats.snapshotsDeclined ?? 0) + 1;
+      return;
+    }
     // Pkg1 (QA C-1): a Trigger A (GAP_ROUNDS) offer is a request for OUR
     // full state, not a competing data offer. Answer with our own offer so
     // the gapped sender accepts and receives it — running the §7.3 race
@@ -1466,7 +1565,7 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
         // inspectable; the session keeps going (never blocking).
         quarantineRecord(deps.db, {
           reason:
-            "invalid_change_record:" +
+            INVALID_RECORD_REASON_PREFIX +
             (e instanceof Error ? e.message.slice(0, 120) : String(e).slice(0, 120)),
           senderDeviceId: deps.selfDeviceId,
           rawRecord: raw,
@@ -1501,15 +1600,57 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
         appendInvalidTally(deps.db, producer); // §2.3 durable tally (informative only)
         continue;
       }
-      const outcome = applyRemoteChange(
+      const outcome = applyRemoteChangeDetailed(
         deps.db,
         record,
         holder.knowledge,
         deps.mutateEntity,
       );
+      if (outcome === "applied" || outcome === "target_gone" || outcome === "quarantined") {
+        sessionHeld.delete(heldKey(record));
+      }
       if (outcome === "applied") stats.receivedApplied++;
       else if (outcome === "buffered") stats.receivedBuffered++;
-      else stats.receivedDuplicate++;
+      else if (outcome === "quarantined") {
+        // The change's target is gone and a prerequisite was quarantined here.
+        // Counted with the quarantined class; deliberately NOT fed to the
+        // misbehavior ladder (not the peer's fault).
+        stats.receivedQuarantined++;
+        console.warn(
+          `[tide][sync] change ${record.device_id}#${record.local_seq} ` +
+            `(${record.entity_type} ${record.entity_id}) quarantined: a change it depends on was quarantined here`,
+        );
+      } else if (outcome === "target_gone") {
+        // Target gone, every prerequisite in: counted as done (history + read
+        // position advance, no row write).
+        stats.receivedTargetGone =
+          (stats.receivedTargetGone ?? 0) + 1;
+        console.warn(
+          `[tide][sync] change ${record.device_id}#${record.local_seq} ` +
+            `(${record.entity_type} ${record.entity_id} ${record.field_path}) ` +
+            `counted as done: its target no longer exists here`,
+        );
+      } else if (outcome === "duplicate_different_content") {
+        stats.receivedDuplicate++;
+        stats.receivedDuplicateDifferentContent =
+          (stats.receivedDuplicateDifferentContent ?? 0) + 1;
+        console.warn(
+          `[tide][sync] WARNING: change ${record.device_id}#${record.local_seq} ` +
+            `arrived again with DIFFERENT content than the stored copy; ` +
+            `stored copy kept, incoming copy recorded in the quarantine list`,
+        );
+      } else if (outcome === "not_applicable") {
+        // The change cannot be applied yet: a change it depends on has not
+        // arrived. Nothing was stored and the read position did not move, so
+        // the next pull re-requests it. Counted and logged (stderr only).
+        stats.receivedNotApplicableYet = (stats.receivedNotApplicableYet ?? 0) + 1;
+        sessionHeld.set(heldKey(record), record);
+        console.warn(
+          `[tide][sync] change ${record.device_id}#${record.local_seq} ` +
+            `(${record.entity_type} ${record.entity_id} ${record.field_path}) ` +
+            `not applicable yet: a change it depends on has not arrived; read position held`,
+        );
+      } else stats.receivedDuplicate++;
       // TD-006: a non-rejected outcome is a normal arrival — feeds the
       // window's ratio denominator (and can drive clean-window recovery).
       misbehavior.recordOk(producer);
@@ -1649,8 +1790,9 @@ type SingleRevalidation =
 function revalidateOneQuarantineRaw(
   db: Database,
   rawRecord: string,
-  mutate?: (db: Database, record: ChangeRecord) => void,
+  mutate?: EntityMutator,
   knowledge?: NonNullable<SyncEngineDeps["knowledge"]>,
+  reason?: string,
 ): SingleRevalidation {
   let record: ChangeRecord;
   try {
@@ -1658,8 +1800,20 @@ function revalidateOneQuarantineRaw(
   } catch {
     return { outcome: "invalid" }; // still invalid: quarantine + skip unchanged
   }
+  // A change quarantined because a prerequisite was rejected: the read
+  // position already passed it, so re-run the readiness rule for real
+  // instead of letting the arrival path call it a duplicate.
+  if (
+    reason === DEPENDS_ON_QUARANTINED_REASON &&
+    appliedFrontierOf(db, record.device_id) >= record.local_seq
+  ) {
+    const r = reapplyQuarantinedInPlace(db, record, mutate);
+    if (r === "applied") return { outcome: "applied" };
+    if (r === "duplicate") return { outcome: "duplicate" };
+    return { outcome: "failed" }; // still blocked: the row stays active
+  }
   try {
-    let outcome: SingleRevalidation["outcome"] | undefined;
+    let outcome: ApplyOutcomeDetailed | undefined;
     // Atomic per row: the skip-row removal and the apply share one
     // transaction (applyRemoteChange's inner transaction nests safely).
     db.transaction(() => {
@@ -1667,11 +1821,22 @@ function revalidateOneQuarantineRaw(
         "DELETE FROM skipped_seqs WHERE producer_device_id = ? AND local_seq = ?",
       ).run(record.device_id, record.local_seq);
       const k = knowledge ?? loadKnowledgeFromDb(db);
-      const res = applyRemoteChange(db, record, k, mutate);
+      const res = applyRemoteChangeDetailed(db, record, k, mutate);
       outcome = res;
     })();
-    if (outcome === "applied") return { outcome: "applied" };
+    if (outcome === "applied" || outcome === "target_gone") {
+      return { outcome: "applied" };
+    }
     if (outcome === "buffered") return { outcome: "buffered" };
+    if (outcome === "not_applicable" || outcome === "quarantined") {
+      // Still blocked: the row stays active. A "waiting" notice never skips
+      // the seq (the change keeps being held and re-requested); every other
+      // row keeps its skip row.
+      if (reason !== WAITING_ON_CHANGE_REASON) {
+        markSeqSkipped(db, record.device_id, record.local_seq);
+      }
+      return { outcome: "failed" };
+    }
     // duplicate (already have it): the skip row is legitimately gone.
     return { outcome: "duplicate" };
   } catch {
@@ -1684,23 +1849,34 @@ function revalidateOneQuarantineRaw(
 export function retryQuarantineRecord(
   db: Database,
   quarantineId: number,
-  mutate?: (db: Database, record: ChangeRecord) => void,
+  mutate?: EntityMutator,
 ):
   | { outcome: "applied" | "duplicate" | "buffered"; resolved: boolean }
   | { outcome: "invalid" | "failed"; resolved: false }
   | { outcome: "already_resolved" | "not_found"; resolved: false } {
   const row = db
     .prepare(
-      "SELECT raw_record, resolved_at_hlc FROM quarantine WHERE quarantine_id = ?",
+      "SELECT raw_record, resolved_at_hlc, quarantine_reason FROM quarantine WHERE quarantine_id = ?",
     )
     .get(quarantineId) as
-    | { raw_record: string; resolved_at_hlc: number | null }
+    | { raw_record: string; resolved_at_hlc: number | null; quarantine_reason: string }
     | undefined;
   if (!row) return { outcome: "not_found", resolved: false };
   if (row.resolved_at_hlc !== null) {
     return { outcome: "already_resolved", resolved: false }; // idempotent
   }
-  const res = revalidateOneQuarantineRaw(db, row.raw_record, mutate);
+  if (row.quarantine_reason === DUPLICATE_DIFFERENT_CONTENT_REASON) {
+    // A duplicate-content warning has nothing to re-check or apply: the stored
+    // copy is kept. Retry is a no-op that says so (it can only be dismissed).
+    return { outcome: "failed", resolved: false };
+  }
+  const res = revalidateOneQuarantineRaw(
+    db,
+    row.raw_record,
+    mutate,
+    undefined,
+    row.quarantine_reason,
+  );
   if (res.outcome === "invalid" || res.outcome === "failed") {
     return { outcome: res.outcome, resolved: false };
   }
@@ -1712,8 +1888,15 @@ export function retryQuarantineRecord(
 }
 
 /**
- * TD-001 (6): restart-time revalidation pass. Iterates EVERY quarantine row
- * and re-runs validateChangeRecord + the full apply path against current
+ * Quarantine reasons of an unparsable or invalid record start with this
+ * prefix (followed by a detail). Together with DEPENDS_ON_QUARANTINED_REASON
+ * it is the whole list of rows the session-start re-check may re-run.
+ */
+export const INVALID_RECORD_REASON_PREFIX = "invalid_change_record:";
+
+/**
+ * TD-001 (6): restart-time revalidation pass. Iterates every UNRESOLVED
+ * retryable quarantine row (allow-list, see the query) and re-runs validateChangeRecord + the full apply path against current
  * durable state. Now-valid records apply idempotently (dedupe by changes
  * UNIQUE), their skipped_seqs row is removed, and if the stalled seq becomes
  * nextExpected the frontier advances honestly. Still-invalid records remain
@@ -1722,12 +1905,24 @@ export function retryQuarantineRecord(
  */
 export function revalidateQuarantine(
   db: Database,
-  mutate?: (db: Database, record: ChangeRecord) => void,
+  mutate?: EntityMutator,
   knowledge?: NonNullable<SyncEngineDeps["knowledge"]>,
 ): RevalidationResult {
   const rows = db
-    .prepare("SELECT raw_record FROM quarantine ORDER BY quarantine_id")
-    .all() as Array<{ raw_record: string }>;
+    // ALLOW-LIST: only unresolved rows with an explicitly retryable reason are
+    // re-run. Warnings, waiting notices, resolved rows (skipped, dismissed,
+    // applied) and any other or future row type are never re-checked.
+    .prepare(
+      `SELECT raw_record, quarantine_reason FROM quarantine
+       WHERE resolved_at_hlc IS NULL
+         AND (quarantine_reason = ? OR substr(quarantine_reason, 1, ?) = ?)
+       ORDER BY quarantine_id`,
+    )
+    .all(
+      DEPENDS_ON_QUARANTINED_REASON,
+      INVALID_RECORD_REASON_PREFIX.length,
+      INVALID_RECORD_REASON_PREFIX,
+    ) as Array<{ raw_record: string; quarantine_reason: string }>;
   const result: RevalidationResult = {
     examined: 0,
     revalidated: 0,
@@ -1738,7 +1933,13 @@ export function revalidateQuarantine(
     // TD-005 remainder: single-record logic extracted and shared with the
     // per-item Retry action (retryQuarantineRecord) — one apply path, both
     // entry points.
-    const res = revalidateOneQuarantineRaw(db, row.raw_record, mutate, knowledge);
+    const res = revalidateOneQuarantineRaw(
+      db,
+      row.raw_record,
+      mutate,
+      knowledge,
+      row.quarantine_reason,
+    );
     if (res.outcome === "applied") result.revalidated++;
     else if (res.outcome === "invalid" || res.outcome === "failed") {
       result.stillInvalid++; // remain quarantined with their skip row

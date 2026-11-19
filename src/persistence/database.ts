@@ -4,6 +4,7 @@ import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import { DDL, SCHEMA_VERSION } from "./schema.ts";
 import { announcedNameFromPeer } from "../domain/device_names.ts";
+import { revokedCutoffs } from "../security/revocation_store.ts";
 import {
   changeId,
   type ChangeRecord,
@@ -69,6 +70,8 @@ function initializeSchema(db: Database.Database): void {
     // gets it, and only THEN its one-time name move (the column is absent,
     // so no nickname can have been set through it yet).
     db.transaction(() => ensurePeerNamesSchemaV10(db))();
+    // held_changes (hold counter): additive, idempotent repair.
+    db.transaction(() => ensureHeldChangesSchema(db))();
   } else if (row.version < SCHEMA_VERSION) {
     // Forward migrations (run oldest-first, inside one transaction).
     const tx = db.transaction(() => {
@@ -212,10 +215,60 @@ function initializeSchema(db: Database.Database): void {
         // DC-28 §4.9 (DC-07 amendment O1): announced_name + one-time move.
         ensurePeerNamesSchemaV10(db);
       }
+      if (row!.version < 11) {
+        // v11: held_changes (hold counter for the waiting notice): additive.
+        ensureHeldChangesSchema(db);
+      }
       db.prepare("UPDATE schema_version SET version = ?").run(SCHEMA_VERSION);
     });
     tx();
   }
+}
+
+/** held_changes (hold counter for the "waiting" notice): additive, idempotent. */
+function ensureHeldChangesSchema(db: Database.Database): void {
+  db.exec(`CREATE TABLE IF NOT EXISTS held_changes (
+    producer_device_id TEXT NOT NULL,
+    local_seq          INTEGER NOT NULL CHECK (local_seq > 0),
+    sessions_held      INTEGER NOT NULL CHECK (sessions_held > 0),
+    first_held_at      INTEGER NOT NULL,
+    PRIMARY KEY (producer_device_id, local_seq))`);
+}
+
+/**
+ * One more session in which (origin, seq) was still held at session end.
+ * Persisted, so the count survives a restart. Returns the new count.
+ */
+export function bumpHeldSessions(
+  db: Database.Database,
+  origin: string,
+  seq: number,
+): number {
+  db.prepare(
+    `INSERT INTO held_changes (producer_device_id, local_seq, sessions_held, first_held_at)
+     VALUES (?, ?, 1, ?)
+     ON CONFLICT(producer_device_id, local_seq) DO UPDATE SET sessions_held = sessions_held + 1`,
+  ).run(origin, seq, Date.now());
+  return (
+    db
+      .prepare("SELECT sessions_held AS n FROM held_changes WHERE producer_device_id = ? AND local_seq = ?")
+      .get(origin, seq) as { n: number }
+  ).n;
+}
+
+/** Forget the hold counter of (origin, seq) (applied, counted done, quarantined or skipped). */
+export function clearHeld(db: Database.Database, origin: string, seq: number): void {
+  db.prepare("DELETE FROM held_changes WHERE producer_device_id = ? AND local_seq = ?").run(origin, seq);
+}
+
+/** Drop hold counters the applied frontier has passed (no stale entries). */
+export function gcHeldChanges(db: Database.Database): void {
+  db.prepare(
+    `DELETE FROM held_changes WHERE EXISTS (
+       SELECT 1 FROM applied_upto a
+       WHERE a.producer_device_id = held_changes.producer_device_id
+         AND a.applied_through >= held_changes.local_seq)`,
+  ).run();
 }
 
 /**
@@ -739,7 +792,77 @@ function recordConflictRow(
 // DC-07 §7 T2 — APPLY REMOTE CHANGE (atomic per DC-02 §7)
 // ---------------------------------------------------------------------------
 
+/**
+ * Result signal of an entity mutator. "target_absent": the change is an edit
+ * or remove of an entity row that does not exist here. applyRemoteChangeDetailed
+ * then decides by causal readiness (prerequisiteState): a prerequisite is not
+ * applied yet -> hold (not applicable yet); one was skipped or quarantined ->
+ * quarantine the change ("depends_on_quarantined_change"); otherwise count it
+ * as done (history row, read position advances, no row write). Returning
+ * nothing means the change was applied. A change that CREATES its target never
+ * returns "target_absent".
+ */
+export type MutateResult = "target_absent" | void;
+export type EntityMutator = (
+  db: Database.Database,
+  record: ChangeRecord,
+) => MutateResult;
+
+class NotApplicableYet extends Error {}
+class QuarantineRequest extends Error {
+  constructor(readonly reason: string) {
+    super(reason);
+  }
+}
+
+/** Quarantine reason for a duplicate (origin, seq) whose content differs from the stored copy. */
+export const DUPLICATE_DIFFERENT_CONTENT_REASON = "duplicate_seq_different_content";
+/** Quarantine reason: the change's target is gone and a prerequisite was skipped/quarantined here. */
+export const DEPENDS_ON_QUARANTINED_REASON = "depends_on_quarantined_change";
+/**
+ * Visible notice (not a rejection): a change has been held for several
+ * sessions because a prerequisite from another device never arrives. The
+ * sequence number is NOT skipped; the change keeps being held and re-requested.
+ */
+export const WAITING_ON_CHANGE_REASON = "waiting_on_change";
+
 export type ApplyOutcome = "applied" | "buffered" | "duplicate";
+/**
+ * ApplyOutcome plus: "not_applicable" (held: a prerequisite is not applied),
+ * "quarantined" (the incoming record itself was quarantined),
+ * "target_gone" (counted done: its target is absent, history stored, no row
+ * write) and
+ * "duplicate_different_content" (a duplicate (origin, seq) whose content
+ * differs from the stored copy: detected and recorded, stored copy untouched).
+ */
+export type ApplyOutcomeDetailed =
+  | ApplyOutcome
+  | "not_applicable"
+  | "quarantined"
+  | "target_gone"
+  | "duplicate_different_content";
+
+/**
+ * Compatibility wrapper: same as applyRemoteChangeDetailed, but a
+ * not-applicable-yet result (only possible with a mutator that signals it)
+ * throws, because this signature cannot express it. The sync engine and the
+ * quarantine retry use applyRemoteChangeDetailed.
+ */
+export function applyRemoteChange(
+  db: Database.Database,
+  incoming: ChangeRecord,
+  knowledge: KnowledgeState,
+  mutate?: EntityMutator,
+): ApplyOutcome {
+  const out = applyRemoteChangeDetailed(db, incoming, knowledge, mutate);
+  if (out === "not_applicable" || out === "quarantined") {
+    throw new Error(
+      `change ${incoming.device_id}#${incoming.local_seq} not applied (${out})`,
+    );
+  }
+  if (out === "duplicate_different_content") return "duplicate";
+  return out === "target_gone" ? "applied" : out;
+}
 
 /**
  * T2: dedupe / apply / buffer an incoming change atomically with
@@ -747,12 +870,304 @@ export type ApplyOutcome = "applied" | "buffered" | "duplicate";
  * Entity mutation callback runs inside the same transaction only for
  * records actually applied (including drained pending records).
  */
-export function applyRemoteChange(
+// ---------------------------------------------------------------------------
+// Causal readiness (DC-02) — one rule for every entity type.
+// ---------------------------------------------------------------------------
+
+export interface PrerequisiteState {
+  /** First origin whose needed seq is not applied/skipped here; null = all in. */
+  missingOrigin: string | null;
+  /** A needed seq of some origin is skipped or quarantined (not applied) here. */
+  rejectedPrerequisite: boolean;
+}
+
+/**
+ * What the change's causality clock covers: need[d] = clock[d] (for the
+ * change's own origin: seq - 1); a removed device (accepted unpairing record
+ * on THIS device) is only needed up to min(clock[d], its effective cutoff).
+ * A seq counts as in when applied, or skipped (quarantined). Decided from
+ * local state only.
+ */
+export function prerequisiteState(
+  db: Database.Database,
+  record: ChangeRecord,
+  opts: { rejectionIgnoresOwnOrigin?: boolean } = {},
+): PrerequisiteState {
+  const cutoffs = revokedCutoffs(db);
+  const appliedRow = db.prepare(
+    "SELECT applied_through AS v FROM applied_upto WHERE producer_device_id = ?",
+  );
+  const heldRow = db.prepare("SELECT MAX(local_seq) AS v FROM changes WHERE device_id = ?");
+  const skippedRow = db.prepare(
+    "SELECT 1 FROM skipped_seqs WHERE producer_device_id = ? AND local_seq = ?",
+  );
+  let missingOrigin: string | null = null;
+  const need = new Map<string, number>();
+  for (const [origin, seq] of Object.entries(record.causality_clock)) {
+    let n = origin === record.device_id ? record.local_seq - 1 : seq;
+    const cutoff = cutoffs.get(origin);
+    if (cutoff !== undefined) n = Math.min(n, cutoff);
+    if (n > 0) need.set(origin, n);
+  }
+  if (!need.has(record.device_id) && record.local_seq > 1) {
+    need.set(record.device_id, record.local_seq - 1);
+  }
+  for (const [origin, n] of need) {
+    let covered = Math.max(
+      (appliedRow.get(origin) as { v: number } | undefined)?.v ?? 0,
+      (heldRow.get(origin) as { v: number | null }).v ?? 0,
+    );
+    while (covered < n && skippedRow.get(origin, covered + 1) !== undefined) covered++;
+    if (covered < n && missingOrigin === null) missingOrigin = origin;
+  }
+  let rejected = false;
+  if (missingOrigin === null) {
+    for (const [origin, n] of need) {
+      if (opts.rejectionIgnoresOwnOrigin && origin === record.device_id) continue;
+      if (hasUnappliedRejectedSeq(db, origin, n)) {
+        rejected = true;
+        break;
+      }
+    }
+  }
+  return { missingOrigin, rejectedPrerequisite: rejected };
+}
+
+/** A seq of `origin` up to `upTo` is skipped or quarantined and not applied here. */
+function hasUnappliedRejectedSeq(db: Database.Database, origin: string, upTo: number): boolean {
+  if (
+    db
+      .prepare("SELECT 1 FROM skipped_seqs WHERE producer_device_id = ? AND local_seq <= ? LIMIT 1")
+      .get(origin, upTo) !== undefined
+  ) {
+    return true;
+  }
+  const rows = db
+    .prepare(
+      `SELECT raw_record FROM quarantine
+       WHERE quarantine_reason NOT IN (?, ?)
+         AND CASE WHEN json_valid(raw_record)
+                  THEN json_extract(raw_record, '$.device_id') END = ?`,
+    )
+    .all(DUPLICATE_DIFFERENT_CONTENT_REASON, WAITING_ON_CHANGE_REASON, origin) as Array<{
+    raw_record: string;
+  }>;
+  for (const r of rows) {
+    try {
+      const raw = JSON.parse(r.raw_record) as { change_id?: unknown; local_seq?: unknown };
+      if (typeof raw.local_seq !== "number" || raw.local_seq > upTo) continue;
+      const cid = typeof raw.change_id === "string" ? raw.change_id : `${origin}:${raw.local_seq}`;
+      if (db.prepare("SELECT 1 FROM changes WHERE change_id = ?").get(cid) === undefined) return true;
+    } catch {
+      /* unparsable: ignore */
+    }
+  }
+  return false;
+}
+
+/** The origin whose change this record is waiting for (null when ready). */
+export function missingPrerequisiteOrigin(
+  db: Database.Database,
+  record: ChangeRecord,
+): string | null {
+  return prerequisiteState(db, record).missingOrigin;
+}
+
+/** Resolve the visible "waiting" notice of (origin, seq), if any (it applied or was quarantined). */
+function resolveWaitingNotice(
+  db: Database.Database,
+  origin: string,
+  seq: number,
+  why: string,
+): void {
+  db.prepare(
+    `UPDATE quarantine SET resolved_at_hlc = ?, resolved_reason = ?
+     WHERE quarantine_reason = ? AND resolved_at_hlc IS NULL
+       AND json_extract(raw_record, '$.device_id') = ?
+       AND json_extract(raw_record, '$.local_seq') = ?`,
+  ).run(Date.now(), why, WAITING_ON_CHANGE_REASON, origin, seq);
+}
+
+/**
+ * Create the visible "waiting on a change from device X" notice for a held
+ * change (once per held (origin, seq) while unresolved). Does NOT skip the
+ * seq and does not touch the held change.
+ */
+export function recordWaitingNotice(
+  db: Database.Database,
+  record: ChangeRecord,
+  missingOrigin: string,
+): void {
+  const exists = db
+    .prepare(
+      `SELECT 1 FROM quarantine
+       WHERE quarantine_reason = ? AND resolved_at_hlc IS NULL
+         AND json_extract(raw_record, '$.device_id') = ?
+         AND json_extract(raw_record, '$.local_seq') = ? LIMIT 1`,
+    )
+    .get(WAITING_ON_CHANGE_REASON, record.device_id, record.local_seq);
+  if (exists !== undefined) return;
+  db.prepare(
+    `INSERT INTO quarantine (quarantine_reason, received_at_hlc, sender_device_id, raw_record)
+     VALUES (?, ?, ?, ?)`,
+  ).run(WAITING_ON_CHANGE_REASON, Date.now(), missingOrigin, JSON.stringify(record));
+}
+
+// ---------------------------------------------------------------------------
+// Duplicate (origin, seq) with DIFFERENT content: detection only.
+// ---------------------------------------------------------------------------
+
+function canonicalJson(v: unknown): string {
+  if (v === null || typeof v !== "object") return JSON.stringify(v);
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(",")}]`;
+  const o = v as Record<string, unknown>;
+  return `{${Object.keys(o)
+    .sort()
+    .map((k) => `${JSON.stringify(k)}:${canonicalJson(o[k])}`)
+    .join(",")}}`;
+}
+
+function contentKey(r: ChangeRecord): string {
+  return canonicalJson([
+    r.change_id,
+    r.entity_id,
+    r.entity_type,
+    r.field_path,
+    r.operation,
+    r.payload,
+    r.hlc_timestamp,
+    r.causality_clock,
+    r.schema_version,
+  ]);
+}
+
+/**
+ * True (and a quarantine row with its own reason code is written) when a
+ * stored copy of the same (origin device, seq) exists with different content.
+ * The stored copy is looked up in `changes` (applied) and `pending_changes`
+ * (buffered). Where NO stored copy exists (skipped/quarantined seqs,
+ * user-deleted rows, compacted history, snapshot-delivered state) nothing can
+ * be compared and nothing is reported. The stored version is never touched.
+ */
+function recordIfDifferentDuplicate(
+  db: Database.Database,
+  incoming: ChangeRecord,
+): boolean {
+  let stored: ChangeRecord | undefined;
+  const row = db
+    .prepare(
+      `SELECT change_id, device_id, local_seq, entity_id, entity_type,
+              field_path, operation, payload, hlc_timestamp, causality_clock,
+              schema_version
+       FROM changes WHERE device_id = ? AND local_seq = ?`,
+    )
+    .get(incoming.device_id, incoming.local_seq) as
+    | (Omit<ChangeRecord, "payload" | "causality_clock"> & {
+        payload: string;
+        causality_clock: string;
+      })
+    | undefined;
+  if (row !== undefined) {
+    stored = {
+      ...row,
+      payload: JSON.parse(row.payload),
+      causality_clock: JSON.parse(row.causality_clock),
+    } as ChangeRecord;
+  } else {
+    const pend = db
+      .prepare(
+        "SELECT record_payload FROM pending_changes WHERE device_id = ? AND local_seq = ?",
+      )
+      .get(incoming.device_id, incoming.local_seq) as
+      | { record_payload: string }
+      | undefined;
+    if (pend !== undefined) stored = JSON.parse(pend.record_payload) as ChangeRecord;
+  }
+  if (stored === undefined) return false;
+  if (contentKey(stored) === contentKey(incoming)) return false;
+  quarantineRecord(db, {
+    reason: DUPLICATE_DIFFERENT_CONTENT_REASON,
+    senderDeviceId: incoming.device_id,
+    rawRecord: incoming,
+  });
+  return true;
+}
+
+/** The origin's applied frontier (applied_upto), 0 when none. */
+export function appliedFrontierOf(db: Database.Database, origin: string): number {
+  return (
+    (
+      db
+        .prepare("SELECT applied_through AS v FROM applied_upto WHERE producer_device_id = ?")
+        .get(origin) as { v: number } | undefined
+    )?.v ?? 0
+  );
+}
+
+/**
+ * Quarantine Retry of a change that was quarantined because a prerequisite
+ * was rejected: the read position already passed its seq, so the normal
+ * arrival path would call it a duplicate. Re-run the rule for real instead:
+ * "applied" = history row + entity row written (or counted done) and the
+ * skip row removed; "blocked" = still not applicable (nothing written);
+ * "duplicate" = it is already stored.
+ */
+export function reapplyQuarantinedInPlace(
+  db: Database.Database,
+  record: ChangeRecord,
+  mutate?: EntityMutator,
+): "applied" | "blocked" | "duplicate" {
+  class Blocked extends Error {}
+  try {
+    return db.transaction(() => {
+      if (
+        db.prepare("SELECT 1 FROM changes WHERE device_id = ? AND local_seq = ?").get(
+          record.device_id,
+          record.local_seq,
+        ) !== undefined
+      ) {
+        return "duplicate" as const;
+      }
+      const det = detectAndRecordConflict(db, record);
+      if (det === "apply") {
+        const res = mutate?.(db, record);
+        if (res === "target_absent") {
+          const pre = prerequisiteState(db, record);
+          if (pre.missingOrigin !== null || pre.rejectedPrerequisite) throw new Blocked();
+        }
+      }
+      db.prepare(`
+        INSERT INTO changes (change_id, device_id, local_seq, entity_id,
+          entity_type, field_path, operation, payload, hlc_timestamp,
+          causality_clock, schema_version)
+        VALUES (@change_id, @device_id, @local_seq, @entity_id, @entity_type,
+          @field_path, @operation, @payload, @hlc_timestamp, @causality_clock,
+          @schema_version)`).run(serializeChange(record));
+      recordEntityVersion(db, record);
+      db.prepare("DELETE FROM skipped_seqs WHERE producer_device_id = ? AND local_seq = ?").run(
+        record.device_id,
+        record.local_seq,
+      );
+      for (const [d, sq] of Object.entries(record.causality_clock)) {
+        db.prepare(
+          `INSERT INTO device_clock (peer_device_id, max_seq) VALUES (?, ?)
+           ON CONFLICT(peer_device_id) DO UPDATE SET max_seq = MAX(max_seq, excluded.max_seq)`,
+        ).run(d, sq);
+      }
+      return "applied" as const;
+    })();
+  } catch (e) {
+    if (e instanceof Blocked) return "blocked";
+    throw e;
+  }
+}
+
+export function applyRemoteChangeDetailed(
   db: Database.Database,
   incoming: ChangeRecord,
   knowledge: KnowledgeState,
-  mutate?: (db: Database.Database, record: ChangeRecord) => void,
-): ApplyOutcome {
+  mutate?: EntityMutator,
+): ApplyOutcomeDetailed {
   const insertPending = db.prepare(`
     INSERT INTO pending_changes (device_id, local_seq, record_payload, received_at_hlc)
     VALUES (?, ?, ?, ?)`);
@@ -811,7 +1226,9 @@ export function applyRemoteChange(
 
       if (cls === "duplicate") {
         mergeClocks(incoming.causality_clock);
-        return "duplicate" as const;
+        return recordIfDifferentDuplicate(db, incoming)
+          ? ("duplicate_different_content" as const)
+          : ("duplicate" as const);
       }
 
       if (cls === "buffer") {
@@ -831,6 +1248,11 @@ export function applyRemoteChange(
         incoming.device_id,
         incoming.local_seq,
       );
+      // Highest seq of `drained` that was really applied; null = none.
+      let lastApplied: number | null = null;
+      let quarantinedIncoming = false;
+      let targetGone = false;
+      let appliedAny = false;
       for (const step of drained) {
         let record: ChangeRecord;
         if (
@@ -848,37 +1270,86 @@ export function applyRemoteChange(
           }
           record = JSON.parse(match.record_payload) as ChangeRecord;
         }
-        // Pkg5 (QA M-2): DC-03 §3 detection BEFORE mutating local state.
-        //   "apply"    -> entity-row mutation runs (§3.2/§3.6, no conflict)
-        //   "noop"     -> §3.1 identical-value convergence: no row write
-        //   "stale"    -> §3.2a (v2): C is causally dominated by a local
-        //                 participant — history + clocks advance but the
-        //                 materialized row is NOT regressed
-        //   "conflict" -> §3.3/§3.4: entity row NOT overwritten; the conflict
-        //                 record was persisted above; history + clocks below
-        //                 still advance (application gating per DC-02 §7 is
-        //                 unaffected, so sync progress and future detections
-        //                 keep working).
-        const det = detectAndRecordConflict(db, record);
-        if (det === "apply") {
-          mutate?.(db, record);
+        // Per-step savepoint: a change that cannot be applied yet rolls back
+        // completely (conflict record, row write, history) and stops the
+        // drain, so the frontier never passes it (DC-02 §4.4).
+        try {
+          db.transaction(() => {
+            // Pkg5 (QA M-2): DC-03 §3 detection BEFORE mutating local state.
+            //   "apply"    -> entity-row mutation runs (§3.2/§3.6, no conflict)
+            //   "noop"     -> §3.1 identical-value convergence: no row write
+            //   "stale"    -> §3.2a (v2): C is causally dominated by a local
+            //                 participant — history + clocks advance but the
+            //                 materialized row is NOT regressed
+            //   "conflict" -> §3.3/§3.4: entity row NOT overwritten; the
+            //                 conflict record was persisted above; history +
+            //                 clocks below still advance.
+            const det = detectAndRecordConflict(db, record);
+            if (det === "apply") {
+              const res = mutate?.(db, record);
+              if (res === "target_absent") {
+                // Target row missing: decide by causal readiness (DC-02).
+                const pre = prerequisiteState(db, record);
+                if (pre.missingOrigin !== null) throw new NotApplicableYet();
+                if (pre.rejectedPrerequisite) {
+                  throw new QuarantineRequest(DEPENDS_ON_QUARANTINED_REASON);
+                }
+                if (step === drained[0]) targetGone = true;
+              }
+            }
+            insertChange.run(serializeChange(record));
+            // Pkg1: durable version state rides the same T2 transaction (INV-1a).
+            recordEntityVersion(db, record);
+            deletePending.run(step.device_id, step.local_seq);
+            resolveWaitingNotice(db, record.device_id, record.local_seq, "applied");
+            clearHeld(db, record.device_id, record.local_seq);
+          })();
+        } catch (e) {
+          if (e instanceof QuarantineRequest) {
+            // Never applicable: quarantine (one row per origin+seq) and treat
+            // the seq as resolved so the read position moves on. The savepoint
+            // rolled back any row write; no history row exists for it.
+            resolveWaitingNotice(db, record.device_id, record.local_seq, "quarantined");
+            quarantineRecord(db, {
+              reason: e.reason,
+              senderDeviceId: record.device_id,
+              rawRecord: record,
+            });
+            markSeqSkipped(db, record.device_id, record.local_seq);
+            deletePending.run(step.device_id, step.local_seq);
+            if (step === drained[0]) quarantinedIncoming = true;
+            lastApplied = step.local_seq;
+            continue;
+          }
+          if (!(e instanceof NotApplicableYet)) throw e;
+          // The pending row of a blocked drained step is dropped so that the
+          // seq is re-requested from the peer (neededRanges skips pending
+          // seqs); later pending seqs stay buffered behind it.
+          deletePending.run(step.device_id, step.local_seq);
+          break;
         }
-        insertChange.run(serializeChange(record));
-        // Pkg1: durable version state rides the same T2 transaction (INV-1a).
-        recordEntityVersion(db, record);
-        deletePending.run(step.device_id, step.local_seq);
+        lastApplied = step.local_seq;
+        appliedAny = true;
       }
-      setAppliedUpto.run(
-        incoming.device_id,
-        drained[drained.length - 1]!.local_seq,
-      );
+      if (lastApplied === null) {
+        // Nothing applied: no history, no frontier move, no clock merge.
+        dbKnowledge = loadKnowledgeFromDb(db);
+        return "not_applicable" as const;
+      }
+      if (lastApplied !== drained[drained.length - 1]!.local_seq) {
+        // Blocked part-way through a drained run: mirror the real DB state.
+        dbKnowledge = loadKnowledgeFromDb(db);
+      }
+      setAppliedUpto.run(incoming.device_id, lastApplied);
       // TD-001 (4): the frontier advanced — skip rows at/below it are
       // resolved (quarantine diagnostic rows are NEVER touched).
       db.prepare(
         "DELETE FROM skipped_seqs WHERE producer_device_id = ? AND local_seq <= ?",
-      ).run(incoming.device_id, drained[drained.length - 1]!.local_seq);
+      ).run(incoming.device_id, lastApplied);
+      if (!appliedAny) return "quarantined" as const; // no clock merge for a quarantined record
       mergeClocks(incoming.causality_clock);
-      return "applied" as const;
+      if (quarantinedIncoming) return "quarantined" as const;
+      return targetGone ? ("target_gone" as const) : ("applied" as const);
     })();
 
     // C2 (Review 2): transaction committed -> now mirror the DB-derived state
@@ -893,12 +1364,15 @@ export function applyRemoteChange(
     // changes/pending_changes inserts means this is a redelivery our in-memory
     // view missed — idempotently reclassify as duplicate instead of crashing.
     if (isUniqueViolation(err)) {
-      db.transaction(() => mergeClocks(incoming.causality_clock))();
+      const different = db.transaction(() => {
+        mergeClocks(incoming.causality_clock);
+        return recordIfDifferentDuplicate(db, incoming);
+      })();
       const fresh = loadKnowledgeFromDb(db);
       knowledge.appliedUpto = fresh.appliedUpto;
       knowledge.pending = fresh.pending;
       knowledge.skipped = fresh.skipped;
-      return "duplicate";
+      return different ? "duplicate_different_content" : "duplicate";
     }
     throw err;
   }
@@ -997,14 +1471,21 @@ export function quarantineRecord(
       Number.isInteger(seq) &&
       seq > 0
     ) {
+      // A duplicate-different-content warning is deduped only against its own
+      // kind (an earlier row of another reason for the same (origin, seq)
+      // must not hide it); other reasons keep the one-row-per-seq rule, and
+      // the visible "waiting" notice never counts as a quarantine of the seq.
+      const sameKindOnly = opts.reason === DUPLICATE_DIFFERENT_CONTENT_REASON;
       const existing = db
         .prepare(
           `SELECT 1 FROM quarantine
            WHERE json_extract(raw_record, '$.device_id') = ?
              AND json_extract(raw_record, '$.local_seq') = ?
+             AND quarantine_reason != ?
+             AND (? = 0 OR quarantine_reason = ?)
            LIMIT 1`,
         )
-        .get(deviceId, seq);
+        .get(deviceId, seq, WAITING_ON_CHANGE_REASON, sameKindOnly ? 1 : 0, DUPLICATE_DIFFERENT_CONTENT_REASON);
       if (existing !== undefined) return; // already quarantined: exactly one row
     }
   }
@@ -1054,6 +1535,7 @@ export function markSeqSkipped(
   db.prepare(
     "INSERT OR IGNORE INTO skipped_seqs (producer_device_id, local_seq) VALUES (?, ?)",
   ).run(producerDeviceId, localSeq);
+  clearHeld(db, producerDeviceId, localSeq); // a skipped seq is no longer held
 }
 
 /** TD-001: does this (producer, seq) currently carry a skip row? */
@@ -1172,12 +1654,14 @@ export function reconcileQuarantineResolutions(
 ): { examined: number; marked: number } {
   const rows = db
     .prepare<
-      [],
+      [string],
       { quarantine_id: number; raw_record: string }
     >(
-      "SELECT quarantine_id, raw_record FROM quarantine WHERE resolved_at_hlc IS NULL",
+      // A duplicate-with-different-content warning is about a record whose
+      // change_id IS in `changes` (the stored copy); it must not auto-resolve.
+      "SELECT quarantine_id, raw_record FROM quarantine WHERE resolved_at_hlc IS NULL AND quarantine_reason != ?",
     )
-    .all();
+    .all(DUPLICATE_DIFFERENT_CONTENT_REASON);
   const exists = db.prepare("SELECT 1 FROM changes WHERE change_id = ?");
   let marked = 0;
   for (const row of rows) {
@@ -1271,16 +1755,30 @@ export function pruneResolvedQuarantine(
   }
   let pruned = 0;
   db.transaction(() => {
+    // Exempt from the cap: the visible record of a user skip ("user_deleted"),
+    // every row whose raw record cannot be read, and every row that is still a
+    // rejection proof for the prerequisite rule: a record marked retried whose
+    // change was never applied (its seq stays skipped), so removing it would
+    // flip a quarantine decision to "counted done". Active rows are never
+    // pruned. Rows resolved because their change was applied, and
+    // warnings/notices, are prunable.
+    const prunable = `resolved_at_hlc IS NOT NULL
+           AND COALESCE(resolved_reason, '') != 'user_deleted'
+           AND json_valid(raw_record)
+           AND NOT (COALESCE(resolved_reason, '') = 'retried_by_user'
+                    AND quarantine_reason NOT IN (?, ?)
+                    AND NOT EXISTS (SELECT 1 FROM changes c
+                                    WHERE c.change_id = json_extract(raw_record, '$.change_id')))`;
     const info = db
       .prepare(
         `DELETE FROM quarantine
-         WHERE resolved_at_hlc IS NOT NULL
+         WHERE ${prunable}
            AND quarantine_id NOT IN (
              SELECT quarantine_id FROM quarantine
-             WHERE resolved_at_hlc IS NOT NULL
+             WHERE ${prunable}
              ORDER BY quarantine_id DESC LIMIT ?)`,
       )
-      .run(cap);
+      .run(DUPLICATE_DIFFERENT_CONTENT_REASON, WAITING_ON_CHANGE_REASON, DUPLICATE_DIFFERENT_CONTENT_REASON, WAITING_ON_CHANGE_REASON, cap);
     pruned = info.changes;
     if (pruned > 0) {
       db.prepare(
@@ -1291,6 +1789,26 @@ export function pruneResolvedQuarantine(
     }
   })();
   return pruned;
+}
+
+/**
+ * Dismiss a duplicate-content warning: hide the warning row and nothing else.
+ * No skip row is written and no change, pending row, applied position or hold
+ * counter is touched. Only warning rows are accepted.
+ */
+export function dismissQuarantineWarning(
+  db: Database.Database,
+  quarantineId: number,
+): { ok: boolean } {
+  const row = db
+    .prepare("SELECT quarantine_reason FROM quarantine WHERE quarantine_id = ?")
+    .get(quarantineId) as { quarantine_reason: string } | undefined;
+  if (!row) throw new Error(`quarantine row ${quarantineId} not found`);
+  if (row.quarantine_reason !== DUPLICATE_DIFFERENT_CONTENT_REASON) {
+    throw new Error("only a duplicate-content warning can be dismissed");
+  }
+  markQuarantineResolved(db, quarantineId, "dismissed_by_user"); // idempotent
+  return { ok: true };
 }
 
 export interface UserDeleteResult {
@@ -1329,12 +1847,17 @@ export function deleteQuarantineByUser(
   const row = db
     .prepare<
       [number],
-      { raw_record: string; resolved_at_hlc: number | null }
+      { raw_record: string; resolved_at_hlc: number | null; quarantine_reason: string }
     >(
-      "SELECT raw_record, resolved_at_hlc FROM quarantine WHERE quarantine_id = ?",
+      "SELECT raw_record, resolved_at_hlc, quarantine_reason FROM quarantine WHERE quarantine_id = ?",
     )
     .get(quarantineId);
   if (!row) throw new Error(`quarantine row ${quarantineId} not found`);
+  if (row.quarantine_reason === DUPLICATE_DIFFERENT_CONTENT_REASON) {
+    // A warning row never reaches the skip path: skipping would drop the
+    // stored copy it is about. Warnings are only dismissed.
+    throw new Error("a warning cannot be skipped; use dismiss_quarantine_warning");
+  }
 
   // Derive (producer, seq) when the raw record is shape-compatible.
   let producer: string | null = null;
@@ -1377,6 +1900,11 @@ export function deleteQuarantineByUser(
           markSeqSkipped(db, producer, seq);
           recreated = true;
         }
+        // The user skipped a change: this device now deliberately differs.
+        // The row stays as resolved "user_deleted" (visible in the list).
+        console.warn(
+          `[tide][sync] change ${producer}#${seq} skipped on this device by the user; it will not be applied here`,
+        );
       } else {
         skipRowPresent = true; // applied: skip row legitimately absent
       }

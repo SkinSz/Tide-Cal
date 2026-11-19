@@ -366,6 +366,26 @@ CREATE TABLE schema_version (
 -- One row holds the current version. Fresh DBs initialize at version 1
 -- inside the same transaction that creates all tables above.
 
+4.13 Held changes (schema version 11)
+
+A change whose target row is missing and whose prerequisites (the changes
+its causality clock covers) have not all arrived is held: it is not stored,
+and the per-producer read position does not move past it. This table counts
+how many sessions each held change was still held at session end, so a
+visible "waiting on a change" notice can appear after a fixed number of
+sessions, also after a restart.
+
+CREATE TABLE held_changes (
+    producer_device_id TEXT NOT NULL,
+    local_seq          INTEGER NOT NULL CHECK (local_seq > 0),
+    sessions_held      INTEGER NOT NULL CHECK (sessions_held > 0),
+    first_held_at      INTEGER NOT NULL,        -- epoch ms of the first hold
+    PRIMARY KEY (producer_device_id, local_seq)
+);
+-- Device-local, never replicated. Cleanup: a row is removed when the change
+-- applies, is counted done, is quarantined or is skipped, and any row at or
+-- below the producer's applied position is removed at session end.
+
 ==================================================
 5. INDEXES (with justification)
 ==================================================

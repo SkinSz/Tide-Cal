@@ -13,7 +13,10 @@ import {
   saveResult,
   type Device,
   guardProcess,
+  useSnapshots,
 } from "./sync_probe_helpers.ts";
+
+useSnapshots(); // subject: compaction gap -> Trigger A snapshot
 
 function mkEvent(d: Device, title: string) {
   const t = Date.now();

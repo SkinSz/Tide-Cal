@@ -1,6 +1,13 @@
 # TIDE DESIGN CONTRACT DC-06
 # Tombstone Compaction Algorithm
 Status: APPROVED by project owner (2026-08-25)
+
+OPERATING CONSTRAINT (v0.2): full-state snapshots are switched off (the sync
+engine never offers one, declines incoming offers and drops unsolicited
+snapshot messages), and change-log truncation (DC-06 compaction) stays off.
+The two belong together: without snapshots, a device that falls behind can
+only catch up from untruncated change logs. Switching EITHER on requires an
+explicit project owner decision.
 Depends on: Architecture Spec v0.3 §11, §12, §30, §31; DC-01 §6; DC-02; DC-03 §2.2; DC-04 §5.4
 Unblocks: change-history GC, storage-boundedness work; depends on nothing unapproved
 beyond DC-01..DC-05

@@ -882,7 +882,7 @@ async fn sync_op(
     op: String,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    const ALLOWED: [&str; 28] = [
+    const ALLOWED: [&str; 29] = [
         "device_info",
         "pairing_offer",
         "pairing_accept",
@@ -896,6 +896,7 @@ async fn sync_op(
         "quarantine_stats",
         "retry_quarantine",
         "delete_quarantine",
+        "dismiss_quarantine_warning",
         "peer_state",
         "list_paired_devices",
         "reset_peer_state",

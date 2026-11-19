@@ -35,7 +35,7 @@ describe("runtime migration proof on a copy of the real production DB", () => {
       // Schema at 10 (v9 = DC-27 revocation cutoff + ACK store; v10 =
       // DC-28 peers.announced_name).
       const v = (core.db.prepare("SELECT version FROM schema_version").get() as { version: number }).version;
-      expect(v).toBe(10);
+      expect(v).toBe(11);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

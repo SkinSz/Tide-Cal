@@ -6,6 +6,13 @@ per owner decision it is a USER-ADJUSTABLE SETTING: the value is exposed in
 the program settings (bounds below) rather than being a hard-coded constant.
 All other triggers/constants unchanged.
 
+OPERATING CONSTRAINT (v0.2): full-state snapshots are switched off (the sync
+engine never offers one, declines incoming offers and drops unsolicited
+snapshot messages), and change-log truncation (DC-06 compaction) stays off.
+The two belong together: without snapshots, a device that falls behind can
+only catch up from untruncated change logs. Switching EITHER on requires an
+explicit project owner decision.
+
 OWNER AMENDMENT 2 (2026-08-25): DC-13 approved with tuned defaults —
 debounce 10s (was 5), sweep interval 10 min (was 15). Rationale: keep data
 fresher without meaningful network cost; see DC-13 §3.5 for the updated

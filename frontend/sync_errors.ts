@@ -65,6 +65,12 @@ const REASON_HINTS: Record<string, string> = {
   bad_entity_type:
     "The record has a data type this version doesn't recognize.",
   id_mismatch: "The record's ID doesn't match its contents.",
+  waiting_on_change:
+    "This change is waiting for an earlier change from another device (shown as the sender) that has not arrived. It applies by itself once that change arrives.",
+  depends_on_quarantined_change:
+    "This change edits an item whose original record was set aside as unusable on this device, so it was set aside too.",
+  duplicate_seq_different_content:
+    "A change arrived twice with different content. The first copy was kept. The other device may have been restored from an older backup.",
 };
 
 /**
@@ -554,7 +560,7 @@ function renderErrorCard(
     // row was resolved. Archive only — no retry/discard actions.
     const res = document.createElement("div");
     res.className = "muted";
-    res.textContent = `resolved: ${RESOLVED_HINTS[view.resolved_reason ?? ""] ?? view.resolved_reason ?? "unknown"}`;
+    res.textContent = `resolved: ${resolvedHint(view.resolved_reason, view.reason)}`;
     card.appendChild(res);
     return card;
   }
@@ -581,12 +587,7 @@ function renderErrorCard(
         // DC-26 v2 (owner 2026-11-14, review O-2): an applied retry changed
         // local data; the calendar redraws once this dialog is closed.
         notifyRetryOutcome(r.outcome);
-        note =
-          r.outcome === "applied" || r.outcome === "duplicate"
-            ? "Applied."
-            : r.outcome === "buffered"
-              ? "Still blocked by an earlier missing record."
-              : "Still invalid — remains quarantined.";
+        note = retryNote(r.outcome, view.reason);
       } catch (err) {
         note = `Retry failed: ${err instanceof Error ? err.message : String(err)}`;
       }
@@ -598,10 +599,16 @@ function renderErrorCard(
     })();
   });
 
+  // Rows that only warn about an arrival (the stored copy is kept) are
+  // dismissed; every other row is SKIPPED on this device: the change is never
+  // applied here and the device keeps going without it.
+  const isWarning = isWarningOnlyReason(view.reason);
   const discard = document.createElement("button");
   discard.type = "button";
-  discard.textContent = "Discard";
-  discard.title = "Give up on this record permanently.";
+  discard.textContent = isWarning ? "Dismiss this warning" : "Skip this change on this device";
+  discard.title = isWarning
+    ? "Hide this warning. The copy this device already holds is kept."
+    : "Never apply this change on this device and carry on without it. Other devices are not affected, but this one will differ from them.";
   discard.addEventListener("click", () => {
     // DC-15 §3.5 two-step confirmation (destructive action), in-app:
     // state what happens, require an explicit second click, revert after a
@@ -609,25 +616,33 @@ function renderErrorCard(
     clearTimeout(revertTimer);
     const warn = document.createElement("span");
     warn.className = "delete-warning";
-    warn.textContent =
-      "This record will be permanently discarded from this device. " +
-      "It will NEVER be applied, and the sender will not be notified.";
+    warn.textContent = isWarning
+      ? "This warning will be hidden. The copy this device already holds is kept."
+      : "This device will skip this change for good. It will not be applied here, " +
+        "so this device will differ from the others. The other devices are not told.";
     const confirmBtn = document.createElement("button");
     confirmBtn.type = "button";
-    confirmBtn.textContent = "Confirm discard?";
+    confirmBtn.textContent = isWarning ? "Confirm dismiss?" : "Confirm skip?";
     confirmBtn.addEventListener("click", () => {
       clearTimeout(revertTimer);
       confirmBtn.disabled = true;
       void (async () => {
         let note: string;
         try {
-          await syncOp("delete_quarantine", {
-            quarantine_id: view.quarantine_id,
-            confirm: true, // explicit flag — the op refuses without it
-          });
-          note = "Record given up on. Later records from this device still sync.";
+          if (isWarning) {
+            // Hides the warning only; it never skips a change.
+            await syncOp("dismiss_quarantine_warning", { quarantine_id: view.quarantine_id });
+          } else {
+            await syncOp("delete_quarantine", {
+              quarantine_id: view.quarantine_id,
+              confirm: true, // explicit flag — the op refuses without it
+            });
+          }
+          note = isWarning
+            ? "Warning dismissed."
+            : "Change skipped on this device. Later changes from the same device still sync.";
         } catch (err) {
-          note = `Discard failed: ${err instanceof Error ? err.message : String(err)}`;
+          note = `${isWarning ? "Dismiss" : "Skip"} failed: ${err instanceof Error ? err.message : String(err)}`;
         }
         const noteEl = document.createElement("span");
         noteEl.className = "muted";
@@ -641,13 +656,15 @@ function renderErrorCard(
     cancelBtn.textContent = "Cancel";
     cancelBtn.addEventListener("click", () => {
       clearTimeout(revertTimer);
-      actions.replaceChildren(retry, discard);
+      actions.replaceChildren(...(isWarning ? [discard] : [retry, discard]));
     });
     actions.replaceChildren(warn, confirmBtn, cancelBtn);
-    revertTimer = setTimeout(() => actions.replaceChildren(retry, discard), 8000);
+    revertTimer = setTimeout(() => actions.replaceChildren(...(isWarning ? [discard] : [retry, discard])), 8000);
   });
 
-  actions.append(retry, discard);
+  // A warning has nothing to re-check: it can only be dismissed.
+  if (isWarning) actions.append(discard);
+  else actions.append(retry, discard);
   card.appendChild(actions);
   return card;
 }
@@ -656,8 +673,39 @@ function renderErrorCard(
 const RESOLVED_HINTS: Record<string, string> = {
   revalidated_on_restart: "applied after re-validation",
   retried_by_user: "applied after you clicked Retry",
-  user_deleted: "given up on by you (never applied)",
+  user_deleted: "skipped on this device by you (never applied here; this device now differs from the others)",
+  dismissed_by_user: "dismissed by you (the copy this device held was kept)",
 };
+
+/**
+ * Plain-language result of a Retry click. Only "applied"/"duplicate" mean
+ * something was applied; a blocked row says what it is waiting for.
+ */
+export function retryNote(outcome: string, reasonCode: string): string {
+  if (outcome === "applied" || outcome === "duplicate") return "Applied.";
+  if (outcome === "buffered") return "Still blocked by an earlier missing record.";
+  if (reasonCode === "waiting_on_change") return "Still waiting for the missing change.";
+  if (reasonCode === "depends_on_quarantined_change") {
+    return "Still blocked: a change it depends on is still set aside.";
+  }
+  return "Still invalid — remains quarantined.";
+}
+
+/** Reason codes that only warn about an arrival (nothing was left unapplied). */
+export function isWarningOnlyReason(code: string): boolean {
+  return code === "duplicate_seq_different_content";
+}
+
+/**
+ * Plain-language text for a resolved row. A user "delete" is a skip on this
+ * device, except for warning-only rows, where it is just a dismissal.
+ */
+export function resolvedHint(resolvedReason: string | null, reasonCode: string): string {
+  if (resolvedReason === "user_deleted" && isWarningOnlyReason(reasonCode)) {
+    return RESOLVED_HINTS.dismissed_by_user!; // older rows: a warning dismissed before the dismiss action existed
+  }
+  return RESOLVED_HINTS[resolvedReason ?? ""] ?? resolvedReason ?? "unknown";
+}
 
 /** Re-render the dialog list + badge after a retry/delete action. */
 async function refreshListAndBadge(): Promise<void> {

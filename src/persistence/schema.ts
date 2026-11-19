@@ -2,7 +2,7 @@
 // One source of truth for table creation. Encryption-at-rest is applied at
 // connection level (SQLCipher key pragma) by the caller, not here.
 
-export const SCHEMA_VERSION = 10; // v2: TD-001 skipped_seqs; v3: TD-005 quarantine lifecycle (resolved_at_hlc, resolved_reason); v4: TD-006/DC-16 hard_blocks + peer_invalid_tally; v5: TD-005 quarantine_prune_stats (retention-cap bookkeeping); v6: Pkg1 entity_versions (durable per-entity version vectors, compaction-proof snapshots); v7: DC-21 peers.last_endpoint_host/port/seen (non-authoritative last-known endpoints); v8: GATE-2026-09-22 all-day end_date repair (exclusive-ms -> inclusive date, DC-07 'inclusive' semantics restored; no DDL change, data-only); v9: DC-27 revocation_records.revoked_after_seq (DC-05 Appendix A cutoff) + revocation_acks (DC-07 Appendix X.1 persisted ACK store); v10: DC-28 peers.announced_name (the name a peer announced at pairing; display_name becomes the local nickname, "" = none)
+export const SCHEMA_VERSION = 11; // v2: TD-001 skipped_seqs; v3: TD-005 quarantine lifecycle (resolved_at_hlc, resolved_reason); v4: TD-006/DC-16 hard_blocks + peer_invalid_tally; v5: TD-005 quarantine_prune_stats (retention-cap bookkeeping); v6: Pkg1 entity_versions (durable per-entity version vectors, compaction-proof snapshots); v7: DC-21 peers.last_endpoint_host/port/seen (non-authoritative last-known endpoints); v8: GATE-2026-09-22 all-day end_date repair (exclusive-ms -> inclusive date, DC-07 'inclusive' semantics restored; no DDL change, data-only); v9: DC-27 revocation_records.revoked_after_seq (DC-05 Appendix A cutoff) + revocation_acks (DC-07 Appendix X.1 persisted ACK store); v10: DC-28 peers.announced_name (the name a peer announced at pairing; display_name becomes the local nickname, "" = none); v11: held_changes (hold counter for the "waiting on a change" notice)
 
 export const DDL = `
 CREATE TABLE calendars (
@@ -247,6 +247,18 @@ CREATE TABLE quarantine (
 CREATE TABLE skipped_seqs (
     producer_device_id TEXT NOT NULL,
     local_seq          INTEGER NOT NULL CHECK (local_seq > 0),
+    PRIMARY KEY (producer_device_id, local_seq)
+);
+
+-- Changes held because a change they depend on has not arrived: how many
+-- sessions each has been held at session end (drives the "waiting" notice)
+-- and when the hold started. One row per (producer, seq); removed when the
+-- change applies, is counted done, is quarantined or is skipped.
+CREATE TABLE held_changes (
+    producer_device_id TEXT NOT NULL,
+    local_seq          INTEGER NOT NULL CHECK (local_seq > 0),
+    sessions_held      INTEGER NOT NULL CHECK (sessions_held > 0),
+    first_held_at      INTEGER NOT NULL,
     PRIMARY KEY (producer_device_id, local_seq)
 );
 

@@ -39,7 +39,7 @@ export interface EventInput {
   recurrenceRule?: string;
 }
 
-const DEFAULT_CALENDAR_ID = "local";
+export const DEFAULT_CALENDAR_ID = "local";
 
 /**
  * Monotone hybrid-logical-clock ticker (ms resolution, presentation-only
@@ -333,6 +333,23 @@ export type OverridePatch = Partial<{
   tz_id: string;
 }>;
 
+/**
+ * Row removal for an event delete in FK order (overrides -> series -> event).
+ * Shared by the local delete (EventCore.deleteEvent) and the remote apply
+ * (sync_service) so both materialize a delete identically.
+ */
+export function deleteEventRows(
+  db: import("better-sqlite3").Database,
+  eventId: string,
+  seriesId?: string,
+): void {
+  if (seriesId !== undefined) {
+    db.prepare("DELETE FROM occurrence_overrides WHERE series_id = ?").run(seriesId);
+    db.prepare("DELETE FROM series WHERE series_id = ?").run(seriesId);
+  }
+  db.prepare("DELETE FROM events WHERE event_id = ?").run(eventId);
+}
+
 /** occurrence_overrides row shape (the fields this bridge reads/writes). */
 interface OverrideRow {
   series_id: string;
@@ -598,7 +615,8 @@ export class EventCore {
           entity_type: "series",
           field_path: "recurrence_rule",
           operation: "set",
-          payload: { value: rule },
+          // base_event_id lets a receiving device materialize the series row.
+          payload: { value: rule, base_event_id: event.id },
           hlc_now: () => seriesHlc,
         },
         (db) => {
@@ -673,7 +691,8 @@ export class EventCore {
           entity_type: "series",
           field_path: "recurrence_rule",
           operation: "set",
-          payload: { value: rule },
+          // base_event_id lets a receiving device materialize the series row.
+          payload: { value: rule, base_event_id: event.id },
           hlc_now: () => seriesHlc,
         },
         (db) => {
@@ -786,15 +805,7 @@ export class EventCore {
         // its overrides — deterministic, NOT a conflict, even vs concurrent
         // override edits. One series-level remove record carries the
         // structure; no per-override records, no resurrection path.
-        if (series) {
-          db.prepare("DELETE FROM occurrence_overrides WHERE series_id = ?").run(
-            series.series_id,
-          );
-          db.prepare("DELETE FROM series WHERE series_id = ?").run(
-            series.series_id,
-          );
-        }
-        db.prepare("DELETE FROM events WHERE event_id = ?").run(id);
+        deleteEventRows(db, id, series?.series_id);
       },
     );
     // D7 series-level tombstone (own entity per DC-01 §6 / DC-12 §4.2).

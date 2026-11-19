@@ -218,7 +218,19 @@ export function msgPipePair(): [MsgPipe, MsgPipe] {
   return [wrap(x, []), wrap(y, [])];
 }
 
+/**
+ * Snapshots are off by default in the engine. A probe whose subject is
+ * snapshot / offer traffic calls useSnapshots() once (or passes
+ * `snapshots: true` per session). The default stays off.
+ */
+let snapshotsOptIn = false;
+export function useSnapshots(on = true): void {
+  snapshotsOptIn = on;
+}
+
 export interface SessionOpts {
+  /** opt this session's engines into full-state snapshots */
+  snapshots?: boolean;
   /** called per message before delivery; return false to drop it */
   filter?: (msg: unknown, dir: "from" | "to") => boolean;
   /** ignore errors from runSession instead of failing */
@@ -256,11 +268,13 @@ export async function sessionOnce(
     db: from.db,
     selfDeviceId: from.identity.deviceId,
     mutateEntity: makeEntityMutator(),
+    snapshots: opts.snapshots ?? snapshotsOptIn,
   });
   const engTo = createSyncEngine({
     db: to.db,
     selfDeviceId: to.identity.deviceId,
     mutateEntity: makeEntityMutator(),
+    snapshots: opts.snapshots ?? snapshotsOptIn,
   });
   let fromStats: Record<string, number> = {};
   let toStats: Record<string, number> = {};

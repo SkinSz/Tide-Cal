@@ -1122,7 +1122,7 @@ describe("schema v9 migration", () => {
     const db = openDatabase({ path });
     try {
       // v10 (DC-28) is the current version; the v9 pieces must be present.
-      expect(SCHEMA_VERSION).toBe(10);
+      expect(SCHEMA_VERSION).toBe(11);
       expect((db.prepare("SELECT version FROM schema_version").get() as { version: number }).version).toBe(SCHEMA_VERSION);
       expect(cols(db, "revocation_records")).toContain("revoked_after_seq");
       expect(cols(db, "revocation_acks")).toEqual([
@@ -1278,6 +1278,7 @@ async function injectAfterUnpair(inject: (L: Dev, P: Dev) => SyncMessage) {
     selfDeviceId: L.identity.deviceId,
     mutateEntity: makeEntityMutator(),
     peerDeviceId: W.identity.deviceId,
+    snapshots: true,
     revocations: makeDbRevocationChannel(L.core.db, {
       selfDeviceId: L.identity.deviceId,
       selfPublicKey: L.identity.publicKey,
@@ -1675,6 +1676,7 @@ describe("TD-041 snapshot vs revoked-producer cutoff", () => {
       selfDeviceId: self.identity.deviceId,
       mutateEntity: makeEntityMutator(),
       peerDeviceId: peer.identity.deviceId,
+      snapshots: true,
       revocations: makeDbRevocationChannel(self.core.db, {
         selfDeviceId: self.identity.deviceId,
         selfPublicKey: self.identity.publicKey,

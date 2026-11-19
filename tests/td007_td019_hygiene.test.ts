@@ -36,6 +36,7 @@ import {
 import { makeEntityMutator } from "../src/persistence/bridges/sync_service.ts";
 import { makeLocalDuplexPair } from "../src/network/noise_transport.ts";
 import type { ChangeRecord, VectorClock } from "../src/sync/change_record.ts";
+import { seedEvent } from "./sync_seed_helpers.ts";
 
 const T0 = Date.UTC(2026, 10, 14, 9, 0, 0);
 const SELF = "d-a-self"; // sorts BELOW PEER: loses the DC-09 §7.3 offer race
@@ -107,6 +108,7 @@ function changeCount(producer: string): number {
 
 describe("TD-007 (1): hard-block lookup prepared once per engine", () => {
   test("a 40-record batch prepares the hard_blocks lookup once, at engine build", async () => {
+    seedEvent(db, "evt-hyg");
     let hardBlockPrepares = 0;
     const realPrepare = db.prepare.bind(db);
     (db as unknown as { prepare: (sql: string) => unknown }).prepare = (sql: string) => {
@@ -206,6 +208,7 @@ describe("TD-019 F3: a dead session's stash never reaches the next session", () 
       selfDeviceId: SELF,
       mutateEntity: makeEntityMutator(),
       misbehavior: new PeerMisbehaviorTracker(DEFAULT_MISBEHAVIOR_CONFIG, () => T0),
+      snapshots: true,
     });
 
     // Session 1: we pull from PEER; PEER answers with a FULL_STATE_OFFER that

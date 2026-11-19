@@ -51,6 +51,7 @@ import {
 } from "../frontend/paired_devices.ts";
 import type { ChangeRecord, VectorClock } from "../src/sync/change_record.ts";
 import type { Database } from "better-sqlite3";
+import { seedEvent } from "./sync_seed_helpers.ts";
 
 const T0 = Date.UTC(2026, 8, 1, 9, 0, 0);
 const BAD = "d-bad";
@@ -432,6 +433,7 @@ describe("TD-006 engine integration", () => {
   });
 
   test("suspension (Level 3) drops intake for the session; a restart (fresh tracker) re-opens it", async () => {
+    seedEvent(db, "evt-td006");
     // Pre-arm the tracker to Level 3 with a deterministic fake clock (the
     // engine path only CONSUMES the gate; escalation timings are unit-tested
     // above without real-time dependence).

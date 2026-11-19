@@ -10,7 +10,7 @@ import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 
 // src/persistence/schema.ts
-var SCHEMA_VERSION = 10;
+var SCHEMA_VERSION = 11;
 var DDL = `
 CREATE TABLE calendars (
     calendar_id   TEXT PRIMARY KEY,
@@ -257,6 +257,18 @@ CREATE TABLE skipped_seqs (
     PRIMARY KEY (producer_device_id, local_seq)
 );
 
+-- Changes held because a change they depend on has not arrived: how many
+-- sessions each has been held at session end (drives the "waiting" notice)
+-- and when the hold started. One row per (producer, seq); removed when the
+-- change applies, is counted done, is quarantined or is skipped.
+CREATE TABLE held_changes (
+    producer_device_id TEXT NOT NULL,
+    local_seq          INTEGER NOT NULL CHECK (local_seq > 0),
+    sessions_held      INTEGER NOT NULL CHECK (sessions_held > 0),
+    first_held_at      INTEGER NOT NULL,
+    PRIMARY KEY (producer_device_id, local_seq)
+);
+
 -- TD-006 / DC-16 \xA72.4 Tier 2: DURABLE hard block (NOT self-clearing).
 -- Survives restart; removed ONLY by explicit user Unblock (\xA74.2) or
 -- unpair/revocation. While a row exists, intake drops everything from that
@@ -394,1870 +406,10 @@ function deviceNameViews(rows, selfDeviceId) {
   return base.map((b, i) => ({ ...b, label: labels[i] }));
 }
 
-// src/sync/change_record.ts
-function changeId(deviceId, localSeq) {
-  return `${deviceId}:${localSeq}`;
-}
-var ChangeRecordError = class extends Error {
-  constructor(code, message) {
-    super(message);
-    this.code = code;
-    this.name = "ChangeRecordError";
-  }
-  code;
-};
-var OPERATIONS = [
-  "set",
-  "remove",
-  "member_add",
-  "member_update",
-  "member_remove"
-];
-var ENTITY_TYPES = [
-  "calendar",
-  "event",
-  "series",
-  "occurrence_override",
-  "reminder",
-  "tombstone-marker"
-];
-function validateChangeRecord(r) {
-  if (typeof r !== "object" || r === null) {
-    throw new ChangeRecordError("missing_field", "record is not an object");
-  }
-  const rec = r;
-  for (const key of [
-    "change_id",
-    "device_id",
-    "entity_id",
-    "field_path"
-  ]) {
-    if (typeof rec[key] !== "string" || rec[key].length === 0) {
-      throw new ChangeRecordError("missing_field", `invalid ${key}`);
-    }
-  }
-  if (typeof rec.local_seq !== "number" || !Number.isInteger(rec.local_seq) || rec.local_seq <= 0) {
-    throw new ChangeRecordError("bad_seq", "local_seq must be a positive integer");
-  }
-  if (typeof rec.operation !== "string" || !OPERATIONS.includes(rec.operation)) {
-    throw new ChangeRecordError("bad_operation", `invalid operation ${String(rec.operation)}`);
-  }
-  if (typeof rec.entity_type !== "string" || !ENTITY_TYPES.includes(rec.entity_type)) {
-    throw new ChangeRecordError("bad_entity_type", `invalid entity_type ${String(rec.entity_type)}`);
-  }
-  const cc = rec.causality_clock;
-  if (typeof cc !== "object" || cc === null || Array.isArray(cc)) {
-    throw new ChangeRecordError("missing_field", "causality_clock must be an object");
-  }
-  for (const [k, v] of Object.entries(cc)) {
-    if (typeof k !== "string" || typeof v !== "number" || !Number.isInteger(v) || v < 0) {
-      throw new ChangeRecordError("missing_field", `causality_clock[${k}] invalid`);
-    }
-  }
-  if (typeof rec.hlc_timestamp !== "number" || !Number.isFinite(rec.hlc_timestamp)) {
-    throw new ChangeRecordError("missing_field", "hlc_timestamp must be a finite number");
-  }
-  {
-    const stack = [rec.payload];
-    while (stack.length > 0) {
-      const cur = stack.pop();
-      if (typeof cur === "number" && !Number.isFinite(cur)) {
-        throw new ChangeRecordError(
-          "missing_field",
-          "payload contains a non-finite number (NaN/Infinity from 1e999-style JSON overflow)"
-        );
-      }
-      if (Array.isArray(cur)) {
-        stack.push(...cur);
-      } else if (typeof cur === "object" && cur !== null) {
-        stack.push(...Object.values(cur));
-      }
-    }
-  }
-  const expected = changeId(rec.device_id, rec.local_seq);
-  if (rec.change_id !== expected) {
-    throw new ChangeRecordError("id_mismatch", `change_id ${rec.change_id} != ${expected}`);
-  }
-  return Object.freeze({ ...rec });
-}
-
-// src/sync/vector_clock.ts
-function get(clock, deviceId) {
-  return clock[deviceId] ?? 0;
-}
-function dominates(a, b) {
-  for (const d of Object.keys(b)) {
-    if (get(a, d) < b[d]) return false;
-  }
-  return true;
-}
-function equalClocks(a, b) {
-  const keys = /* @__PURE__ */ new Set([...Object.keys(a), ...Object.keys(b)]);
-  for (const d of keys) {
-    if (get(a, d) !== get(b, d)) return false;
-  }
-  return true;
-}
-function sameOrDescendant(xClock, xProducer, yClock, yProducer) {
-  return dominates(xClock, yClock) && get(xClock, yProducer.device_id) >= yProducer.local_seq;
-}
-function concurrent(a, b) {
-  return !dominates(a, b) && !dominates(b, a);
-}
-function merge(a, b) {
-  const out = { ...a };
-  for (const [d, s] of Object.entries(b)) {
-    out[d] = Math.max(get(out, d), s);
-  }
-  return out;
-}
-function advanceByMerge(target, incoming) {
-  for (const [d, s] of Object.entries(incoming)) {
-    target[d] = Math.max(get(target, d), s);
-  }
-}
-
-// src/sync/conflict_detection.ts
-function deepEqual(a, b) {
-  if (a === b) return true;
-  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) {
-    return false;
-  }
-  const ka = Object.keys(a);
-  const kb = Object.keys(b);
-  if (ka.length !== kb.length) return false;
-  return ka.every(
-    (k) => deepEqual(a[k], b[k])
-  );
-}
-function effectiveValue(c) {
-  switch (c.operation) {
-    case "set":
-      return { deleted: false, value: c.payload.value };
-    case "remove":
-      return { deleted: true, value: void 0 };
-    case "member_add":
-    case "member_update":
-      return { deleted: false, value: c.payload };
-    case "member_remove":
-      return { deleted: true, value: void 0 };
-  }
-}
-function valuesDiffer(a, b) {
-  const va = effectiveValue(a);
-  const vb = effectiveValue(b);
-  if (va.deleted !== vb.deleted) return true;
-  return !deepEqual(va.value, vb.value);
-}
-function detect(incoming, localCurrent, locals) {
-  const v = effectiveValue(incoming);
-  if (v.deleted && localCurrent.deleted || !v.deleted && !localCurrent.deleted && deepEqual(v.value, localCurrent.value)) {
-    return { kind: "noop" };
-  }
-  const dominated = locals.some(
-    (l) => sameOrDescendant(
-      l.causality_clock,
-      { device_id: l.device_id, local_seq: l.local_seq },
-      incoming.causality_clock,
-      { device_id: incoming.device_id, local_seq: incoming.local_seq }
-    ) && !equalClocks(l.causality_clock, incoming.causality_clock)
-  );
-  if (dominated) {
-    return { kind: "stale" };
-  }
-  const conflicting = locals.filter((l) => concurrent(incoming.causality_clock, l.causality_clock));
-  if (conflicting.length === 0) {
-    return { kind: "apply" };
-  }
-  const differing = conflicting.filter((l) => valuesDiffer(incoming, l));
-  if (differing.length === 0) {
-    return { kind: "apply" };
-  }
-  return { kind: "conflict", conflicting: differing };
-}
-
-// src/sync/knowledge_state.ts
-function emptyKnowledge() {
-  return { appliedUpto: {}, pending: /* @__PURE__ */ new Map() };
-}
-function appliedThrough(k, deviceId) {
-  return k.appliedUpto[deviceId] ?? 0;
-}
-function skippedOf(k, deviceId) {
-  return k.skipped?.get(deviceId) ?? /* @__PURE__ */ new Set();
-}
-function nextExpected(k, deviceId) {
-  let s = appliedThrough(k, deviceId) + 1;
-  const skipped = skippedOf(k, deviceId);
-  while (skipped.has(s)) s += 1;
-  return s;
-}
-function classifyArrival(k, deviceId, localSeq) {
-  const through = appliedThrough(k, deviceId);
-  if (skippedOf(k, deviceId).has(localSeq)) return "duplicate";
-  if (localSeq <= through) return "duplicate";
-  if (localSeq === nextExpected(k, deviceId)) return "apply";
-  return k.pending.get(deviceId)?.has(localSeq) === true ? "duplicate" : "buffer";
-}
-function advanceApplied(k, deviceId, localSeq) {
-  const drained = [];
-  if (localSeq !== nextExpected(k, deviceId)) return drained;
-  let next = localSeq;
-  const skipped = skippedOf(k, deviceId);
-  drained.push({ device_id: deviceId, local_seq: localSeq });
-  const pend = k.pending.get(deviceId);
-  while (pend?.has(next + 1) && !skipped.has(next + 1)) {
-    next += 1;
-    pend.delete(next);
-    drained.push({ device_id: deviceId, local_seq: next });
-  }
-  if (pend && pend.size === 0) k.pending.delete(deviceId);
-  k.appliedUpto[deviceId] = next;
-  if (k.skipped?.has(deviceId)) {
-    const set = k.skipped.get(deviceId);
-    for (const s of [...set]) {
-      if (s <= next) set.delete(s);
-    }
-    if (set.size === 0) k.skipped.delete(deviceId);
-  }
-  return drained;
-}
-function neededRanges(k, advertised, selfDeviceId) {
-  const need = [];
-  for (const [d, advSeq] of Object.entries(advertised)) {
-    if (selfDeviceId !== void 0 && d === selfDeviceId) continue;
-    const have = appliedThrough(k, d);
-    if (advSeq <= have) continue;
-    const havePending = k.pending.get(d) ?? /* @__PURE__ */ new Set();
-    const haveSkipped = skippedOf(k, d);
-    let lo = have + 1;
-    for (let s = have + 1; s <= advSeq + 1; s++) {
-      if (s === advSeq + 1 || havePending.has(s) || haveSkipped.has(s)) {
-        if (lo < s) need.push({ device_id: d, lo, hi: s - 1 });
-        lo = s + 1;
-      }
-    }
-  }
-  return need;
-}
-
-// src/persistence/database.ts
-function openDatabase(opts) {
-  const db = new Database(opts.path);
-  db.pragma("journal_mode = WAL");
-  db.pragma("foreign_keys = ON");
-  initializeSchema(db);
-  return db;
-}
-function initializeSchema(db) {
-  let row;
-  try {
-    row = db.prepare("SELECT version FROM schema_version").get();
-  } catch {
-    row = void 0;
-  }
-  if (row === void 0) {
-    const tx = db.transaction(() => {
-      db.exec(DDL);
-      db.prepare(
-        "INSERT INTO schema_version (version, applied_at_hlc) VALUES (?, ?)"
-      ).run(SCHEMA_VERSION, Date.now());
-    });
-    tx();
-  } else if (row.version > SCHEMA_VERSION) {
-    throw new Error(
-      `database schema_version ${row.version} newer than supported ${SCHEMA_VERSION}`
-    );
-  } else if (row.version === SCHEMA_VERSION) {
-    db.transaction(() => ensureReminderColumnsV7(db))();
-    db.transaction(() => ensureRevocationSchemaV9(db))();
-    db.transaction(() => ensurePeerNamesSchemaV10(db))();
-  } else if (row.version < SCHEMA_VERSION) {
-    const tx = db.transaction(() => {
-      if (row.version < 2) {
-        db.exec(`CREATE TABLE IF NOT EXISTS skipped_seqs (
-          producer_device_id TEXT NOT NULL,
-          local_seq          INTEGER NOT NULL CHECK (local_seq > 0),
-          PRIMARY KEY (producer_device_id, local_seq))`);
-      }
-      if (row.version < 3) {
-        const cols = db.prepare("PRAGMA table_info(quarantine)").all().map((c) => c.name);
-        if (!cols.includes("resolved_at_hlc")) {
-          db.exec("ALTER TABLE quarantine ADD COLUMN resolved_at_hlc INTEGER");
-        }
-        if (!cols.includes("resolved_reason")) {
-          db.exec("ALTER TABLE quarantine ADD COLUMN resolved_reason TEXT");
-        }
-      }
-      if (row.version < 4) {
-        db.exec(`CREATE TABLE IF NOT EXISTS hard_blocks (
-          producer_device_id TEXT PRIMARY KEY,
-          first_triggered_at INTEGER NOT NULL,
-          last_triggered_at  INTEGER NOT NULL,
-          trigger_count      INTEGER NOT NULL CHECK (trigger_count > 0))`);
-        db.exec(`CREATE TABLE IF NOT EXISTS peer_invalid_tally (
-          producer_device_id TEXT PRIMARY KEY,
-          total_invalid      INTEGER NOT NULL CHECK (total_invalid >= 0),
-          last_invalid_at    INTEGER NOT NULL)`);
-      }
-      if (row.version < 5) {
-        db.exec(`CREATE TABLE IF NOT EXISTS quarantine_prune_stats (
-          id            INTEGER PRIMARY KEY CHECK (id = 1),
-          total_pruned  INTEGER NOT NULL DEFAULT 0)`);
-      }
-      if (row.version < 6) {
-        db.exec(`CREATE TABLE IF NOT EXISTS entity_versions (
-          entity_id          TEXT PRIMARY KEY,
-          entity_type        TEXT NOT NULL,
-          version            TEXT NOT NULL,
-          latest_producer    TEXT NOT NULL,
-          latest_seq         INTEGER NOT NULL,
-          latest_hlc         INTEGER NOT NULL,
-          updated_hlc        INTEGER NOT NULL)`);
-        backfillEntityVersions(db);
-      }
-      if (row.version < 7) {
-        const cols = db.prepare("PRAGMA table_info(peers)").all().map((c) => c.name);
-        if (!cols.includes("last_endpoint_host")) {
-          db.exec("ALTER TABLE peers ADD COLUMN last_endpoint_host TEXT");
-        }
-        if (!cols.includes("last_endpoint_port")) {
-          db.exec("ALTER TABLE peers ADD COLUMN last_endpoint_port INTEGER");
-        }
-        if (!cols.includes("last_endpoint_seen")) {
-          db.exec("ALTER TABLE peers ADD COLUMN last_endpoint_seen INTEGER");
-        }
-        ensureReminderColumnsV7(db);
-      }
-      if (row.version < 8) {
-        const hasEvents = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").get() !== void 0;
-        if (hasEvents) {
-          db.exec(`
-            UPDATE events SET
-              end_date = strftime('%Y-%m-%d', (utc_end_ms - 1) / 1000, 'unixepoch', 'localtime')
-            WHERE all_day = 1
-              AND utc_end_ms IS NOT NULL
-              AND utc_end_ms > 0
-              AND end_date IS NOT NULL
-              AND end_date != strftime('%Y-%m-%d', (utc_end_ms - 1) / 1000, 'unixepoch', 'localtime')
-              -- Safety: never let the re-derivation move end_date BEFORE
-              -- start_date (legacy shell-store rows carry utc_* = 0 and their
-              -- truth lives in the date columns themselves).
-              AND strftime('%Y-%m-%d', (utc_end_ms - 1) / 1000, 'unixepoch', 'localtime') >= start_date;
-          `);
-        }
-      }
-      ensureReminderColumnsV7(db);
-      if (row.version <= 9) {
-        ensureRevocationSchemaV9(db);
-      }
-      if (row.version < 10) {
-        ensurePeerNamesSchemaV10(db);
-      }
-      db.prepare("UPDATE schema_version SET version = ?").run(SCHEMA_VERSION);
-    });
-    tx();
-  }
-}
-function ensureReminderColumnsV7(db) {
-  const colsOf = (table) => db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table) !== void 0 ? db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name) : [];
-  const remCols = colsOf("reminders");
-  if (remCols.length > 0 && !remCols.includes("enabled")) {
-    db.exec("ALTER TABLE reminders ADD COLUMN enabled INTEGER CHECK (enabled IN (0, 1))");
-  }
-  const evCols = colsOf("events");
-  if (evCols.length > 0 && !evCols.includes("all_day_reminder_time")) {
-    db.exec("ALTER TABLE events ADD COLUMN all_day_reminder_time TEXT");
-  }
-}
-function ensureRevocationSchemaV9(db) {
-  db.exec(`CREATE TABLE IF NOT EXISTS revocation_records (
-    revoked_device_id    TEXT NOT NULL,
-    revoked_by_device_id TEXT NOT NULL,
-    revoked_at_hlc       INTEGER NOT NULL,
-    reason               TEXT,
-    record_bytes         BLOB NOT NULL,
-    signature            BLOB NOT NULL,
-    verification_state   TEXT NOT NULL CHECK
-                         (verification_state IN ('pending','valid','invalid')),
-    received_at_hlc      INTEGER NOT NULL,
-    revoked_after_seq    INTEGER,
-    PRIMARY KEY (revoked_device_id, revoked_by_device_id, revoked_at_hlc))`);
-  const cols = db.prepare("PRAGMA table_info(revocation_records)").all().map((c) => c.name);
-  if (!cols.includes("revoked_after_seq")) {
-    db.exec("ALTER TABLE revocation_records ADD COLUMN revoked_after_seq INTEGER");
-  }
-  db.exec(`CREATE TABLE IF NOT EXISTS revocation_acks (
-    peer_device_id       TEXT NOT NULL,
-    revoked_device_id    TEXT NOT NULL,
-    revoked_by_device_id TEXT NOT NULL,
-    revoked_at_hlc       INTEGER NOT NULL,
-    acked_at             INTEGER NOT NULL,
-    PRIMARY KEY (peer_device_id, revoked_device_id, revoked_by_device_id,
-                 revoked_at_hlc))`);
-}
-function ensurePeerNamesSchemaV10(db) {
-  const hasPeers = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='peers'").get() !== void 0;
-  if (!hasPeers) return false;
-  const cols = db.prepare("PRAGMA table_info(peers)").all().map(
-    (c) => c.name
-  );
-  if (cols.includes("announced_name")) return false;
-  db.exec("ALTER TABLE peers ADD COLUMN announced_name TEXT");
-  const rows = db.prepare("SELECT device_id, display_name FROM peers").all();
-  const upd = db.prepare("UPDATE peers SET announced_name = ?, display_name = '' WHERE device_id = ?");
-  for (const r of rows) {
-    upd.run(announcedNameFromPeer(r.display_name, r.device_id).name, r.device_id);
-  }
-  return true;
-}
-function backfillEntityVersions(db) {
-  const rows = db.prepare(
-    "SELECT entity_id, entity_type, causality_clock, device_id, local_seq, hlc_timestamp FROM changes ORDER BY hlc_timestamp ASC, local_seq ASC"
-  ).all();
-  for (const r of rows) {
-    recordEntityVersion(db, {
-      change_id: changeId(r.device_id, r.local_seq),
-      device_id: r.device_id,
-      local_seq: r.local_seq,
-      entity_id: r.entity_id,
-      entity_type: r.entity_type,
-      field_path: "",
-      operation: "set",
-      payload: {},
-      hlc_timestamp: r.hlc_timestamp,
-      causality_clock: JSON.parse(r.causality_clock),
-      schema_version: 1
-    });
-  }
-}
-function recordEntityVersion(db, record) {
-  const get2 = db.prepare(
-    "SELECT version, latest_hlc, latest_seq, latest_producer FROM entity_versions WHERE entity_id = ?"
-  );
-  const existing = get2.get(record.entity_id);
-  let version = existing ? JSON.parse(existing.version) : {};
-  version = mergeClocks(version, record.causality_clock);
-  let producer = existing?.latest_producer ?? record.device_id;
-  let seq = existing?.latest_seq ?? record.local_seq;
-  let hlc = existing?.latest_hlc ?? record.hlc_timestamp;
-  if (record.hlc_timestamp > hlc || record.hlc_timestamp === hlc && record.local_seq > seq) {
-    producer = record.device_id;
-    seq = record.local_seq;
-    hlc = record.hlc_timestamp;
-  }
-  db.prepare(`
-    INSERT INTO entity_versions (entity_id, entity_type, version, latest_producer, latest_seq, latest_hlc, updated_hlc)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(entity_id) DO UPDATE SET
-      entity_type = excluded.entity_type,
-      version = excluded.version,
-      latest_producer = excluded.latest_producer,
-      latest_seq = excluded.latest_seq,
-      latest_hlc = excluded.latest_hlc,
-      updated_hlc = excluded.updated_hlc`).run(
-    record.entity_id,
-    record.entity_type,
-    JSON.stringify(version),
-    producer,
-    seq,
-    hlc,
-    record.hlc_timestamp
-  );
-}
-function mergeClocks(a, b) {
-  const out = { ...a };
-  for (const [d, s] of Object.entries(b)) {
-    out[d] = Math.max(out[d] ?? 0, s);
-  }
-  return out;
-}
-function createLocalChange(db, selfDeviceId, input, mutate) {
-  const insertChange = db.prepare(`
-    INSERT INTO changes (change_id, device_id, local_seq, entity_id,
-      entity_type, field_path, operation, payload, hlc_timestamp,
-      causality_clock, schema_version)
-    VALUES (@change_id, @device_id, @local_seq, @entity_id, @entity_type,
-      @field_path, @operation, @payload, @hlc_timestamp, @causality_clock,
-      @schema_version)`);
-  const upsertClock = db.prepare(`
-    INSERT INTO device_clock (peer_device_id, max_seq) VALUES (@d, @s)
-    ON CONFLICT(peer_device_id) DO UPDATE SET
-      max_seq = MAX(max_seq, excluded.max_seq)`);
-  let record;
-  const tx = db.transaction(() => {
-    const storedClock = getDeviceClock(db);
-    const nextSeq = Math.max(storedClock[selfDeviceId] ?? 0, getNextLocalSeq(db, selfDeviceId)) + 1;
-    const clock = { ...storedClock, [selfDeviceId]: nextSeq };
-    record = {
-      change_id: changeId(selfDeviceId, nextSeq),
-      device_id: selfDeviceId,
-      local_seq: nextSeq,
-      entity_id: input.entity_id,
-      entity_type: input.entity_type,
-      field_path: input.field_path,
-      operation: input.operation,
-      payload: input.payload,
-      hlc_timestamp: input.hlc_now(),
-      causality_clock: clock,
-      schema_version: 1
-    };
-    mutate?.(db, record);
-    insertChange.run(serializeChange(record));
-    recordEntityVersion(db, record);
-    upsertClock.run({ d: selfDeviceId, s: nextSeq });
-  });
-  tx();
-  return record;
-}
-function serializeChange(r) {
-  return {
-    ...r,
-    payload: JSON.stringify(r.payload),
-    causality_clock: JSON.stringify(r.causality_clock)
-  };
-}
-function getNextLocalSeq(db, deviceId) {
-  const row = db.prepare(
-    "SELECT MAX(local_seq) AS m FROM changes WHERE device_id = ?"
-  ).get(deviceId);
-  return row?.m ?? 0;
-}
-function getDeviceClock(db) {
-  const rows = db.prepare(
-    "SELECT peer_device_id, max_seq FROM device_clock"
-  ).all();
-  const clock = {};
-  for (const r of rows) clock[r.peer_device_id] = r.max_seq;
-  return clock;
-}
-function eventRowLocalValue(db, entityId, fieldPath) {
-  const row = db.prepare(
-    "SELECT title, description, all_day, utc_start_ms, utc_end_ms FROM events WHERE event_id = ?"
-  ).get(entityId);
-  if (!row) return { deleted: true, value: void 0 };
-  switch (fieldPath) {
-    case "title":
-      return { deleted: false, value: row.title };
-    case "description":
-      return { deleted: false, value: row.description };
-    case "schedule":
-      return {
-        deleted: false,
-        value: {
-          startMs: row.utc_start_ms,
-          endMs: row.utc_end_ms,
-          allDay: row.all_day === 1
-        }
-      };
-    default:
-      return {
-        deleted: false,
-        value: {
-          title: row.title,
-          description: row.description,
-          startMs: row.utc_start_ms,
-          endMs: row.utc_end_ms,
-          allDay: row.all_day === 1
-        }
-      };
-  }
-}
-function loadConflictLocals(db, entityId, fieldPath) {
-  const rows = (fieldPath === "*" ? db.prepare(
-    `SELECT change_id, device_id, local_seq, entity_id, entity_type,
-                    field_path, operation, payload, hlc_timestamp,
-                    causality_clock, schema_version
-             FROM changes WHERE entity_id = ?`
-  ).all(entityId) : db.prepare(
-    `SELECT change_id, device_id, local_seq, entity_id, entity_type,
-                    field_path, operation, payload, hlc_timestamp,
-                    causality_clock, schema_version
-             FROM changes
-             WHERE entity_id = ? AND (field_path = ? OR field_path = '*')`
-  ).all(entityId, fieldPath)).map(deserializeChangeRow);
-  return rows;
-}
-function deserializeChangeRow(r) {
-  return {
-    change_id: r.change_id,
-    device_id: r.device_id,
-    local_seq: r.local_seq,
-    entity_id: r.entity_id,
-    entity_type: r.entity_type,
-    field_path: r.field_path,
-    operation: r.operation,
-    payload: JSON.parse(r.payload),
-    hlc_timestamp: r.hlc_timestamp,
-    causality_clock: JSON.parse(r.causality_clock),
-    schema_version: r.schema_version
-  };
-}
-function detectAndRecordConflict(db, record) {
-  if (record.entity_type !== "event") return "apply";
-  const localCurrent = eventRowLocalValue(db, record.entity_id, record.field_path);
-  const locals = loadConflictLocals(db, record.entity_id, record.field_path);
-  const outcome = detect(record, localCurrent, locals);
-  if (outcome.kind === "conflict") {
-    recordConflictRow(db, record, outcome.conflicting);
-    return "conflict";
-  }
-  return outcome.kind;
-}
-function recordConflictRow(db, incoming, conflicting) {
-  const insertParticipant = db.prepare(`
-    INSERT OR IGNORE INTO conflict_participants
-      (conflict_id, change_id, device_id, local_seq, causality_clock, payload)
-    VALUES (?, ?, ?, ?, ?, ?)`);
-  db.transaction(() => {
-    const existing = db.prepare(
-      `SELECT conflict_id FROM conflicts
-         WHERE entity_id = ? AND field_path = ? AND status = 'unresolved'`
-    ).get(incoming.entity_id, incoming.field_path);
-    let conflictId;
-    if (existing) {
-      conflictId = existing.conflict_id;
-    } else {
-      conflictId = randomUUID();
-      db.prepare(
-        `INSERT INTO conflicts (conflict_id, entity_id, field_path, status,
-                                detected_at_hlc)
-         VALUES (?, ?, ?, 'unresolved', ?)`
-      ).run(conflictId, incoming.entity_id, incoming.field_path, Date.now());
-    }
-    for (const p of [...conflicting, incoming]) {
-      insertParticipant.run(
-        conflictId,
-        p.change_id,
-        p.device_id,
-        p.local_seq,
-        JSON.stringify(p.causality_clock),
-        JSON.stringify(p.payload)
-      );
-    }
-  })();
-}
-function applyRemoteChange(db, incoming, knowledge, mutate) {
-  const insertPending = db.prepare(`
-    INSERT INTO pending_changes (device_id, local_seq, record_payload, received_at_hlc)
-    VALUES (?, ?, ?, ?)`);
-  const insertChange = db.prepare(`
-    INSERT INTO changes (change_id, device_id, local_seq, entity_id,
-      entity_type, field_path, operation, payload, hlc_timestamp,
-      causality_clock, schema_version)
-    VALUES (@change_id, @device_id, @local_seq, @entity_id, @entity_type,
-      @field_path, @operation, @payload, @hlc_timestamp, @causality_clock,
-      @schema_version)`);
-  const setAppliedUpto = db.prepare(`
-    INSERT INTO applied_upto (producer_device_id, applied_through) VALUES (?, ?)
-    ON CONFLICT(producer_device_id) DO UPDATE SET
-      applied_through = MAX(applied_through, excluded.applied_through)`);
-  const deletePending = db.prepare(
-    "DELETE FROM pending_changes WHERE device_id = ? AND local_seq = ?"
-  );
-  const loadAllPending = db.prepare(
-    "SELECT device_id, local_seq, record_payload FROM pending_changes WHERE device_id = ?"
-  );
-  const upsertClockStmt = db.prepare(`
-    INSERT INTO device_clock (peer_device_id, max_seq) VALUES (?, ?)
-    ON CONFLICT(peer_device_id) DO UPDATE SET
-      max_seq = MAX(max_seq, excluded.max_seq)`);
-  function mergeClocks2(clock) {
-    for (const [d, s] of Object.entries(clock)) {
-      upsertClockStmt.run(d, s);
-    }
-  }
-  let dbKnowledge;
-  try {
-    const outcome = db.transaction(() => {
-      dbKnowledge = loadKnowledgeFromDb(db);
-      const cls = classifyArrival(
-        dbKnowledge,
-        incoming.device_id,
-        incoming.local_seq
-      );
-      if (cls === "duplicate") {
-        mergeClocks2(incoming.causality_clock);
-        return "duplicate";
-      }
-      if (cls === "buffer") {
-        insertPending.run(
-          incoming.device_id,
-          incoming.local_seq,
-          JSON.stringify(incoming),
-          Date.now()
-        );
-        mergeClocks2(incoming.causality_clock);
-        return "buffered";
-      }
-      const drained = advanceApplied(
-        dbKnowledge,
-        incoming.device_id,
-        incoming.local_seq
-      );
-      for (const step of drained) {
-        let record;
-        if (step.device_id === incoming.device_id && step.local_seq === incoming.local_seq) {
-          record = incoming;
-        } else {
-          const rows = loadAllPending.all(step.device_id);
-          const match = rows.find((r) => r.local_seq === step.local_seq);
-          if (!match) {
-            throw new Error(
-              `pending payload missing for ${step.device_id}:${step.local_seq}`
-            );
-          }
-          record = JSON.parse(match.record_payload);
-        }
-        const det = detectAndRecordConflict(db, record);
-        if (det === "apply") {
-          mutate?.(db, record);
-        }
-        insertChange.run(serializeChange(record));
-        recordEntityVersion(db, record);
-        deletePending.run(step.device_id, step.local_seq);
-      }
-      setAppliedUpto.run(
-        incoming.device_id,
-        drained[drained.length - 1].local_seq
-      );
-      db.prepare(
-        "DELETE FROM skipped_seqs WHERE producer_device_id = ? AND local_seq <= ?"
-      ).run(incoming.device_id, drained[drained.length - 1].local_seq);
-      mergeClocks2(incoming.causality_clock);
-      return "applied";
-    })();
-    knowledge.appliedUpto = dbKnowledge.appliedUpto;
-    knowledge.pending = dbKnowledge.pending;
-    knowledge.skipped = dbKnowledge.skipped;
-    return outcome;
-  } catch (err2) {
-    if (isUniqueViolation(err2)) {
-      db.transaction(() => mergeClocks2(incoming.causality_clock))();
-      const fresh = loadKnowledgeFromDb(db);
-      knowledge.appliedUpto = fresh.appliedUpto;
-      knowledge.pending = fresh.pending;
-      knowledge.skipped = fresh.skipped;
-      return "duplicate";
-    }
-    throw err2;
-  }
-}
-function loadKnowledgeFromDb(db) {
-  const k = emptyKnowledge();
-  k.skipped = /* @__PURE__ */ new Map();
-  for (const r of db.prepare(
-    "SELECT producer_device_id, applied_through FROM applied_upto"
-  ).all()) {
-    k.appliedUpto[r.producer_device_id] = r.applied_through;
-  }
-  for (const r of db.prepare(
-    "SELECT device_id, local_seq FROM pending_changes"
-  ).all()) {
-    let set = k.pending.get(r.device_id);
-    if (!set) {
-      set = /* @__PURE__ */ new Set();
-      k.pending.set(r.device_id, set);
-    }
-    set.add(r.local_seq);
-  }
-  for (const r of db.prepare(
-    "SELECT producer_device_id, local_seq FROM skipped_seqs"
-  ).all()) {
-    let set = k.skipped.get(r.producer_device_id);
-    if (!set) {
-      set = /* @__PURE__ */ new Set();
-      k.skipped.set(r.producer_device_id, set);
-    }
-    set.add(r.local_seq);
-  }
-  return k;
-}
-function isUniqueViolation(err2) {
-  const msg = err2 instanceof Error ? err2.message : String(err2);
-  return msg.includes("UNIQUE constraint failed");
-}
-function quarantineRecord(db, opts) {
-  const raw = opts.rawRecord;
-  if (raw !== null && typeof raw === "object" && !Array.isArray(raw)) {
-    const deviceId = raw.device_id;
-    const seq = raw.local_seq;
-    if (typeof deviceId === "string" && deviceId.length > 0 && typeof seq === "number" && Number.isInteger(seq) && seq > 0) {
-      const existing = db.prepare(
-        `SELECT 1 FROM quarantine
-           WHERE json_extract(raw_record, '$.device_id') = ?
-             AND json_extract(raw_record, '$.local_seq') = ?
-           LIMIT 1`
-      ).get(deviceId, seq);
-      if (existing !== void 0) return;
-    }
-  }
-  db.prepare(`
-    INSERT INTO quarantine
-      (quarantine_reason, received_at_hlc, sender_device_id, raw_record)
-    VALUES (?, ?, ?, ?)`).run(
-    opts.reason,
-    Date.now(),
-    opts.senderDeviceId,
-    JSON.stringify(opts.rawRecord)
-  );
-}
-function countQuarantined(db, reason) {
-  if (reason === void 0) {
-    const row2 = db.prepare("SELECT COUNT(*) AS c FROM quarantine").get();
-    return row2?.c ?? 0;
-  }
-  const row = db.prepare(
-    "SELECT COUNT(*) AS c FROM quarantine WHERE quarantine_reason = ?"
-  ).get(reason);
-  return row?.c ?? 0;
-}
-function markSeqSkipped(db, producerDeviceId, localSeq) {
-  db.prepare(
-    "INSERT OR IGNORE INTO skipped_seqs (producer_device_id, local_seq) VALUES (?, ?)"
-  ).run(producerDeviceId, localSeq);
-}
-function isSeqSkipped(db, producerDeviceId, localSeq) {
-  return !!db.prepare(
-    "SELECT 1 FROM skipped_seqs WHERE producer_device_id = ? AND local_seq = ?"
-  ).get(producerDeviceId, localSeq);
-}
-function listQuarantine(db, opts) {
-  return db.prepare(
-    `SELECT quarantine_id, quarantine_reason, received_at_hlc,
-              sender_device_id, raw_record,
-              resolved_at_hlc, resolved_reason
-       FROM quarantine ORDER BY quarantine_id DESC LIMIT ?`
-  ).all(opts?.limit ?? 200);
-}
-function markQuarantineResolved(db, quarantineId, reason) {
-  const info = db.prepare(
-    `UPDATE quarantine
-       SET resolved_at_hlc = ?, resolved_reason = ?
-       WHERE quarantine_id = ? AND resolved_at_hlc IS NULL`
-  ).run(Date.now(), reason, quarantineId);
-  return info.changes > 0;
-}
-function reconcileQuarantineResolutions(db) {
-  const rows = db.prepare(
-    "SELECT quarantine_id, raw_record FROM quarantine WHERE resolved_at_hlc IS NULL"
-  ).all();
-  const exists = db.prepare("SELECT 1 FROM changes WHERE change_id = ?");
-  let marked = 0;
-  for (const row of rows) {
-    let deviceId;
-    let localSeq;
-    try {
-      const raw = JSON.parse(row.raw_record);
-      deviceId = raw.device_id;
-      localSeq = raw.local_seq;
-    } catch {
-      continue;
-    }
-    if (typeof deviceId !== "string") continue;
-    if (typeof localSeq !== "number" || !Number.isInteger(localSeq)) continue;
-    const changeIdStr = `${deviceId}:${localSeq}`;
-    if (exists.get(changeIdStr)) {
-      if (markQuarantineResolved(db, row.quarantine_id, "revalidated_on_restart")) {
-        marked++;
-      }
-    }
-  }
-  return { examined: rows.length, marked };
-}
-function listQuarantineStats(db) {
-  const row = db.prepare(
-    `SELECT SUM(CASE WHEN resolved_at_hlc IS NULL THEN 1 ELSE 0 END) AS active,
-              SUM(CASE WHEN resolved_at_hlc IS NOT NULL THEN 1 ELSE 0 END) AS resolved,
-              COUNT(*) AS total
-       FROM quarantine`
-  ).get();
-  const pruned = db.prepare(
-    "SELECT total_pruned FROM quarantine_prune_stats WHERE id = 1"
-  ).get();
-  return {
-    active: row?.active ?? 0,
-    resolved: row?.resolved ?? 0,
-    total: row?.total ?? 0,
-    total_pruned: pruned?.total_pruned ?? 0
-  };
-}
-var QUARANTINE_RESOLVED_RETENTION_CAP = 1e3;
-function pruneResolvedQuarantine(db, cap = QUARANTINE_RESOLVED_RETENTION_CAP) {
-  if (!Number.isInteger(cap) || cap < 0) {
-    throw new Error(`invalid retention cap: ${cap}`);
-  }
-  let pruned = 0;
-  db.transaction(() => {
-    const info = db.prepare(
-      `DELETE FROM quarantine
-         WHERE resolved_at_hlc IS NOT NULL
-           AND quarantine_id NOT IN (
-             SELECT quarantine_id FROM quarantine
-             WHERE resolved_at_hlc IS NOT NULL
-             ORDER BY quarantine_id DESC LIMIT ?)`
-    ).run(cap);
-    pruned = info.changes;
-    if (pruned > 0) {
-      db.prepare(
-        `INSERT INTO quarantine_prune_stats (id, total_pruned) VALUES (1, ?)
-         ON CONFLICT(id) DO UPDATE SET
-           total_pruned = total_pruned + excluded.total_pruned`
-      ).run(pruned);
-    }
-  })();
-  return pruned;
-}
-function deleteQuarantineByUser(db, quarantineId, opts) {
-  if (opts?.confirm !== true) {
-    throw new Error(
-      "delete_quarantine requires explicit confirm: true (destructive action, DC-15 \xA73.5)"
-    );
-  }
-  const row = db.prepare(
-    "SELECT raw_record, resolved_at_hlc FROM quarantine WHERE quarantine_id = ?"
-  ).get(quarantineId);
-  if (!row) throw new Error(`quarantine row ${quarantineId} not found`);
-  let producer = null;
-  let seq = null;
-  try {
-    const raw = JSON.parse(row.raw_record);
-    if (typeof raw.device_id === "string" && raw.device_id.length > 0) {
-      producer = raw.device_id;
-    }
-    if (typeof raw.local_seq === "number" && Number.isInteger(raw.local_seq) && raw.local_seq > 0) {
-      seq = raw.local_seq;
-    }
-  } catch {
-  }
-  let skipRowPresent = false;
-  let recreated = false;
-  db.transaction(() => {
-    if (row.resolved_at_hlc === null) {
-      markQuarantineResolved(db, quarantineId, "user_deleted");
-    }
-    if (producer !== null && seq !== null) {
-      const applied = !!db.prepare("SELECT 1 FROM changes WHERE change_id = ?").get(`${producer}:${seq}`);
-      if (!applied) {
-        skipRowPresent = isSeqSkipped(db, producer, seq);
-        if (!skipRowPresent) {
-          markSeqSkipped(db, producer, seq);
-          recreated = true;
-        }
-      } else {
-        skipRowPresent = true;
-      }
-    }
-  })();
-  return {
-    ok: true,
-    skip_row_present: skipRowPresent,
-    skip_row_recreated: recreated
-  };
-}
-var HARD_BLOCK_LOOKUP_SQL = "SELECT 1 FROM hard_blocks WHERE producer_device_id = ?";
-function makeHardBlockCheck(db) {
-  const stmt = db.prepare(HARD_BLOCK_LOOKUP_SQL);
-  return (producerDeviceId) => !!stmt.get(producerDeviceId);
-}
-function hardBlockProducer(db, producerDeviceId) {
-  const now = Date.now();
-  db.prepare(
-    `INSERT INTO hard_blocks
-       (producer_device_id, first_triggered_at, last_triggered_at, trigger_count)
-     VALUES (?, ?, ?, 1)
-     ON CONFLICT(producer_device_id) DO UPDATE SET
-       last_triggered_at = excluded.last_triggered_at,
-       trigger_count = trigger_count + 1`
-  ).run(producerDeviceId, now, now);
-}
-function unhardBlockProducer(db, producerDeviceId) {
-  const info = db.prepare("DELETE FROM hard_blocks WHERE producer_device_id = ?").run(producerDeviceId);
-  return info.changes > 0;
-}
-function listHardBlocks(db) {
-  return db.prepare(`SELECT producer_device_id, first_triggered_at, last_triggered_at,
-              trigger_count
-       FROM hard_blocks ORDER BY last_triggered_at DESC`).all();
-}
-function appendInvalidTally(db, producerDeviceId) {
-  db.prepare(
-    `INSERT INTO peer_invalid_tally
-       (producer_device_id, total_invalid, last_invalid_at)
-     VALUES (?, 1, ?)
-     ON CONFLICT(producer_device_id) DO UPDATE SET
-       total_invalid = total_invalid + 1,
-       last_invalid_at = excluded.last_invalid_at`
-  ).run(producerDeviceId, Date.now());
-}
-function listPeerInvalidTally(db) {
-  return db.prepare(`SELECT producer_device_id, total_invalid, last_invalid_at
-       FROM peer_invalid_tally ORDER BY last_invalid_at DESC`).all();
-}
-
-// src/persistence/bridges/event_core.ts
-var DEFAULT_CALENDAR_ID = "local";
-var HlcTicker = class {
-  last = 0;
-  now() {
-    const wall = Date.now();
-    this.last = wall > this.last ? wall : this.last + 1;
-    return this.last;
-  }
-};
-function loadOrCreateDeviceId(dbPath) {
-  const marker = `${dbPath}.device_id`;
-  if (existsSync(marker)) {
-    return readFileSync(marker, "utf8").trim();
-  }
-  const id = `dev-${randomUUID2()}`;
-  writeFileSync(marker, id, "utf8");
-  return id;
-}
-function localDateStr(ms) {
-  const d = new Date(ms);
-  const p = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
-}
-function localWallStr(ms) {
-  const d = new Date(ms);
-  const p = (n) => String(n).padStart(2, "0");
-  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
-}
-function inclusiveEndDateFromExclusiveMs(endMs) {
-  return localDateStr(endMs - 1);
-}
-function timezoneId() {
-  try {
-    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
-  } catch {
-    return "UTC";
-  }
-}
-function assertNoInjectedId(input, op) {
-  if (input !== null && typeof input === "object" && "id" in input) {
-    throw new Error(
-      `${op}_event: input.id is not accepted \u2014 event ids are assigned by the sidecar (update targets come from the op's id argument) and a client-injected id is rejected without any state change`
-    );
-  }
-}
-var MAX_EVENT_MS = 864e13;
-function validateEventValues(input, op) {
-  for (const k of ["startMs", "endMs"]) {
-    const v = input[k];
-    if (typeof v !== "number" || !Number.isInteger(v)) {
-      throw new Error(
-        `${op}: input.${k} must be an integer number of epoch milliseconds (fractional/non-numeric values are rejected, never coerced)`
-      );
-    }
-    if (Math.abs(v) > MAX_EVENT_MS) {
-      throw new Error(
-        `${op}: input.${k} ${v} is outside the epoch-ms domain (+/-${MAX_EVENT_MS}); values beyond it are rejected because Date-derived columns and exact JSON round-trips cannot represent them`
-      );
-    }
-  }
-  if (input.endMs < input.startMs) {
-    throw new Error(
-      `${op}: input.endMs (${input.endMs}) must be >= input.startMs (${input.startMs}) \u2014 inverted ranges are rejected without any state change`
-    );
-  }
-}
-var RRULE_FREQS = /* @__PURE__ */ new Set(["DAILY", "WEEKLY", "MONTHLY", "YEARLY"]);
-var RRULE_KEYS = /* @__PURE__ */ new Set(["FREQ", "INTERVAL", "BYDAY", "COUNT", "UNTIL"]);
-var RRULE_DAYS = /* @__PURE__ */ new Set(["MO", "TU", "WE", "TH", "FR", "SA", "SU"]);
-var RECURRENCE_ID_RE = /^\d{8}T\d{6}$/;
-function validateRRule(rule, op) {
-  if (typeof rule !== "string" || rule.trim().length === 0) {
-    throw new Error(`${op}: recurrence_rule must be a non-empty RRULE string`);
-  }
-  const segments = rule.split(";");
-  let sawFreq = false;
-  for (const seg of segments) {
-    const eq = seg.indexOf("=");
-    if (eq <= 0) {
-      throw new Error(
-        `${op}: recurrence_rule segment "${seg}" is not KEY=VALUE \u2014 the rule must be a semicolon-separated RFC 5545 RRULE`
-      );
-    }
-    const key = seg.slice(0, eq).trim().toUpperCase();
-    const value = seg.slice(eq + 1).trim();
-    if (!RRULE_KEYS.has(key)) {
-      throw new Error(
-        `${op}: recurrence_rule key "${key}" is not supported \u2014 allowed: FREQ, INTERVAL, BYDAY, COUNT, UNTIL`
-      );
-    }
-    if (value.length === 0) {
-      throw new Error(`${op}: recurrence_rule key "${key}" has an empty value`);
-    }
-    switch (key) {
-      case "FREQ": {
-        const f = value.toUpperCase();
-        if (!RRULE_FREQS.has(f)) {
-          throw new Error(
-            `${op}: recurrence_rule FREQ "${value}" is not supported \u2014 allowed: DAILY, WEEKLY, MONTHLY, YEARLY`
-          );
-        }
-        sawFreq = true;
-        break;
-      }
-      case "INTERVAL": {
-        const n = Number(value);
-        if (!Number.isInteger(n) || n < 1) {
-          throw new Error(
-            `${op}: recurrence_rule INTERVAL "${value}" must be an integer >= 1`
-          );
-        }
-        break;
-      }
-      case "COUNT": {
-        const n = Number(value);
-        if (!Number.isInteger(n) || n < 1) {
-          throw new Error(
-            `${op}: recurrence_rule COUNT "${value}" must be an integer >= 1`
-          );
-        }
-        break;
-      }
-      case "UNTIL": {
-        if (!/^\d{8}$/.test(value) && !/^\d{8}T\d{6}Z$/.test(value)) {
-          throw new Error(
-            `${op}: recurrence_rule UNTIL "${value}" must be YYYYMMDD or YYYYMMDDTHHMMSSZ (RFC 5545 \xA73.3.10)`
-          );
-        }
-        break;
-      }
-      case "BYDAY": {
-        for (const d of value.split(",")) {
-          if (!RRULE_DAYS.has(d.trim().toUpperCase())) {
-            throw new Error(
-              `${op}: recurrence_rule BYDAY value "${d}" is not a weekday (MO TU WE TH FR SA SU)`
-            );
-          }
-        }
-        break;
-      }
-    }
-  }
-  if (!sawFreq) {
-    throw new Error(`${op}: recurrence_rule is missing required FREQ`);
-  }
-  return rule;
-}
-function validateRecurrenceId(rid, op) {
-  if (typeof rid !== "string" || !RECURRENCE_ID_RE.test(rid)) {
-    throw new Error(
-      `${op}: recurrence_id must be the canonical wall-clock form "YYYYMMDDTHHMMSS" (DC-12 \xA72.3), got: ${JSON.stringify(rid)}`
-    );
-  }
-  return rid;
-}
-var OVERRIDE_FIELDS = [
-  "cancelled",
-  "title",
-  "start_wall",
-  "end_wall",
-  "tz_id"
-];
-var EventCore = class {
-  db;
-  dbPath;
-  deviceId;
-  hlc = new HlcTicker();
-  /**
-   * DC-27 V3: the ONE hybrid logical clock of this process, the same ticker
-   * that stamps local change records (revoked_at_hlc must come from it).
-   */
-  hlcNow() {
-    return this.hlc.now();
-  }
-  constructor(dbPath, deviceId) {
-    this.dbPath = dbPath;
-    this.db = openDatabase({ path: dbPath });
-    this.deviceId = deviceId ?? loadOrCreateDeviceId(dbPath);
-    this.ensureDefaultCalendar();
-  }
-  get selfDeviceId() {
-    return this.deviceId;
-  }
-  // -------------------------------------------------------------------------
-  // DC-22: reminder members (collection members; replicate per D5).
-  // -------------------------------------------------------------------------
-  /** Read one event's reminder member, or null. */
-  reminderFor(eventId) {
-    const row = this.db.prepare(
-      "SELECT minutes_before, enabled FROM reminders WHERE entity_id = ?"
-    ).get(eventId);
-    if (row === void 0) return null;
-    return { minutesBefore: row.minutes_before, enabled: row.enabled !== 0 };
-  }
-  /**
-   * Create-or-update this event's reminder member (v1 UI: one member per
-   * event). Replicates as member_add / member_update (D5: disabled members
-   * are stored-but-inactive AND still replicate).
-   */
-  setReminder(eventId, reminder) {
-    if (!Number.isInteger(reminder.minutesBefore) || reminder.minutesBefore < 0) {
-      throw new Error("setReminder: minutes_before must be a non-negative integer");
-    }
-    if (this.getEventRow(eventId) === void 0) {
-      throw new Error(`setReminder: event not found: ${eventId}`);
-    }
-    const existing = this.db.prepare(
-      "SELECT member_id FROM reminders WHERE entity_id = ?"
-    ).get(eventId);
-    const hlc = this.hlc.now();
-    if (existing !== void 0) {
-      createLocalChange(
-        this.db,
-        this.deviceId,
-        {
-          entity_id: eventId,
-          entity_type: "reminder",
-          field_path: `reminders.${existing.member_id}`,
-          operation: "member_update",
-          payload: {
-            value: { minutes_before: reminder.minutesBefore, enabled: reminder.enabled ? 1 : 0 }
-          },
-          hlc_now: () => hlc
-        },
-        (db) => {
-          db.prepare(
-            "UPDATE reminders SET minutes_before = ?, enabled = ?, updated_hlc = ? WHERE member_id = ?"
-          ).run(reminder.minutesBefore, reminder.enabled ? 1 : 0, hlc, existing.member_id);
-        }
-      );
-      return;
-    }
-    const memberId = `rem-${randomUUID2()}`;
-    createLocalChange(
-      this.db,
-      this.deviceId,
-      {
-        entity_id: eventId,
-        entity_type: "reminder",
-        field_path: `reminders.${memberId}`,
-        operation: "member_add",
-        payload: {
-          value: { minutes_before: reminder.minutesBefore, enabled: reminder.enabled ? 1 : 0 }
-        },
-        hlc_now: () => hlc
-      },
-      (db) => {
-        db.prepare(
-          `INSERT INTO reminders (member_id, entity_id, collection_path, minutes_before, enabled, updated_hlc)
-           VALUES (?, ?, 'reminders', ?, ?, ?)`
-        ).run(memberId, eventId, reminder.minutesBefore, reminder.enabled ? 1 : 0, hlc);
-      }
-    );
-  }
-  /** Remove the event's reminder member (member_remove). Idempotent. */
-  clearReminder(eventId) {
-    const existing = this.db.prepare(
-      "SELECT member_id FROM reminders WHERE entity_id = ?"
-    ).get(eventId);
-    if (existing === void 0) return;
-    const hlc = this.hlc.now();
-    createLocalChange(
-      this.db,
-      this.deviceId,
-      {
-        entity_id: eventId,
-        entity_type: "reminder",
-        field_path: `reminders.${existing.member_id}`,
-        operation: "member_remove",
-        payload: { value: null },
-        hlc_now: () => hlc
-      },
-      (db) => {
-        db.prepare("DELETE FROM reminders WHERE member_id = ?").run(existing.member_id);
-      }
-    );
-  }
-  /**
-   * Bootstrap the shell-local calendar through the same T1 path so even
-   * this bootstrap produces an auditable change record.
-   *
-   * Pkg6 (QA-2 F-1): the bootstrap change is emitted ONLY when the calendar
-   * row is MISSING. Previously the T1 ran unconditionally, so every
-   * sidecar restart emitted a fresh authoritative "title='My Calendar'"
-   * change for an entity that already existed — a spurious change per
-   * restart (QA-2 s5_cycles.json: changes_delta=1 x N). Beyond noise, that
-   * is a latent LWW data-loss trap: once calendar rename ships, a restart
-   * would re-assert the DEFAULT title over a peer-renamed calendar. An
-   * existing row (local or synced) is left completely untouched — no
-   * change record, no device_clock advance, no updated_hlc churn.
-   */
-  ensureDefaultCalendar() {
-    const exists = this.db.prepare(
-      "SELECT 1 FROM calendars WHERE calendar_id = ?"
-    ).get(DEFAULT_CALENDAR_ID);
-    if (exists !== void 0) return;
-    const hlc = this.hlc.now();
-    createLocalChange(
-      this.db,
-      this.deviceId,
-      {
-        entity_id: DEFAULT_CALENDAR_ID,
-        entity_type: "calendar",
-        field_path: "title",
-        operation: "set",
-        payload: { value: "My Calendar" },
-        hlc_now: () => hlc
-      },
-      (db) => {
-        db.prepare(
-          `INSERT INTO calendars (calendar_id, title, color, created_hlc, updated_hlc)
-           VALUES (?, ?, NULL, ?, ?)
-           ON CONFLICT(calendar_id) DO NOTHING`
-        ).run(DEFAULT_CALENDAR_ID, "My Calendar", hlc, hlc);
-      }
-    );
-  }
-  listEvents(range) {
-    let rows;
-    if (range?.fromMs != null && range?.toMs != null) {
-      rows = this.db.prepare(
-        `SELECT event_id, title, description, all_day, start_date, end_date,
-                  start_wall, end_wall, utc_start_ms, utc_end_ms
-           FROM events WHERE utc_start_ms IS NOT NULL
-             AND utc_start_ms < ? AND utc_end_ms > ?
-           ORDER BY utc_start_ms`
-      ).all(range.toMs, range.fromMs);
-    } else {
-      rows = this.db.prepare(
-        `SELECT event_id, title, description, all_day, start_date, end_date,
-                  start_wall, end_wall, utc_start_ms, utc_end_ms
-           FROM events ORDER BY utc_start_ms`
-      ).all();
-    }
-    return rows.map(rowToEvent).sort(byStart);
-  }
-  createEvent(input) {
-    assertNoInjectedId(input, "create");
-    const rule = input.recurrenceRule !== void 0 ? validateRRule(input.recurrenceRule, "create_event") : void 0;
-    const event = {
-      id: `evt-${randomUUID2()}`,
-      title: input.title,
-      description: input.description,
-      startMs: input.startMs,
-      endMs: input.endMs,
-      allDay: input.allDay
-    };
-    validateEventValues(event, "create_event");
-    const hlc = this.hlc.now();
-    createLocalChange(
-      this.db,
-      this.deviceId,
-      {
-        entity_id: event.id,
-        entity_type: "event",
-        field_path: "event",
-        operation: "set",
-        payload: { value: eventFields(event) },
-        hlc_now: () => hlc
-      },
-      (db, _record) => {
-        insertEventRow(db, event, hlc);
-      }
-    );
-    if (rule !== void 0) {
-      const seriesId = `ser-${randomUUID2()}`;
-      const seriesHlc = this.hlc.now();
-      createLocalChange(
-        this.db,
-        this.deviceId,
-        {
-          entity_id: seriesId,
-          entity_type: "series",
-          field_path: "recurrence_rule",
-          operation: "set",
-          payload: { value: rule },
-          hlc_now: () => seriesHlc
-        },
-        (db) => {
-          db.prepare(
-            `INSERT INTO series (series_id, base_event_id, recurrence_rule, created_hlc, updated_hlc)
-             VALUES (?, ?, ?, ?, ?)`
-          ).run(seriesId, event.id, rule, seriesHlc, seriesHlc);
-        }
-      );
-    }
-    return event;
-  }
-  /**
-   * DC-23 §4 Case B: create an event with a CALLER-SUPPLIED canonical Tide
-   * id (import identity resolution). Same T1/validation machinery as
-   * createEvent — the ONLY difference is the id source. Guard: the id must
-   * match the canonical evt-<uuid> shape AND not already exist (a collision
-   * is a hard error, never a silent upsert). Non-canonical ids are refused
-   * here so the M-1 invariant (core-owned identity) keeps holding for the
-   * ordinary createEvent path — this method exists for the importer only
-   * and is NOT exposed on any surface op.
-   */
-  createEventWithId(id, input) {
-    if (!/^evt-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
-      throw new Error(`create_event_with_id: id is not canonical evt-<uuid> shape: ${id}`);
-    }
-    assertNoInjectedId(input, "create");
-    if (this.getEventRow(id) !== void 0) {
-      throw new Error(`create_event_with_id: event already exists: ${id}`);
-    }
-    const rule = input.recurrenceRule !== void 0 ? validateRRule(input.recurrenceRule, "create_event") : void 0;
-    const event = {
-      id,
-      title: input.title,
-      description: input.description,
-      startMs: input.startMs,
-      endMs: input.endMs,
-      allDay: input.allDay
-    };
-    validateEventValues(event, "create_event");
-    const hlc = this.hlc.now();
-    createLocalChange(
-      this.db,
-      this.deviceId,
-      {
-        entity_id: event.id,
-        entity_type: "event",
-        field_path: "event",
-        operation: "set",
-        payload: { value: eventFields(event) },
-        hlc_now: () => hlc
-      },
-      (db, _record) => {
-        insertEventRow(db, event, hlc);
-      }
-    );
-    if (rule !== void 0) {
-      const seriesId = `ser-${randomUUID2()}`;
-      const seriesHlc = this.hlc.now();
-      createLocalChange(
-        this.db,
-        this.deviceId,
-        {
-          entity_id: seriesId,
-          entity_type: "series",
-          field_path: "recurrence_rule",
-          operation: "set",
-          payload: { value: rule },
-          hlc_now: () => seriesHlc
-        },
-        (db) => {
-          db.prepare(
-            `INSERT INTO series (series_id, base_event_id, recurrence_rule, created_hlc, updated_hlc)
-             VALUES (?, ?, ?, ?, ?)`
-          ).run(seriesId, event.id, rule, seriesHlc, seriesHlc);
-        }
-      );
-    }
-    return event;
-  }
-  updateEvent(id, input) {
-    assertNoInjectedId(input, "update");
-    const existing = this.getEventRow(id);
-    if (!existing) throw new Error(`event not found: ${id}`);
-    const before = rowToEvent(existing);
-    const updated = {
-      id,
-      title: input.title,
-      description: input.description,
-      startMs: input.startMs,
-      endMs: input.endMs,
-      allDay: input.allDay
-    };
-    validateEventValues(updated, "update_event");
-    const groups = [
-      {
-        field_path: "title",
-        value: input.title,
-        changed: before.title !== input.title
-      },
-      {
-        field_path: "description",
-        value: input.description,
-        changed: before.description !== input.description
-      },
-      {
-        field_path: "schedule",
-        value: { startMs: input.startMs, endMs: input.endMs, allDay: input.allDay },
-        changed: before.startMs !== input.startMs || before.endMs !== input.endMs || before.allDay !== input.allDay
-      }
-    ];
-    for (const g of groups.filter((g2) => g2.changed)) {
-      const hlc = this.hlc.now();
-      createLocalChange(
-        this.db,
-        this.deviceId,
-        {
-          entity_id: id,
-          entity_type: "event",
-          field_path: g.field_path,
-          operation: "set",
-          payload: { value: g.value },
-          hlc_now: () => hlc
-        },
-        (db) => {
-          insertEventRow(db, updated, hlc, true);
-        }
-      );
-    }
-    return updated;
-  }
-  deleteEvent(id) {
-    const existing = this.getEventRow(id);
-    if (!existing) return;
-    const series = this.seriesForBaseEvent(id);
-    const hlc = this.hlc.now();
-    createLocalChange(
-      this.db,
-      this.deviceId,
-      {
-        entity_id: id,
-        entity_type: "event",
-        field_path: "*",
-        operation: "remove",
-        payload: {},
-        hlc_now: () => hlc
-      },
-      (db) => {
-        if (series) {
-          db.prepare("DELETE FROM occurrence_overrides WHERE series_id = ?").run(
-            series.series_id
-          );
-          db.prepare("DELETE FROM series WHERE series_id = ?").run(
-            series.series_id
-          );
-        }
-        db.prepare("DELETE FROM events WHERE event_id = ?").run(id);
-      }
-    );
-    if (series) {
-      const seriesHlc = this.hlc.now();
-      createLocalChange(
-        this.db,
-        this.deviceId,
-        {
-          entity_id: series.series_id,
-          entity_type: "series",
-          field_path: "*",
-          operation: "remove",
-          payload: {},
-          hlc_now: () => seriesHlc
-        }
-      );
-    }
-  }
-  getEventRow(id) {
-    return this.db.prepare(
-      `SELECT event_id, title, description, all_day, start_date, end_date,
-                start_wall, end_wall, utc_start_ms, utc_end_ms
-         FROM events WHERE event_id = ?`
-    ).get(id);
-  }
-  seriesForBaseEvent(baseEventId) {
-    return this.db.prepare(
-      `SELECT series_id, recurrence_rule FROM series WHERE base_event_id = ?`
-    ).get(baseEventId);
-  }
-  /**
-   * DC-12 §2.1 / §3: edit the series' recurrence rule. Its own conflict
-   * entity (series_id, "recurrence_rule"); stored VERBATIM (validated first).
-   * No-op (no change record) when the rule is byte-identical.
-   */
-  updateSeriesRule(seriesId, rule) {
-    if (typeof seriesId !== "string" || seriesId.length === 0) {
-      throw new Error("update_series_rule: series_id must be a non-empty string");
-    }
-    const validated = validateRRule(rule, "update_series_rule");
-    const row = this.db.prepare(
-      `SELECT series_id, recurrence_rule FROM series WHERE series_id = ?`
-    ).get(seriesId);
-    if (!row) throw new Error(`series not found: ${seriesId}`);
-    if (row.recurrence_rule === validated) {
-      return { seriesId, recurrenceRule: validated };
-    }
-    const hlc = this.hlc.now();
-    createLocalChange(
-      this.db,
-      this.deviceId,
-      {
-        entity_id: seriesId,
-        entity_type: "series",
-        field_path: "recurrence_rule",
-        operation: "set",
-        payload: { value: validated },
-        hlc_now: () => hlc
-      },
-      (db) => {
-        db.prepare(
-          `UPDATE series SET recurrence_rule = ?, updated_hlc = ? WHERE series_id = ?`
-        ).run(validated, hlc, seriesId);
-      }
-    );
-    return { seriesId, recurrenceRule: validated };
-  }
-  /**
-   * DC-12 §2.2/§2.3/§4.1: create or edit ONE occurrence override, keyed
-   * (series_id, recurrence_id). recurrence_id is the canonical wall-clock
-   * form of the ORIGINAL occurrence start (never rewritten — R2). Each
-   * changed field is its own DC-03 conflict entity
-   * (series_id, "overrides.<rid>.<field>") — exactly one change record per
-   * field per DC-01 §3.1. Unchanged fields produce nothing (TR-8 idempotence).
-   */
-  updateOccurrence(seriesId, recurrenceId, patch) {
-    if (typeof seriesId !== "string" || seriesId.length === 0) {
-      throw new Error("update_occurrence: series_id must be a non-empty string");
-    }
-    const rid = validateRecurrenceId(recurrenceId, "update_occurrence");
-    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
-      throw new Error("update_occurrence: patch must be an object");
-    }
-    const unknown = Object.keys(patch).filter(
-      (k) => !OVERRIDE_FIELDS.includes(k)
-    );
-    if (unknown.length > 0) {
-      throw new Error(
-        `update_occurrence: unknown patch field(s): ${unknown.join(", ")} \u2014 allowed: ${OVERRIDE_FIELDS.join(", ")}`
-      );
-    }
-    if (Object.keys(patch).length === 0) {
-      throw new Error("update_occurrence: patch must set at least one field");
-    }
-    for (const k of ["title", "start_wall", "end_wall", "tz_id"]) {
-      const v = patch[k];
-      if (v !== void 0 && typeof v !== "string") {
-        throw new Error(`update_occurrence: patch.${k} must be a string`);
-      }
-      if (typeof v === "string" && v.trim().length === 0) {
-        throw new Error(`update_occurrence: patch.${k} must be a non-empty string`);
-      }
-    }
-    if (patch.cancelled !== void 0 && typeof patch.cancelled !== "boolean") {
-      throw new Error("update_occurrence: patch.cancelled must be a boolean");
-    }
-    const series = this.db.prepare(
-      `SELECT series_id FROM series WHERE series_id = ?`
-    ).get(seriesId);
-    if (!series) throw new Error(`series not found: ${seriesId}`);
-    const existing = this.db.prepare(
-      `SELECT series_id, recurrence_id, cancelled, title, start_wall,
-                end_wall, tz_id, updated_hlc
-         FROM occurrence_overrides WHERE series_id = ? AND recurrence_id = ?`
-    ).get(seriesId, rid);
-    const wanted = {};
-    if (patch.cancelled !== void 0 && (existing?.cancelled ?? 0) !== (patch.cancelled ? 1 : 0)) {
-      wanted.cancelled = patch.cancelled;
-    }
-    for (const k of ["title", "start_wall", "end_wall", "tz_id"]) {
-      if (patch[k] !== void 0 && (existing?.[k] ?? null) !== patch[k]) {
-        wanted[k] = patch[k];
-      }
-    }
-    if (Object.keys(wanted).length === 0) {
-      return { seriesId, recurrenceId: rid, changed: [] };
-    }
-    const merged = {
-      series_id: seriesId,
-      recurrence_id: rid,
-      cancelled: wanted.cancelled !== void 0 ? wanted.cancelled ? 1 : 0 : existing?.cancelled ?? 0,
-      title: wanted.title ?? existing?.title ?? null,
-      start_wall: wanted.start_wall ?? existing?.start_wall ?? null,
-      end_wall: wanted.end_wall ?? existing?.end_wall ?? null,
-      tz_id: wanted.tz_id ?? existing?.tz_id ?? null
-    };
-    for (const field of OVERRIDE_FIELDS) {
-      if (!(field in wanted)) continue;
-      const fieldHlc = this.hlc.now();
-      const value = field === "cancelled" ? wanted.cancelled : wanted[field];
-      createLocalChange(
-        this.db,
-        this.deviceId,
-        {
-          entity_id: seriesId,
-          entity_type: "occurrence_override",
-          field_path: `overrides.${rid}.${field}`,
-          operation: "set",
-          payload: { value },
-          hlc_now: () => fieldHlc
-        },
-        (db) => {
-          db.prepare(
-            `INSERT INTO occurrence_overrides (series_id, recurrence_id, cancelled,
-                title, start_wall, end_wall, tz_id, updated_hlc)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(series_id, recurrence_id) DO UPDATE SET
-                cancelled = excluded.cancelled,
-                title = excluded.title,
-                start_wall = excluded.start_wall,
-                end_wall = excluded.end_wall,
-                tz_id = excluded.tz_id,
-                updated_hlc = excluded.updated_hlc`
-          ).run(
-            seriesId,
-            rid,
-            merged.cancelled,
-            merged.title,
-            merged.start_wall,
-            merged.end_wall,
-            merged.tz_id,
-            fieldHlc
-          );
-        }
-      );
-    }
-    return {
-      seriesId,
-      recurrenceId: rid,
-      changed: Object.keys(wanted)
-    };
-  }
-  /**
-   * READ-ONLY series listing for recurrence surfacing (DC-12 §2): every
-   * series row with its verbatim RRULE joined to its occurrence_overrides.
-   * No change records, no mutation — pure SELECT over stored state.
-   */
-  listSeries() {
-    const rows = this.db.prepare(`SELECT series_id, base_event_id, recurrence_rule FROM series`).all();
-    const overrides = this.db.prepare(
-      `SELECT series_id, recurrence_id, cancelled, title, start_wall,
-                end_wall, tz_id
-         FROM occurrence_overrides ORDER BY recurrence_id`
-    ).all();
-    const bySeries = /* @__PURE__ */ new Map();
-    for (const o of overrides) {
-      let list = bySeries.get(o.series_id);
-      if (!list) bySeries.set(o.series_id, list = []);
-      list.push({
-        recurrenceId: o.recurrence_id,
-        cancelled: o.cancelled !== 0,
-        title: o.title,
-        startWall: o.start_wall,
-        endWall: o.end_wall,
-        tzId: o.tz_id
-      });
-    }
-    return rows.map((r) => ({
-      seriesId: r.series_id,
-      baseEventId: r.base_event_id,
-      recurrenceRule: r.recurrence_rule,
-      overrides: bySeries.get(r.series_id) ?? []
-    }));
-  }
-};
-function eventFields(e) {
-  return {
-    title: e.title,
-    description: e.description,
-    startMs: e.startMs,
-    endMs: e.endMs,
-    allDay: e.allDay
-  };
-}
-function insertEventRow(db, e, hlc, upsert = false) {
-  const derived = derivedScheduleColumns(e);
-  if (upsert) {
-    const exists = !!db.prepare("SELECT 1 FROM events WHERE event_id = ?").get(e.id);
-    if (!exists) {
-      insertNewEventRow(db, e, hlc, derived);
-    } else {
-      updateEventRowDerived(db, e.id, e, hlc, derived);
-    }
-    return;
-  }
-  insertNewEventRow(db, e, hlc, derived);
-}
-function derivedScheduleColumns(e) {
-  return {
-    all_day: e.allDay ? 1 : 0,
-    start_date: e.allDay ? localDateStr(e.startMs) : null,
-    end_date: e.allDay ? inclusiveEndDateFromExclusiveMs(Math.max(e.endMs, e.startMs)) : null,
-    start_wall: e.allDay ? null : localWallStr(e.startMs),
-    end_wall: e.allDay ? null : localWallStr(e.endMs),
-    tz_id: e.allDay ? null : timezoneId(),
-    utc_start_ms: e.startMs,
-    utc_end_ms: Math.max(e.endMs, e.startMs)
-  };
-}
-function insertNewEventRow(db, e, hlc, d) {
-  db.prepare(`INSERT INTO events (event_id, calendar_id, title, description,
-      all_day, start_date, end_date, start_wall, end_wall, tz_id,
-      utc_start_ms, utc_end_ms, created_hlc, updated_hlc)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-    e.id,
-    DEFAULT_CALENDAR_ID,
-    e.title,
-    e.description,
-    d.all_day,
-    d.start_date,
-    d.end_date,
-    d.start_wall,
-    d.end_wall,
-    d.tz_id,
-    d.utc_start_ms,
-    d.utc_end_ms,
-    hlc,
-    hlc
-  );
-}
-function updateEventRowDerived(db, eventId, e, hlc, d) {
-  const info = db.prepare(`
-    UPDATE events SET title = ?, description = ?, all_day = ?, start_date = ?,
-      end_date = ?, start_wall = ?, end_wall = ?, tz_id = ?,
-      utc_start_ms = ?, utc_end_ms = ?, updated_hlc = ?
-    WHERE event_id = ?`).run(
-    e.title,
-    e.description,
-    d.all_day,
-    d.start_date,
-    d.end_date,
-    d.start_wall,
-    d.end_wall,
-    d.tz_id,
-    d.utc_start_ms,
-    d.utc_end_ms,
-    hlc,
-    eventId
-  );
-  return info.changes > 0;
-}
-function rowToEvent(r) {
-  let startMs = r.utc_start_ms;
-  let endMs = r.utc_end_ms;
-  if (startMs == null || endMs == null) {
-    if (r.all_day && r.start_date && r.end_date) {
-      startMs = (/* @__PURE__ */ new Date(`${r.start_date}T00:00:00`)).getTime();
-      endMs = (/* @__PURE__ */ new Date(`${r.end_date}T23:59:59.999`)).getTime();
-    } else if (r.start_wall && r.end_wall && r.start_date) {
-      startMs = (/* @__PURE__ */ new Date(`${r.start_date}T${r.start_wall}`)).getTime();
-      endMs = (/* @__PURE__ */ new Date(`${r.start_date}T${r.end_wall}`)).getTime();
-    } else {
-      startMs = 0;
-      endMs = 0;
-    }
-  }
-  return {
-    id: r.event_id,
-    title: r.title,
-    description: r.description,
-    startMs,
-    endMs,
-    allDay: r.all_day !== 0
-  };
-}
-function byStart(a, b) {
-  return a.startMs - b.startMs || a.title.localeCompare(b.title);
-}
-
-// src/network/sync_runtime.ts
-import { createServer, connect } from "node:net";
-import { existsSync as existsSync2, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "node:fs";
-import { join } from "node:path";
-import { networkInterfaces } from "node:os";
-
 // src/security/identity.ts
 import { randomBytes as randomBytes2 } from "node:crypto";
 
-// node_modules/@noble/ed25519/index.js
+// ../../../node_modules/@noble/ed25519/index.js
 var ed25519_CURVE = Object.freeze({
   p: 0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffedn,
   n: 0x1000000000000000000000000000000014def9dea2f79cd65812631a5cf5d3edn,
@@ -2762,7 +914,7 @@ var wNAF = (n) => {
   return { p, f };
 };
 
-// node_modules/@noble/hashes/_u64.js
+// ../../../node_modules/@noble/hashes/_u64.js
 var U32_MASK64 = /* @__PURE__ */ (() => BigInt(2 ** 32 - 1))();
 var _32n = /* @__PURE__ */ BigInt(32);
 function fromBig(n, le = false) {
@@ -2805,7 +957,7 @@ var add4H = (low, Ah, Bh, Ch, Dh) => Ah + Bh + Ch + Dh + (low / 2 ** 32 | 0) | 0
 var add5L = (Al, Bl, Cl, Dl, El) => (Al >>> 0) + (Bl >>> 0) + (Cl >>> 0) + (Dl >>> 0) + (El >>> 0);
 var add5H = (low, Ah, Bh, Ch, Dh, Eh) => Ah + Bh + Ch + Dh + Eh + (low / 2 ** 32 | 0) | 0;
 
-// node_modules/@noble/hashes/utils.js
+// ../../../node_modules/@noble/hashes/utils.js
 function isBytes2(a) {
   return a instanceof Uint8Array || ArrayBuffer.isView(a) && a.constructor.name === "Uint8Array" && "BYTES_PER_ELEMENT" in a && a.BYTES_PER_ELEMENT === 1;
 }
@@ -2954,7 +1106,7 @@ var oidNist = (suffix) => ({
   oid: Uint8Array.from([6, 9, 96, 134, 72, 1, 101, 3, 4, 2, suffix])
 });
 
-// node_modules/@noble/hashes/_md.js
+// ../../../node_modules/@noble/hashes/_md.js
 function Chi(a, b, c) {
   return a & b ^ ~a & c;
 }
@@ -3085,7 +1237,7 @@ var SHA512_IV = /* @__PURE__ */ Uint32Array.from([
   327033209
 ]);
 
-// node_modules/@noble/hashes/sha2.js
+// ../../../node_modules/@noble/hashes/sha2.js
 var SHA256_K = /* @__PURE__ */ Uint32Array.from([
   1116352408,
   1899447441,
@@ -3520,10 +1672,2595 @@ async function verifyAsync2(message, signature, publicKey) {
   }
 }
 
+// src/security/revocation.ts
+var RevocationError = class extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+    this.name = "RevocationError";
+  }
+  code;
+};
+var encoder = new TextEncoder();
+function isNonEmptyString(v) {
+  return typeof v === "string" && v.length > 0;
+}
+function validateRevocationRecord(r) {
+  if (typeof r !== "object" || r === null) {
+    throw new RevocationError("missing_field", "record is not an object");
+  }
+  const rec = r;
+  if (rec.v !== 1) {
+    throw new RevocationError("bad_version", `unsupported version ${String(rec.v)}`);
+  }
+  for (const key of [
+    "revoked_device_id",
+    "revoked_by_device_id"
+  ]) {
+    if (!isNonEmptyString(rec[key])) {
+      throw new RevocationError("missing_field", `invalid ${key}`);
+    }
+  }
+  if (typeof rec.revoked_at_hlc !== "number" || !Number.isInteger(rec.revoked_at_hlc) || rec.revoked_at_hlc < 0) {
+    throw new RevocationError("bad_hlc", "revoked_at_hlc must be a non-negative integer");
+  }
+  if (rec.reason !== void 0 && !isNonEmptyString(rec.reason)) {
+    throw new RevocationError("missing_field", "invalid reason");
+  }
+  if (rec.revoked_after_seq !== void 0 && (typeof rec.revoked_after_seq !== "number" || !Number.isInteger(rec.revoked_after_seq) || rec.revoked_after_seq < 0)) {
+    throw new RevocationError("bad_hlc", "revoked_after_seq must be a non-negative integer");
+  }
+  const out = {
+    v: 1,
+    revoked_device_id: rec.revoked_device_id,
+    revoked_by_device_id: rec.revoked_by_device_id,
+    revoked_at_hlc: rec.revoked_at_hlc
+  };
+  if (rec.reason !== void 0) out.reason = rec.reason;
+  if (rec.revoked_after_seq !== void 0) {
+    out.revoked_after_seq = rec.revoked_after_seq;
+  }
+  return out;
+}
+function canonicalRevocationBytes(record) {
+  const obj = record;
+  const keys = Object.keys(obj).filter((k) => obj[k] !== void 0).sort();
+  const parts = keys.map(
+    (k) => `${JSON.stringify(k)}:${JSON.stringify(obj[k])}`
+  );
+  return encoder.encode(`{${parts.join(",")}}`);
+}
+async function createRevocation(fields, privateKey) {
+  const record = validateRevocationRecord({ ...fields, v: 1 });
+  const signature = await signAsync2(canonicalRevocationBytes(record), privateKey);
+  return { record, signature };
+}
+async function verifyRevocation(signed, trustStoreLookup) {
+  try {
+    let record;
+    try {
+      record = validateRevocationRecord(signed.record);
+    } catch {
+      return { valid: false, reason: "malformed" };
+    }
+    if (!(signed.signature instanceof Uint8Array) || signed.signature.length === 0) {
+      return { valid: false, reason: "malformed" };
+    }
+    if (record.revoked_by_device_id === record.revoked_device_id) {
+      return { valid: false, reason: "self_signed" };
+    }
+    const entry = trustStoreLookup(record.revoked_by_device_id);
+    if (entry === void 0) {
+      return { valid: false, reason: "unknown_revoker" };
+    }
+    if (entry.status !== "trusted") {
+      return { valid: false, reason: "revoker_not_trusted" };
+    }
+    const ok = await verifyAsync2(
+      canonicalRevocationBytes(record),
+      signed.signature,
+      entry.publicKey
+    );
+    return ok ? { valid: true } : { valid: false, reason: "bad_signature" };
+  } catch {
+    return { valid: false, reason: "malformed" };
+  }
+}
+function recordTriple(record) {
+  return {
+    revoked_device_id: record.revoked_device_id,
+    revoked_at_hlc: record.revoked_at_hlc,
+    revoked_by_device_id: record.revoked_by_device_id
+  };
+}
+function shortDeviceId(deviceId) {
+  return deviceId.length > 16 ? deviceId.slice(0, 16) + "\u2026" : deviceId;
+}
+function keysEqual(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= (a[i] ?? 0) ^ (b[i] ?? 0);
+  return diff === 0;
+}
+function canSynchronize(trustStore, peerId, claimedPublicKey) {
+  const entry = trustStore.get(peerId);
+  if (entry === void 0) return "DENY_UNPAIRED";
+  if (claimedPublicKey !== void 0) {
+    const claimedId = deriveDeviceId(claimedPublicKey);
+    if (claimedId !== peerId || !keysEqual(entry.publicKey, claimedPublicKey)) {
+      return "DENY_KEY_MISMATCH";
+    }
+  }
+  if (entry.status === "revoked") return "DENY_REVOKED";
+  return "ALLOW";
+}
+
+// src/security/revocation_store.ts
+var defaultLog = (line) => console.error(`[tide] ${line}`);
+function bytesEqual(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+function dbTrustLookup(db, self2) {
+  const stmt = db.prepare(
+    "SELECT public_key, status FROM peers WHERE device_id = ?"
+  );
+  return (deviceId) => {
+    if (self2 !== void 0 && deviceId === self2.deviceId) {
+      return { publicKey: self2.publicKey, status: "trusted" };
+    }
+    const row = stmt.get(deviceId);
+    if (row === void 0) return void 0;
+    return { publicKey: new Uint8Array(row.public_key), status: row.status };
+  };
+}
+function rowToSigned(row) {
+  try {
+    const record = validateRevocationRecord(
+      JSON.parse(Buffer.from(row.record_bytes).toString("utf8"))
+    );
+    return { record, signature: new Uint8Array(row.signature) };
+  } catch {
+    return void 0;
+  }
+}
+function revokedCutoffs(db) {
+  const rows = db.prepare(
+    `SELECT revoked_device_id AS d, MAX(COALESCE(revoked_after_seq, 0)) AS c
+       FROM revocation_records WHERE verification_state = 'valid'
+       GROUP BY revoked_device_id`
+  ).all();
+  return new Map(rows.map((r) => [r.d, r.c]));
+}
+function isKnownRevoked(db, deviceId) {
+  const row = db.prepare(
+    `SELECT 1 FROM peers WHERE device_id = @id AND status = 'revoked'
+       UNION ALL
+       SELECT 1 FROM revocation_records
+        WHERE revoked_device_id = @id AND verification_state = 'valid'
+       LIMIT 1`
+  ).get({ id: deviceId });
+  return row !== void 0;
+}
+function insertRecordStmt(db) {
+  return db.prepare(
+    `INSERT INTO revocation_records
+       (revoked_device_id, revoked_by_device_id, revoked_at_hlc, reason,
+        record_bytes, signature, verification_state, received_at_hlc,
+        revoked_after_seq)
+     VALUES (?, ?, ?, NULL, ?, ?, 'valid', ?, ?)`
+  );
+}
+function deletePendingAboveCutoff(db, producer) {
+  const cutoff = revokedCutoffs(db).get(producer) ?? 0;
+  db.prepare(
+    "DELETE FROM pending_changes WHERE device_id = ? AND local_seq > ?"
+  ).run(producer, cutoff);
+}
+function clearRevokedPeerState(db, deviceId) {
+  db.prepare(
+    `UPDATE peers SET last_endpoint_host = NULL, last_endpoint_port = NULL,
+            last_endpoint_seen = NULL
+     WHERE device_id = ?`
+  ).run(deviceId);
+  db.prepare("DELETE FROM hard_blocks WHERE producer_device_id = ?").run(deviceId);
+  db.prepare("DELETE FROM peer_invalid_tally WHERE producer_device_id = ?").run(deviceId);
+}
+function makeDbRevocationChannel(db, opts) {
+  const log = opts.log ?? defaultLog;
+  const lookup = dbTrustLookup(db, {
+    deviceId: opts.selfDeviceId,
+    publicKey: opts.selfPublicKey
+  });
+  const findStored = db.prepare(
+    `SELECT signature FROM revocation_records
+     WHERE revoked_device_id = ? AND revoked_by_device_id = ? AND revoked_at_hlc = ?
+       AND verification_state = 'valid'`
+  );
+  return {
+    queueFor(peer) {
+      const rows = db.prepare(
+        `SELECT r.record_bytes, r.signature FROM revocation_records r
+           WHERE r.verification_state = 'valid'
+             AND r.revoked_device_id != ?
+             AND NOT EXISTS (
+               SELECT 1 FROM revocation_acks a
+               WHERE a.peer_device_id = ?
+                 AND a.revoked_device_id = r.revoked_device_id
+                 AND a.revoked_by_device_id = r.revoked_by_device_id
+                 AND a.revoked_at_hlc = r.revoked_at_hlc)
+           ORDER BY r.received_at_hlc`
+      ).all(peer, peer);
+      const out = [];
+      for (const r of rows) {
+        const s = rowToSigned(r);
+        if (s !== void 0) out.push(s);
+      }
+      return out;
+    },
+    async acceptInbound(signed, fromPeer) {
+      const from = shortDeviceId(fromPeer);
+      let record;
+      try {
+        record = validateRevocationRecord(signed.record);
+      } catch {
+        log(`revocation: rejected record (malformed) from ${from}`);
+        return false;
+      }
+      const existing = findStored.get(
+        record.revoked_device_id,
+        record.revoked_by_device_id,
+        record.revoked_at_hlc
+      );
+      if (existing !== void 0) {
+        if (bytesEqual(new Uint8Array(existing.signature), signed.signature)) {
+          return false;
+        }
+        log(`revocation: rejected record (conflicting_triple) from ${from}`);
+        return false;
+      }
+      const verdict = await verifyRevocation({ record, signature: signed.signature }, lookup);
+      if (!verdict.valid) {
+        log(`revocation: rejected record (${verdict.reason}) from ${from}`);
+        return false;
+      }
+      let flipped = false;
+      const stored = db.transaction(() => {
+        const revoker = lookup(record.revoked_by_device_id);
+        if (revoker === void 0 || revoker.status !== "trusted") return "untrusted";
+        const dup = findStored.get(
+          record.revoked_device_id,
+          record.revoked_by_device_id,
+          record.revoked_at_hlc
+        );
+        if (dup !== void 0) return "duplicate";
+        insertRecordStmt(db).run(
+          record.revoked_device_id,
+          record.revoked_by_device_id,
+          record.revoked_at_hlc,
+          Buffer.from(canonicalRevocationBytes(record)),
+          Buffer.from(signed.signature),
+          opts.hlcNow(),
+          record.revoked_after_seq ?? null
+        );
+        const res = db.prepare(
+          "UPDATE peers SET status = 'revoked' WHERE device_id = ? AND status = 'trusted'"
+        ).run(record.revoked_device_id);
+        flipped = res.changes > 0;
+        clearRevokedPeerState(db, record.revoked_device_id);
+        deletePendingAboveCutoff(db, record.revoked_device_id);
+        return "stored";
+      })();
+      if (stored === "duplicate") return false;
+      if (stored === "untrusted") {
+        log(`revocation: rejected record (revoker_not_trusted) from ${from}`);
+        return false;
+      }
+      log(
+        `revocation: accepted record for ${shortDeviceId(record.revoked_device_id)} from ${from}`
+      );
+      if (flipped) {
+        try {
+          opts.onPeerRevoked?.(record.revoked_device_id);
+        } catch {
+        }
+      }
+      return true;
+    },
+    acceptedTriples() {
+      return db.prepare(
+        `SELECT revoked_device_id, revoked_at_hlc, revoked_by_device_id
+             FROM revocation_records WHERE verification_state = 'valid'`
+      ).all().map((t) => ({
+        revoked_device_id: t.revoked_device_id,
+        revoked_at_hlc: t.revoked_at_hlc,
+        revoked_by_device_id: t.revoked_by_device_id
+      }));
+    },
+    recordAck(fromPeer, triples) {
+      if (!Array.isArray(triples)) return;
+      const ins = db.prepare(
+        `INSERT OR IGNORE INTO revocation_acks
+           (peer_device_id, revoked_device_id, revoked_by_device_id, revoked_at_hlc, acked_at)
+         SELECT ?, revoked_device_id, revoked_by_device_id, revoked_at_hlc, ?
+         FROM revocation_records
+         WHERE revoked_device_id = ? AND revoked_by_device_id = ? AND revoked_at_hlc = ?
+           AND verification_state = 'valid'`
+      );
+      const now = Date.now();
+      db.transaction(() => {
+        for (const t of triples) {
+          if (t === null || typeof t !== "object" || typeof t.revoked_device_id !== "string" || typeof t.revoked_by_device_id !== "string" || typeof t.revoked_at_hlc !== "number") {
+            continue;
+          }
+          ins.run(fromPeer, now, t.revoked_device_id, t.revoked_by_device_id, t.revoked_at_hlc);
+        }
+      })();
+    },
+    revokedCutoffs() {
+      return revokedCutoffs(db);
+    }
+  };
+}
+var UnpairError = class extends Error {
+  constructor(code, message) {
+    super(`${code}: ${message}`);
+    this.code = code;
+    this.name = "UnpairError";
+  }
+  code;
+};
+async function unpairLocal(db, opts) {
+  const statusOf = db.prepare("SELECT status FROM peers WHERE device_id = ?");
+  const cutoffOf = db.prepare(
+    "SELECT applied_through FROM applied_upto WHERE producer_device_id = ?"
+  );
+  const readCutoff = () => cutoffOf.get(opts.deviceId)?.applied_through ?? 0;
+  if (opts.deviceId === opts.selfDeviceId) {
+    throw new UnpairError("ERR_NOT_PAIRED", "this device cannot unpair itself");
+  }
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const pre = statusOf.get(opts.deviceId);
+    if (pre === void 0) throw new UnpairError("ERR_NOT_PAIRED", "device is not paired");
+    if (pre.status === "revoked") return { already: true };
+    const hlc = opts.hlcNow();
+    const cutoff = readCutoff();
+    const signed = await createRevocation(
+      {
+        revoked_device_id: opts.deviceId,
+        revoked_by_device_id: opts.selfDeviceId,
+        revoked_at_hlc: hlc,
+        revoked_after_seq: cutoff
+      },
+      opts.privateKey
+    );
+    const result = db.transaction(() => {
+      const row = statusOf.get(opts.deviceId);
+      if (row === void 0) throw new UnpairError("ERR_NOT_PAIRED", "device is not paired");
+      if (row.status === "revoked") return { already: true };
+      if (readCutoff() !== cutoff) return "retry";
+      db.prepare("UPDATE peers SET status = 'revoked' WHERE device_id = ?").run(opts.deviceId);
+      insertRecordStmt(db).run(
+        signed.record.revoked_device_id,
+        signed.record.revoked_by_device_id,
+        signed.record.revoked_at_hlc,
+        Buffer.from(canonicalRevocationBytes(signed.record)),
+        Buffer.from(signed.signature),
+        hlc,
+        cutoff
+      );
+      clearRevokedPeerState(db, opts.deviceId);
+      db.prepare(
+        "DELETE FROM pending_changes WHERE device_id = ? AND local_seq > ?"
+      ).run(opts.deviceId, cutoff);
+      opts.beforeCommit?.();
+      return { already: false, triple: recordTriple(signed.record), cutoff };
+    })();
+    if (result !== "retry") return result;
+  }
+  throw new UnpairError("ERR_BUSY", "the device is still syncing; try again");
+}
+function listRemovedDevices(db, selfDeviceId) {
+  const revoked = db.prepare(
+    "SELECT device_id, display_name, announced_name FROM peers WHERE status = 'revoked' ORDER BY device_id"
+  ).all();
+  const trusted = db.prepare(
+    "SELECT device_id, display_name, announced_name FROM peers WHERE status = 'trusted' ORDER BY paired_at, device_id"
+  ).all();
+  const removedLabels = deviceNameViews(revoked, selfDeviceId);
+  const toldLabels = new Map(
+    deviceNameViews(trusted, selfDeviceId).map((v) => [v.device_id, v.label])
+  );
+  const removedAt = db.prepare(
+    `SELECT COALESCE(
+        (SELECT MIN(revoked_at_hlc) FROM revocation_records
+          WHERE revoked_device_id = @d AND revoked_by_device_id = @self
+            AND verification_state = 'valid'),
+        (SELECT MIN(received_at_hlc) FROM revocation_records
+          WHERE revoked_device_id = @d AND verification_state = 'valid')) AS t`
+  );
+  const acked = db.prepare(
+    `SELECT 1 FROM revocation_acks a JOIN revocation_records r
+       ON r.revoked_device_id = a.revoked_device_id
+      AND r.revoked_by_device_id = a.revoked_by_device_id
+      AND r.revoked_at_hlc = a.revoked_at_hlc
+     WHERE a.peer_device_id = ? AND r.revoked_device_id = ? LIMIT 1`
+  );
+  return revoked.map((p, i) => ({
+    device_id: p.device_id,
+    label: removedLabels[i].label,
+    removed_at: removedAt.get({ d: p.device_id, self: selfDeviceId })?.t ?? 0,
+    told: trusted.filter((t) => t.device_id !== p.device_id).map((t) => ({
+      device_id: t.device_id,
+      label: toldLabels.get(t.device_id),
+      done: acked.get(t.device_id, p.device_id) !== void 0
+    }))
+  }));
+}
+
+// src/sync/change_record.ts
+function changeId(deviceId, localSeq) {
+  return `${deviceId}:${localSeq}`;
+}
+var ChangeRecordError = class extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+    this.name = "ChangeRecordError";
+  }
+  code;
+};
+var OPERATIONS = [
+  "set",
+  "remove",
+  "member_add",
+  "member_update",
+  "member_remove"
+];
+var ENTITY_TYPES = [
+  "calendar",
+  "event",
+  "series",
+  "occurrence_override",
+  "reminder",
+  "tombstone-marker"
+];
+function validateChangeRecord(r) {
+  if (typeof r !== "object" || r === null) {
+    throw new ChangeRecordError("missing_field", "record is not an object");
+  }
+  const rec = r;
+  for (const key of [
+    "change_id",
+    "device_id",
+    "entity_id",
+    "field_path"
+  ]) {
+    if (typeof rec[key] !== "string" || rec[key].length === 0) {
+      throw new ChangeRecordError("missing_field", `invalid ${key}`);
+    }
+  }
+  if (typeof rec.local_seq !== "number" || !Number.isInteger(rec.local_seq) || rec.local_seq <= 0) {
+    throw new ChangeRecordError("bad_seq", "local_seq must be a positive integer");
+  }
+  if (typeof rec.operation !== "string" || !OPERATIONS.includes(rec.operation)) {
+    throw new ChangeRecordError("bad_operation", `invalid operation ${String(rec.operation)}`);
+  }
+  if (typeof rec.entity_type !== "string" || !ENTITY_TYPES.includes(rec.entity_type)) {
+    throw new ChangeRecordError("bad_entity_type", `invalid entity_type ${String(rec.entity_type)}`);
+  }
+  const cc = rec.causality_clock;
+  if (typeof cc !== "object" || cc === null || Array.isArray(cc)) {
+    throw new ChangeRecordError("missing_field", "causality_clock must be an object");
+  }
+  for (const [k, v] of Object.entries(cc)) {
+    if (typeof k !== "string" || typeof v !== "number" || !Number.isInteger(v) || v < 0) {
+      throw new ChangeRecordError("missing_field", `causality_clock[${k}] invalid`);
+    }
+  }
+  if (typeof rec.hlc_timestamp !== "number" || !Number.isFinite(rec.hlc_timestamp)) {
+    throw new ChangeRecordError("missing_field", "hlc_timestamp must be a finite number");
+  }
+  {
+    const stack = [rec.payload];
+    while (stack.length > 0) {
+      const cur = stack.pop();
+      if (typeof cur === "number" && !Number.isFinite(cur)) {
+        throw new ChangeRecordError(
+          "missing_field",
+          "payload contains a non-finite number (NaN/Infinity from 1e999-style JSON overflow)"
+        );
+      }
+      if (Array.isArray(cur)) {
+        stack.push(...cur);
+      } else if (typeof cur === "object" && cur !== null) {
+        stack.push(...Object.values(cur));
+      }
+    }
+  }
+  const expected = changeId(rec.device_id, rec.local_seq);
+  if (rec.change_id !== expected) {
+    throw new ChangeRecordError("id_mismatch", `change_id ${rec.change_id} != ${expected}`);
+  }
+  return Object.freeze({ ...rec });
+}
+
+// src/sync/vector_clock.ts
+function get(clock, deviceId) {
+  return clock[deviceId] ?? 0;
+}
+function dominates(a, b) {
+  for (const d of Object.keys(b)) {
+    if (get(a, d) < b[d]) return false;
+  }
+  return true;
+}
+function equalClocks(a, b) {
+  const keys = /* @__PURE__ */ new Set([...Object.keys(a), ...Object.keys(b)]);
+  for (const d of keys) {
+    if (get(a, d) !== get(b, d)) return false;
+  }
+  return true;
+}
+function sameOrDescendant(xClock, xProducer, yClock, yProducer) {
+  return dominates(xClock, yClock) && get(xClock, yProducer.device_id) >= yProducer.local_seq;
+}
+function concurrent(a, b) {
+  return !dominates(a, b) && !dominates(b, a);
+}
+function merge(a, b) {
+  const out = { ...a };
+  for (const [d, s] of Object.entries(b)) {
+    out[d] = Math.max(get(out, d), s);
+  }
+  return out;
+}
+function advanceByMerge(target, incoming) {
+  for (const [d, s] of Object.entries(incoming)) {
+    target[d] = Math.max(get(target, d), s);
+  }
+}
+
+// src/sync/conflict_detection.ts
+function deepEqual(a, b) {
+  if (a === b) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) {
+    return false;
+  }
+  const ka = Object.keys(a);
+  const kb = Object.keys(b);
+  if (ka.length !== kb.length) return false;
+  return ka.every(
+    (k) => deepEqual(a[k], b[k])
+  );
+}
+function effectiveValue(c) {
+  switch (c.operation) {
+    case "set":
+      return { deleted: false, value: c.payload.value };
+    case "remove":
+      return { deleted: true, value: void 0 };
+    case "member_add":
+    case "member_update":
+      return { deleted: false, value: c.payload };
+    case "member_remove":
+      return { deleted: true, value: void 0 };
+  }
+}
+function valuesDiffer(a, b) {
+  const va = effectiveValue(a);
+  const vb = effectiveValue(b);
+  if (va.deleted !== vb.deleted) return true;
+  return !deepEqual(va.value, vb.value);
+}
+function detect(incoming, localCurrent, locals) {
+  const v = effectiveValue(incoming);
+  if (v.deleted && localCurrent.deleted || !v.deleted && !localCurrent.deleted && deepEqual(v.value, localCurrent.value)) {
+    return { kind: "noop" };
+  }
+  const dominated = locals.some(
+    (l) => sameOrDescendant(
+      l.causality_clock,
+      { device_id: l.device_id, local_seq: l.local_seq },
+      incoming.causality_clock,
+      { device_id: incoming.device_id, local_seq: incoming.local_seq }
+    ) && !equalClocks(l.causality_clock, incoming.causality_clock)
+  );
+  if (dominated) {
+    return { kind: "stale" };
+  }
+  const conflicting = locals.filter((l) => concurrent(incoming.causality_clock, l.causality_clock));
+  if (conflicting.length === 0) {
+    return { kind: "apply" };
+  }
+  const differing = conflicting.filter((l) => valuesDiffer(incoming, l));
+  if (differing.length === 0) {
+    return { kind: "apply" };
+  }
+  return { kind: "conflict", conflicting: differing };
+}
+
+// src/sync/knowledge_state.ts
+function emptyKnowledge() {
+  return { appliedUpto: {}, pending: /* @__PURE__ */ new Map() };
+}
+function appliedThrough(k, deviceId) {
+  return k.appliedUpto[deviceId] ?? 0;
+}
+function skippedOf(k, deviceId) {
+  return k.skipped?.get(deviceId) ?? /* @__PURE__ */ new Set();
+}
+function nextExpected(k, deviceId) {
+  let s = appliedThrough(k, deviceId) + 1;
+  const skipped = skippedOf(k, deviceId);
+  while (skipped.has(s)) s += 1;
+  return s;
+}
+function classifyArrival(k, deviceId, localSeq) {
+  const through = appliedThrough(k, deviceId);
+  if (skippedOf(k, deviceId).has(localSeq)) return "duplicate";
+  if (localSeq <= through) return "duplicate";
+  if (localSeq === nextExpected(k, deviceId)) return "apply";
+  return k.pending.get(deviceId)?.has(localSeq) === true ? "duplicate" : "buffer";
+}
+function advanceApplied(k, deviceId, localSeq) {
+  const drained = [];
+  if (localSeq !== nextExpected(k, deviceId)) return drained;
+  let next = localSeq;
+  const skipped = skippedOf(k, deviceId);
+  drained.push({ device_id: deviceId, local_seq: localSeq });
+  const pend = k.pending.get(deviceId);
+  while (pend?.has(next + 1) && !skipped.has(next + 1)) {
+    next += 1;
+    pend.delete(next);
+    drained.push({ device_id: deviceId, local_seq: next });
+  }
+  if (pend && pend.size === 0) k.pending.delete(deviceId);
+  k.appliedUpto[deviceId] = next;
+  if (k.skipped?.has(deviceId)) {
+    const set = k.skipped.get(deviceId);
+    for (const s of [...set]) {
+      if (s <= next) set.delete(s);
+    }
+    if (set.size === 0) k.skipped.delete(deviceId);
+  }
+  return drained;
+}
+function neededRanges(k, advertised, selfDeviceId) {
+  const need = [];
+  for (const [d, advSeq] of Object.entries(advertised)) {
+    if (selfDeviceId !== void 0 && d === selfDeviceId) continue;
+    const have = appliedThrough(k, d);
+    if (advSeq <= have) continue;
+    const havePending = k.pending.get(d) ?? /* @__PURE__ */ new Set();
+    const haveSkipped = skippedOf(k, d);
+    let lo = have + 1;
+    for (let s = have + 1; s <= advSeq + 1; s++) {
+      if (s === advSeq + 1 || havePending.has(s) || haveSkipped.has(s)) {
+        if (lo < s) need.push({ device_id: d, lo, hi: s - 1 });
+        lo = s + 1;
+      }
+    }
+  }
+  return need;
+}
+
+// src/persistence/database.ts
+function openDatabase(opts) {
+  const db = new Database(opts.path);
+  db.pragma("journal_mode = WAL");
+  db.pragma("foreign_keys = ON");
+  initializeSchema(db);
+  return db;
+}
+function initializeSchema(db) {
+  let row;
+  try {
+    row = db.prepare("SELECT version FROM schema_version").get();
+  } catch {
+    row = void 0;
+  }
+  if (row === void 0) {
+    const tx = db.transaction(() => {
+      db.exec(DDL);
+      db.prepare(
+        "INSERT INTO schema_version (version, applied_at_hlc) VALUES (?, ?)"
+      ).run(SCHEMA_VERSION, Date.now());
+    });
+    tx();
+  } else if (row.version > SCHEMA_VERSION) {
+    throw new Error(
+      `database schema_version ${row.version} newer than supported ${SCHEMA_VERSION}`
+    );
+  } else if (row.version === SCHEMA_VERSION) {
+    db.transaction(() => ensureReminderColumnsV7(db))();
+    db.transaction(() => ensureRevocationSchemaV9(db))();
+    db.transaction(() => ensurePeerNamesSchemaV10(db))();
+    db.transaction(() => ensureHeldChangesSchema(db))();
+  } else if (row.version < SCHEMA_VERSION) {
+    const tx = db.transaction(() => {
+      if (row.version < 2) {
+        db.exec(`CREATE TABLE IF NOT EXISTS skipped_seqs (
+          producer_device_id TEXT NOT NULL,
+          local_seq          INTEGER NOT NULL CHECK (local_seq > 0),
+          PRIMARY KEY (producer_device_id, local_seq))`);
+      }
+      if (row.version < 3) {
+        const cols = db.prepare("PRAGMA table_info(quarantine)").all().map((c) => c.name);
+        if (!cols.includes("resolved_at_hlc")) {
+          db.exec("ALTER TABLE quarantine ADD COLUMN resolved_at_hlc INTEGER");
+        }
+        if (!cols.includes("resolved_reason")) {
+          db.exec("ALTER TABLE quarantine ADD COLUMN resolved_reason TEXT");
+        }
+      }
+      if (row.version < 4) {
+        db.exec(`CREATE TABLE IF NOT EXISTS hard_blocks (
+          producer_device_id TEXT PRIMARY KEY,
+          first_triggered_at INTEGER NOT NULL,
+          last_triggered_at  INTEGER NOT NULL,
+          trigger_count      INTEGER NOT NULL CHECK (trigger_count > 0))`);
+        db.exec(`CREATE TABLE IF NOT EXISTS peer_invalid_tally (
+          producer_device_id TEXT PRIMARY KEY,
+          total_invalid      INTEGER NOT NULL CHECK (total_invalid >= 0),
+          last_invalid_at    INTEGER NOT NULL)`);
+      }
+      if (row.version < 5) {
+        db.exec(`CREATE TABLE IF NOT EXISTS quarantine_prune_stats (
+          id            INTEGER PRIMARY KEY CHECK (id = 1),
+          total_pruned  INTEGER NOT NULL DEFAULT 0)`);
+      }
+      if (row.version < 6) {
+        db.exec(`CREATE TABLE IF NOT EXISTS entity_versions (
+          entity_id          TEXT PRIMARY KEY,
+          entity_type        TEXT NOT NULL,
+          version            TEXT NOT NULL,
+          latest_producer    TEXT NOT NULL,
+          latest_seq         INTEGER NOT NULL,
+          latest_hlc         INTEGER NOT NULL,
+          updated_hlc        INTEGER NOT NULL)`);
+        backfillEntityVersions(db);
+      }
+      if (row.version < 7) {
+        const cols = db.prepare("PRAGMA table_info(peers)").all().map((c) => c.name);
+        if (!cols.includes("last_endpoint_host")) {
+          db.exec("ALTER TABLE peers ADD COLUMN last_endpoint_host TEXT");
+        }
+        if (!cols.includes("last_endpoint_port")) {
+          db.exec("ALTER TABLE peers ADD COLUMN last_endpoint_port INTEGER");
+        }
+        if (!cols.includes("last_endpoint_seen")) {
+          db.exec("ALTER TABLE peers ADD COLUMN last_endpoint_seen INTEGER");
+        }
+        ensureReminderColumnsV7(db);
+      }
+      if (row.version < 8) {
+        const hasEvents = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").get() !== void 0;
+        if (hasEvents) {
+          db.exec(`
+            UPDATE events SET
+              end_date = strftime('%Y-%m-%d', (utc_end_ms - 1) / 1000, 'unixepoch', 'localtime')
+            WHERE all_day = 1
+              AND utc_end_ms IS NOT NULL
+              AND utc_end_ms > 0
+              AND end_date IS NOT NULL
+              AND end_date != strftime('%Y-%m-%d', (utc_end_ms - 1) / 1000, 'unixepoch', 'localtime')
+              -- Safety: never let the re-derivation move end_date BEFORE
+              -- start_date (legacy shell-store rows carry utc_* = 0 and their
+              -- truth lives in the date columns themselves).
+              AND strftime('%Y-%m-%d', (utc_end_ms - 1) / 1000, 'unixepoch', 'localtime') >= start_date;
+          `);
+        }
+      }
+      ensureReminderColumnsV7(db);
+      if (row.version <= 9) {
+        ensureRevocationSchemaV9(db);
+      }
+      if (row.version < 10) {
+        ensurePeerNamesSchemaV10(db);
+      }
+      if (row.version < 11) {
+        ensureHeldChangesSchema(db);
+      }
+      db.prepare("UPDATE schema_version SET version = ?").run(SCHEMA_VERSION);
+    });
+    tx();
+  }
+}
+function ensureHeldChangesSchema(db) {
+  db.exec(`CREATE TABLE IF NOT EXISTS held_changes (
+    producer_device_id TEXT NOT NULL,
+    local_seq          INTEGER NOT NULL CHECK (local_seq > 0),
+    sessions_held      INTEGER NOT NULL CHECK (sessions_held > 0),
+    first_held_at      INTEGER NOT NULL,
+    PRIMARY KEY (producer_device_id, local_seq))`);
+}
+function bumpHeldSessions(db, origin, seq) {
+  db.prepare(
+    `INSERT INTO held_changes (producer_device_id, local_seq, sessions_held, first_held_at)
+     VALUES (?, ?, 1, ?)
+     ON CONFLICT(producer_device_id, local_seq) DO UPDATE SET sessions_held = sessions_held + 1`
+  ).run(origin, seq, Date.now());
+  return db.prepare("SELECT sessions_held AS n FROM held_changes WHERE producer_device_id = ? AND local_seq = ?").get(origin, seq).n;
+}
+function clearHeld(db, origin, seq) {
+  db.prepare("DELETE FROM held_changes WHERE producer_device_id = ? AND local_seq = ?").run(origin, seq);
+}
+function gcHeldChanges(db) {
+  db.prepare(
+    `DELETE FROM held_changes WHERE EXISTS (
+       SELECT 1 FROM applied_upto a
+       WHERE a.producer_device_id = held_changes.producer_device_id
+         AND a.applied_through >= held_changes.local_seq)`
+  ).run();
+}
+function ensureReminderColumnsV7(db) {
+  const colsOf = (table) => db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table) !== void 0 ? db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name) : [];
+  const remCols = colsOf("reminders");
+  if (remCols.length > 0 && !remCols.includes("enabled")) {
+    db.exec("ALTER TABLE reminders ADD COLUMN enabled INTEGER CHECK (enabled IN (0, 1))");
+  }
+  const evCols = colsOf("events");
+  if (evCols.length > 0 && !evCols.includes("all_day_reminder_time")) {
+    db.exec("ALTER TABLE events ADD COLUMN all_day_reminder_time TEXT");
+  }
+}
+function ensureRevocationSchemaV9(db) {
+  db.exec(`CREATE TABLE IF NOT EXISTS revocation_records (
+    revoked_device_id    TEXT NOT NULL,
+    revoked_by_device_id TEXT NOT NULL,
+    revoked_at_hlc       INTEGER NOT NULL,
+    reason               TEXT,
+    record_bytes         BLOB NOT NULL,
+    signature            BLOB NOT NULL,
+    verification_state   TEXT NOT NULL CHECK
+                         (verification_state IN ('pending','valid','invalid')),
+    received_at_hlc      INTEGER NOT NULL,
+    revoked_after_seq    INTEGER,
+    PRIMARY KEY (revoked_device_id, revoked_by_device_id, revoked_at_hlc))`);
+  const cols = db.prepare("PRAGMA table_info(revocation_records)").all().map((c) => c.name);
+  if (!cols.includes("revoked_after_seq")) {
+    db.exec("ALTER TABLE revocation_records ADD COLUMN revoked_after_seq INTEGER");
+  }
+  db.exec(`CREATE TABLE IF NOT EXISTS revocation_acks (
+    peer_device_id       TEXT NOT NULL,
+    revoked_device_id    TEXT NOT NULL,
+    revoked_by_device_id TEXT NOT NULL,
+    revoked_at_hlc       INTEGER NOT NULL,
+    acked_at             INTEGER NOT NULL,
+    PRIMARY KEY (peer_device_id, revoked_device_id, revoked_by_device_id,
+                 revoked_at_hlc))`);
+}
+function ensurePeerNamesSchemaV10(db) {
+  const hasPeers = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='peers'").get() !== void 0;
+  if (!hasPeers) return false;
+  const cols = db.prepare("PRAGMA table_info(peers)").all().map(
+    (c) => c.name
+  );
+  if (cols.includes("announced_name")) return false;
+  db.exec("ALTER TABLE peers ADD COLUMN announced_name TEXT");
+  const rows = db.prepare("SELECT device_id, display_name FROM peers").all();
+  const upd = db.prepare("UPDATE peers SET announced_name = ?, display_name = '' WHERE device_id = ?");
+  for (const r of rows) {
+    upd.run(announcedNameFromPeer(r.display_name, r.device_id).name, r.device_id);
+  }
+  return true;
+}
+function backfillEntityVersions(db) {
+  const rows = db.prepare(
+    "SELECT entity_id, entity_type, causality_clock, device_id, local_seq, hlc_timestamp FROM changes ORDER BY hlc_timestamp ASC, local_seq ASC"
+  ).all();
+  for (const r of rows) {
+    recordEntityVersion(db, {
+      change_id: changeId(r.device_id, r.local_seq),
+      device_id: r.device_id,
+      local_seq: r.local_seq,
+      entity_id: r.entity_id,
+      entity_type: r.entity_type,
+      field_path: "",
+      operation: "set",
+      payload: {},
+      hlc_timestamp: r.hlc_timestamp,
+      causality_clock: JSON.parse(r.causality_clock),
+      schema_version: 1
+    });
+  }
+}
+function recordEntityVersion(db, record) {
+  const get2 = db.prepare(
+    "SELECT version, latest_hlc, latest_seq, latest_producer FROM entity_versions WHERE entity_id = ?"
+  );
+  const existing = get2.get(record.entity_id);
+  let version = existing ? JSON.parse(existing.version) : {};
+  version = mergeClocks(version, record.causality_clock);
+  let producer = existing?.latest_producer ?? record.device_id;
+  let seq = existing?.latest_seq ?? record.local_seq;
+  let hlc = existing?.latest_hlc ?? record.hlc_timestamp;
+  if (record.hlc_timestamp > hlc || record.hlc_timestamp === hlc && record.local_seq > seq) {
+    producer = record.device_id;
+    seq = record.local_seq;
+    hlc = record.hlc_timestamp;
+  }
+  db.prepare(`
+    INSERT INTO entity_versions (entity_id, entity_type, version, latest_producer, latest_seq, latest_hlc, updated_hlc)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(entity_id) DO UPDATE SET
+      entity_type = excluded.entity_type,
+      version = excluded.version,
+      latest_producer = excluded.latest_producer,
+      latest_seq = excluded.latest_seq,
+      latest_hlc = excluded.latest_hlc,
+      updated_hlc = excluded.updated_hlc`).run(
+    record.entity_id,
+    record.entity_type,
+    JSON.stringify(version),
+    producer,
+    seq,
+    hlc,
+    record.hlc_timestamp
+  );
+}
+function mergeClocks(a, b) {
+  const out = { ...a };
+  for (const [d, s] of Object.entries(b)) {
+    out[d] = Math.max(out[d] ?? 0, s);
+  }
+  return out;
+}
+function createLocalChange(db, selfDeviceId, input, mutate) {
+  const insertChange = db.prepare(`
+    INSERT INTO changes (change_id, device_id, local_seq, entity_id,
+      entity_type, field_path, operation, payload, hlc_timestamp,
+      causality_clock, schema_version)
+    VALUES (@change_id, @device_id, @local_seq, @entity_id, @entity_type,
+      @field_path, @operation, @payload, @hlc_timestamp, @causality_clock,
+      @schema_version)`);
+  const upsertClock = db.prepare(`
+    INSERT INTO device_clock (peer_device_id, max_seq) VALUES (@d, @s)
+    ON CONFLICT(peer_device_id) DO UPDATE SET
+      max_seq = MAX(max_seq, excluded.max_seq)`);
+  let record;
+  const tx = db.transaction(() => {
+    const storedClock = getDeviceClock(db);
+    const nextSeq = Math.max(storedClock[selfDeviceId] ?? 0, getNextLocalSeq(db, selfDeviceId)) + 1;
+    const clock = { ...storedClock, [selfDeviceId]: nextSeq };
+    record = {
+      change_id: changeId(selfDeviceId, nextSeq),
+      device_id: selfDeviceId,
+      local_seq: nextSeq,
+      entity_id: input.entity_id,
+      entity_type: input.entity_type,
+      field_path: input.field_path,
+      operation: input.operation,
+      payload: input.payload,
+      hlc_timestamp: input.hlc_now(),
+      causality_clock: clock,
+      schema_version: 1
+    };
+    mutate?.(db, record);
+    insertChange.run(serializeChange(record));
+    recordEntityVersion(db, record);
+    upsertClock.run({ d: selfDeviceId, s: nextSeq });
+  });
+  tx();
+  return record;
+}
+function serializeChange(r) {
+  return {
+    ...r,
+    payload: JSON.stringify(r.payload),
+    causality_clock: JSON.stringify(r.causality_clock)
+  };
+}
+function getNextLocalSeq(db, deviceId) {
+  const row = db.prepare(
+    "SELECT MAX(local_seq) AS m FROM changes WHERE device_id = ?"
+  ).get(deviceId);
+  return row?.m ?? 0;
+}
+function getDeviceClock(db) {
+  const rows = db.prepare(
+    "SELECT peer_device_id, max_seq FROM device_clock"
+  ).all();
+  const clock = {};
+  for (const r of rows) clock[r.peer_device_id] = r.max_seq;
+  return clock;
+}
+function eventRowLocalValue(db, entityId, fieldPath) {
+  const row = db.prepare(
+    "SELECT title, description, all_day, utc_start_ms, utc_end_ms FROM events WHERE event_id = ?"
+  ).get(entityId);
+  if (!row) return { deleted: true, value: void 0 };
+  switch (fieldPath) {
+    case "title":
+      return { deleted: false, value: row.title };
+    case "description":
+      return { deleted: false, value: row.description };
+    case "schedule":
+      return {
+        deleted: false,
+        value: {
+          startMs: row.utc_start_ms,
+          endMs: row.utc_end_ms,
+          allDay: row.all_day === 1
+        }
+      };
+    default:
+      return {
+        deleted: false,
+        value: {
+          title: row.title,
+          description: row.description,
+          startMs: row.utc_start_ms,
+          endMs: row.utc_end_ms,
+          allDay: row.all_day === 1
+        }
+      };
+  }
+}
+function loadConflictLocals(db, entityId, fieldPath) {
+  const rows = (fieldPath === "*" ? db.prepare(
+    `SELECT change_id, device_id, local_seq, entity_id, entity_type,
+                    field_path, operation, payload, hlc_timestamp,
+                    causality_clock, schema_version
+             FROM changes WHERE entity_id = ?`
+  ).all(entityId) : db.prepare(
+    `SELECT change_id, device_id, local_seq, entity_id, entity_type,
+                    field_path, operation, payload, hlc_timestamp,
+                    causality_clock, schema_version
+             FROM changes
+             WHERE entity_id = ? AND (field_path = ? OR field_path = '*')`
+  ).all(entityId, fieldPath)).map(deserializeChangeRow);
+  return rows;
+}
+function deserializeChangeRow(r) {
+  return {
+    change_id: r.change_id,
+    device_id: r.device_id,
+    local_seq: r.local_seq,
+    entity_id: r.entity_id,
+    entity_type: r.entity_type,
+    field_path: r.field_path,
+    operation: r.operation,
+    payload: JSON.parse(r.payload),
+    hlc_timestamp: r.hlc_timestamp,
+    causality_clock: JSON.parse(r.causality_clock),
+    schema_version: r.schema_version
+  };
+}
+function detectAndRecordConflict(db, record) {
+  if (record.entity_type !== "event") return "apply";
+  const localCurrent = eventRowLocalValue(db, record.entity_id, record.field_path);
+  const locals = loadConflictLocals(db, record.entity_id, record.field_path);
+  const outcome = detect(record, localCurrent, locals);
+  if (outcome.kind === "conflict") {
+    recordConflictRow(db, record, outcome.conflicting);
+    return "conflict";
+  }
+  return outcome.kind;
+}
+function recordConflictRow(db, incoming, conflicting) {
+  const insertParticipant = db.prepare(`
+    INSERT OR IGNORE INTO conflict_participants
+      (conflict_id, change_id, device_id, local_seq, causality_clock, payload)
+    VALUES (?, ?, ?, ?, ?, ?)`);
+  db.transaction(() => {
+    const existing = db.prepare(
+      `SELECT conflict_id FROM conflicts
+         WHERE entity_id = ? AND field_path = ? AND status = 'unresolved'`
+    ).get(incoming.entity_id, incoming.field_path);
+    let conflictId;
+    if (existing) {
+      conflictId = existing.conflict_id;
+    } else {
+      conflictId = randomUUID();
+      db.prepare(
+        `INSERT INTO conflicts (conflict_id, entity_id, field_path, status,
+                                detected_at_hlc)
+         VALUES (?, ?, ?, 'unresolved', ?)`
+      ).run(conflictId, incoming.entity_id, incoming.field_path, Date.now());
+    }
+    for (const p of [...conflicting, incoming]) {
+      insertParticipant.run(
+        conflictId,
+        p.change_id,
+        p.device_id,
+        p.local_seq,
+        JSON.stringify(p.causality_clock),
+        JSON.stringify(p.payload)
+      );
+    }
+  })();
+}
+var NotApplicableYet = class extends Error {
+};
+var QuarantineRequest = class extends Error {
+  constructor(reason) {
+    super(reason);
+    this.reason = reason;
+  }
+  reason;
+};
+var DUPLICATE_DIFFERENT_CONTENT_REASON = "duplicate_seq_different_content";
+var DEPENDS_ON_QUARANTINED_REASON = "depends_on_quarantined_change";
+var WAITING_ON_CHANGE_REASON = "waiting_on_change";
+function prerequisiteState(db, record, opts = {}) {
+  const cutoffs = revokedCutoffs(db);
+  const appliedRow = db.prepare(
+    "SELECT applied_through AS v FROM applied_upto WHERE producer_device_id = ?"
+  );
+  const heldRow = db.prepare("SELECT MAX(local_seq) AS v FROM changes WHERE device_id = ?");
+  const skippedRow = db.prepare(
+    "SELECT 1 FROM skipped_seqs WHERE producer_device_id = ? AND local_seq = ?"
+  );
+  let missingOrigin = null;
+  const need = /* @__PURE__ */ new Map();
+  for (const [origin, seq] of Object.entries(record.causality_clock)) {
+    let n = origin === record.device_id ? record.local_seq - 1 : seq;
+    const cutoff = cutoffs.get(origin);
+    if (cutoff !== void 0) n = Math.min(n, cutoff);
+    if (n > 0) need.set(origin, n);
+  }
+  if (!need.has(record.device_id) && record.local_seq > 1) {
+    need.set(record.device_id, record.local_seq - 1);
+  }
+  for (const [origin, n] of need) {
+    let covered = Math.max(
+      appliedRow.get(origin)?.v ?? 0,
+      heldRow.get(origin).v ?? 0
+    );
+    while (covered < n && skippedRow.get(origin, covered + 1) !== void 0) covered++;
+    if (covered < n && missingOrigin === null) missingOrigin = origin;
+  }
+  let rejected = false;
+  if (missingOrigin === null) {
+    for (const [origin, n] of need) {
+      if (opts.rejectionIgnoresOwnOrigin && origin === record.device_id) continue;
+      if (hasUnappliedRejectedSeq(db, origin, n)) {
+        rejected = true;
+        break;
+      }
+    }
+  }
+  return { missingOrigin, rejectedPrerequisite: rejected };
+}
+function hasUnappliedRejectedSeq(db, origin, upTo) {
+  if (db.prepare("SELECT 1 FROM skipped_seqs WHERE producer_device_id = ? AND local_seq <= ? LIMIT 1").get(origin, upTo) !== void 0) {
+    return true;
+  }
+  const rows = db.prepare(
+    `SELECT raw_record FROM quarantine
+       WHERE quarantine_reason NOT IN (?, ?)
+         AND CASE WHEN json_valid(raw_record)
+                  THEN json_extract(raw_record, '$.device_id') END = ?`
+  ).all(DUPLICATE_DIFFERENT_CONTENT_REASON, WAITING_ON_CHANGE_REASON, origin);
+  for (const r of rows) {
+    try {
+      const raw = JSON.parse(r.raw_record);
+      if (typeof raw.local_seq !== "number" || raw.local_seq > upTo) continue;
+      const cid = typeof raw.change_id === "string" ? raw.change_id : `${origin}:${raw.local_seq}`;
+      if (db.prepare("SELECT 1 FROM changes WHERE change_id = ?").get(cid) === void 0) return true;
+    } catch {
+    }
+  }
+  return false;
+}
+function missingPrerequisiteOrigin(db, record) {
+  return prerequisiteState(db, record).missingOrigin;
+}
+function resolveWaitingNotice(db, origin, seq, why) {
+  db.prepare(
+    `UPDATE quarantine SET resolved_at_hlc = ?, resolved_reason = ?
+     WHERE quarantine_reason = ? AND resolved_at_hlc IS NULL
+       AND json_extract(raw_record, '$.device_id') = ?
+       AND json_extract(raw_record, '$.local_seq') = ?`
+  ).run(Date.now(), why, WAITING_ON_CHANGE_REASON, origin, seq);
+}
+function recordWaitingNotice(db, record, missingOrigin) {
+  const exists = db.prepare(
+    `SELECT 1 FROM quarantine
+       WHERE quarantine_reason = ? AND resolved_at_hlc IS NULL
+         AND json_extract(raw_record, '$.device_id') = ?
+         AND json_extract(raw_record, '$.local_seq') = ? LIMIT 1`
+  ).get(WAITING_ON_CHANGE_REASON, record.device_id, record.local_seq);
+  if (exists !== void 0) return;
+  db.prepare(
+    `INSERT INTO quarantine (quarantine_reason, received_at_hlc, sender_device_id, raw_record)
+     VALUES (?, ?, ?, ?)`
+  ).run(WAITING_ON_CHANGE_REASON, Date.now(), missingOrigin, JSON.stringify(record));
+}
+function canonicalJson(v) {
+  if (v === null || typeof v !== "object") return JSON.stringify(v);
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(",")}]`;
+  const o = v;
+  return `{${Object.keys(o).sort().map((k) => `${JSON.stringify(k)}:${canonicalJson(o[k])}`).join(",")}}`;
+}
+function contentKey(r) {
+  return canonicalJson([
+    r.change_id,
+    r.entity_id,
+    r.entity_type,
+    r.field_path,
+    r.operation,
+    r.payload,
+    r.hlc_timestamp,
+    r.causality_clock,
+    r.schema_version
+  ]);
+}
+function recordIfDifferentDuplicate(db, incoming) {
+  let stored;
+  const row = db.prepare(
+    `SELECT change_id, device_id, local_seq, entity_id, entity_type,
+              field_path, operation, payload, hlc_timestamp, causality_clock,
+              schema_version
+       FROM changes WHERE device_id = ? AND local_seq = ?`
+  ).get(incoming.device_id, incoming.local_seq);
+  if (row !== void 0) {
+    stored = {
+      ...row,
+      payload: JSON.parse(row.payload),
+      causality_clock: JSON.parse(row.causality_clock)
+    };
+  } else {
+    const pend = db.prepare(
+      "SELECT record_payload FROM pending_changes WHERE device_id = ? AND local_seq = ?"
+    ).get(incoming.device_id, incoming.local_seq);
+    if (pend !== void 0) stored = JSON.parse(pend.record_payload);
+  }
+  if (stored === void 0) return false;
+  if (contentKey(stored) === contentKey(incoming)) return false;
+  quarantineRecord(db, {
+    reason: DUPLICATE_DIFFERENT_CONTENT_REASON,
+    senderDeviceId: incoming.device_id,
+    rawRecord: incoming
+  });
+  return true;
+}
+function appliedFrontierOf(db, origin) {
+  return db.prepare("SELECT applied_through AS v FROM applied_upto WHERE producer_device_id = ?").get(origin)?.v ?? 0;
+}
+function reapplyQuarantinedInPlace(db, record, mutate) {
+  class Blocked extends Error {
+  }
+  try {
+    return db.transaction(() => {
+      if (db.prepare("SELECT 1 FROM changes WHERE device_id = ? AND local_seq = ?").get(
+        record.device_id,
+        record.local_seq
+      ) !== void 0) {
+        return "duplicate";
+      }
+      const det = detectAndRecordConflict(db, record);
+      if (det === "apply") {
+        const res = mutate?.(db, record);
+        if (res === "target_absent") {
+          const pre = prerequisiteState(db, record);
+          if (pre.missingOrigin !== null || pre.rejectedPrerequisite) throw new Blocked();
+        }
+      }
+      db.prepare(`
+        INSERT INTO changes (change_id, device_id, local_seq, entity_id,
+          entity_type, field_path, operation, payload, hlc_timestamp,
+          causality_clock, schema_version)
+        VALUES (@change_id, @device_id, @local_seq, @entity_id, @entity_type,
+          @field_path, @operation, @payload, @hlc_timestamp, @causality_clock,
+          @schema_version)`).run(serializeChange(record));
+      recordEntityVersion(db, record);
+      db.prepare("DELETE FROM skipped_seqs WHERE producer_device_id = ? AND local_seq = ?").run(
+        record.device_id,
+        record.local_seq
+      );
+      for (const [d, sq] of Object.entries(record.causality_clock)) {
+        db.prepare(
+          `INSERT INTO device_clock (peer_device_id, max_seq) VALUES (?, ?)
+           ON CONFLICT(peer_device_id) DO UPDATE SET max_seq = MAX(max_seq, excluded.max_seq)`
+        ).run(d, sq);
+      }
+      return "applied";
+    })();
+  } catch (e) {
+    if (e instanceof Blocked) return "blocked";
+    throw e;
+  }
+}
+function applyRemoteChangeDetailed(db, incoming, knowledge, mutate) {
+  const insertPending = db.prepare(`
+    INSERT INTO pending_changes (device_id, local_seq, record_payload, received_at_hlc)
+    VALUES (?, ?, ?, ?)`);
+  const insertChange = db.prepare(`
+    INSERT INTO changes (change_id, device_id, local_seq, entity_id,
+      entity_type, field_path, operation, payload, hlc_timestamp,
+      causality_clock, schema_version)
+    VALUES (@change_id, @device_id, @local_seq, @entity_id, @entity_type,
+      @field_path, @operation, @payload, @hlc_timestamp, @causality_clock,
+      @schema_version)`);
+  const setAppliedUpto = db.prepare(`
+    INSERT INTO applied_upto (producer_device_id, applied_through) VALUES (?, ?)
+    ON CONFLICT(producer_device_id) DO UPDATE SET
+      applied_through = MAX(applied_through, excluded.applied_through)`);
+  const deletePending = db.prepare(
+    "DELETE FROM pending_changes WHERE device_id = ? AND local_seq = ?"
+  );
+  const loadAllPending = db.prepare(
+    "SELECT device_id, local_seq, record_payload FROM pending_changes WHERE device_id = ?"
+  );
+  const upsertClockStmt = db.prepare(`
+    INSERT INTO device_clock (peer_device_id, max_seq) VALUES (?, ?)
+    ON CONFLICT(peer_device_id) DO UPDATE SET
+      max_seq = MAX(max_seq, excluded.max_seq)`);
+  function mergeClocks2(clock) {
+    for (const [d, s] of Object.entries(clock)) {
+      upsertClockStmt.run(d, s);
+    }
+  }
+  let dbKnowledge;
+  try {
+    const outcome = db.transaction(() => {
+      dbKnowledge = loadKnowledgeFromDb(db);
+      const cls = classifyArrival(
+        dbKnowledge,
+        incoming.device_id,
+        incoming.local_seq
+      );
+      if (cls === "duplicate") {
+        mergeClocks2(incoming.causality_clock);
+        return recordIfDifferentDuplicate(db, incoming) ? "duplicate_different_content" : "duplicate";
+      }
+      if (cls === "buffer") {
+        insertPending.run(
+          incoming.device_id,
+          incoming.local_seq,
+          JSON.stringify(incoming),
+          Date.now()
+        );
+        mergeClocks2(incoming.causality_clock);
+        return "buffered";
+      }
+      const drained = advanceApplied(
+        dbKnowledge,
+        incoming.device_id,
+        incoming.local_seq
+      );
+      let lastApplied = null;
+      let quarantinedIncoming = false;
+      let targetGone = false;
+      let appliedAny = false;
+      for (const step of drained) {
+        let record;
+        if (step.device_id === incoming.device_id && step.local_seq === incoming.local_seq) {
+          record = incoming;
+        } else {
+          const rows = loadAllPending.all(step.device_id);
+          const match = rows.find((r) => r.local_seq === step.local_seq);
+          if (!match) {
+            throw new Error(
+              `pending payload missing for ${step.device_id}:${step.local_seq}`
+            );
+          }
+          record = JSON.parse(match.record_payload);
+        }
+        try {
+          db.transaction(() => {
+            const det = detectAndRecordConflict(db, record);
+            if (det === "apply") {
+              const res = mutate?.(db, record);
+              if (res === "target_absent") {
+                const pre = prerequisiteState(db, record);
+                if (pre.missingOrigin !== null) throw new NotApplicableYet();
+                if (pre.rejectedPrerequisite) {
+                  throw new QuarantineRequest(DEPENDS_ON_QUARANTINED_REASON);
+                }
+                if (step === drained[0]) targetGone = true;
+              }
+            }
+            insertChange.run(serializeChange(record));
+            recordEntityVersion(db, record);
+            deletePending.run(step.device_id, step.local_seq);
+            resolveWaitingNotice(db, record.device_id, record.local_seq, "applied");
+            clearHeld(db, record.device_id, record.local_seq);
+          })();
+        } catch (e) {
+          if (e instanceof QuarantineRequest) {
+            resolveWaitingNotice(db, record.device_id, record.local_seq, "quarantined");
+            quarantineRecord(db, {
+              reason: e.reason,
+              senderDeviceId: record.device_id,
+              rawRecord: record
+            });
+            markSeqSkipped(db, record.device_id, record.local_seq);
+            deletePending.run(step.device_id, step.local_seq);
+            if (step === drained[0]) quarantinedIncoming = true;
+            lastApplied = step.local_seq;
+            continue;
+          }
+          if (!(e instanceof NotApplicableYet)) throw e;
+          deletePending.run(step.device_id, step.local_seq);
+          break;
+        }
+        lastApplied = step.local_seq;
+        appliedAny = true;
+      }
+      if (lastApplied === null) {
+        dbKnowledge = loadKnowledgeFromDb(db);
+        return "not_applicable";
+      }
+      if (lastApplied !== drained[drained.length - 1].local_seq) {
+        dbKnowledge = loadKnowledgeFromDb(db);
+      }
+      setAppliedUpto.run(incoming.device_id, lastApplied);
+      db.prepare(
+        "DELETE FROM skipped_seqs WHERE producer_device_id = ? AND local_seq <= ?"
+      ).run(incoming.device_id, lastApplied);
+      if (!appliedAny) return "quarantined";
+      mergeClocks2(incoming.causality_clock);
+      if (quarantinedIncoming) return "quarantined";
+      return targetGone ? "target_gone" : "applied";
+    })();
+    knowledge.appliedUpto = dbKnowledge.appliedUpto;
+    knowledge.pending = dbKnowledge.pending;
+    knowledge.skipped = dbKnowledge.skipped;
+    return outcome;
+  } catch (err2) {
+    if (isUniqueViolation(err2)) {
+      const different = db.transaction(() => {
+        mergeClocks2(incoming.causality_clock);
+        return recordIfDifferentDuplicate(db, incoming);
+      })();
+      const fresh = loadKnowledgeFromDb(db);
+      knowledge.appliedUpto = fresh.appliedUpto;
+      knowledge.pending = fresh.pending;
+      knowledge.skipped = fresh.skipped;
+      return different ? "duplicate_different_content" : "duplicate";
+    }
+    throw err2;
+  }
+}
+function loadKnowledgeFromDb(db) {
+  const k = emptyKnowledge();
+  k.skipped = /* @__PURE__ */ new Map();
+  for (const r of db.prepare(
+    "SELECT producer_device_id, applied_through FROM applied_upto"
+  ).all()) {
+    k.appliedUpto[r.producer_device_id] = r.applied_through;
+  }
+  for (const r of db.prepare(
+    "SELECT device_id, local_seq FROM pending_changes"
+  ).all()) {
+    let set = k.pending.get(r.device_id);
+    if (!set) {
+      set = /* @__PURE__ */ new Set();
+      k.pending.set(r.device_id, set);
+    }
+    set.add(r.local_seq);
+  }
+  for (const r of db.prepare(
+    "SELECT producer_device_id, local_seq FROM skipped_seqs"
+  ).all()) {
+    let set = k.skipped.get(r.producer_device_id);
+    if (!set) {
+      set = /* @__PURE__ */ new Set();
+      k.skipped.set(r.producer_device_id, set);
+    }
+    set.add(r.local_seq);
+  }
+  return k;
+}
+function isUniqueViolation(err2) {
+  const msg = err2 instanceof Error ? err2.message : String(err2);
+  return msg.includes("UNIQUE constraint failed");
+}
+function quarantineRecord(db, opts) {
+  const raw = opts.rawRecord;
+  if (raw !== null && typeof raw === "object" && !Array.isArray(raw)) {
+    const deviceId = raw.device_id;
+    const seq = raw.local_seq;
+    if (typeof deviceId === "string" && deviceId.length > 0 && typeof seq === "number" && Number.isInteger(seq) && seq > 0) {
+      const sameKindOnly = opts.reason === DUPLICATE_DIFFERENT_CONTENT_REASON;
+      const existing = db.prepare(
+        `SELECT 1 FROM quarantine
+           WHERE json_extract(raw_record, '$.device_id') = ?
+             AND json_extract(raw_record, '$.local_seq') = ?
+             AND quarantine_reason != ?
+             AND (? = 0 OR quarantine_reason = ?)
+           LIMIT 1`
+      ).get(deviceId, seq, WAITING_ON_CHANGE_REASON, sameKindOnly ? 1 : 0, DUPLICATE_DIFFERENT_CONTENT_REASON);
+      if (existing !== void 0) return;
+    }
+  }
+  db.prepare(`
+    INSERT INTO quarantine
+      (quarantine_reason, received_at_hlc, sender_device_id, raw_record)
+    VALUES (?, ?, ?, ?)`).run(
+    opts.reason,
+    Date.now(),
+    opts.senderDeviceId,
+    JSON.stringify(opts.rawRecord)
+  );
+}
+function countQuarantined(db, reason) {
+  if (reason === void 0) {
+    const row2 = db.prepare("SELECT COUNT(*) AS c FROM quarantine").get();
+    return row2?.c ?? 0;
+  }
+  const row = db.prepare(
+    "SELECT COUNT(*) AS c FROM quarantine WHERE quarantine_reason = ?"
+  ).get(reason);
+  return row?.c ?? 0;
+}
+function markSeqSkipped(db, producerDeviceId, localSeq) {
+  db.prepare(
+    "INSERT OR IGNORE INTO skipped_seqs (producer_device_id, local_seq) VALUES (?, ?)"
+  ).run(producerDeviceId, localSeq);
+  clearHeld(db, producerDeviceId, localSeq);
+}
+function isSeqSkipped(db, producerDeviceId, localSeq) {
+  return !!db.prepare(
+    "SELECT 1 FROM skipped_seqs WHERE producer_device_id = ? AND local_seq = ?"
+  ).get(producerDeviceId, localSeq);
+}
+function listQuarantine(db, opts) {
+  return db.prepare(
+    `SELECT quarantine_id, quarantine_reason, received_at_hlc,
+              sender_device_id, raw_record,
+              resolved_at_hlc, resolved_reason
+       FROM quarantine ORDER BY quarantine_id DESC LIMIT ?`
+  ).all(opts?.limit ?? 200);
+}
+function markQuarantineResolved(db, quarantineId, reason) {
+  const info = db.prepare(
+    `UPDATE quarantine
+       SET resolved_at_hlc = ?, resolved_reason = ?
+       WHERE quarantine_id = ? AND resolved_at_hlc IS NULL`
+  ).run(Date.now(), reason, quarantineId);
+  return info.changes > 0;
+}
+function reconcileQuarantineResolutions(db) {
+  const rows = db.prepare(
+    // A duplicate-with-different-content warning is about a record whose
+    // change_id IS in `changes` (the stored copy); it must not auto-resolve.
+    "SELECT quarantine_id, raw_record FROM quarantine WHERE resolved_at_hlc IS NULL AND quarantine_reason != ?"
+  ).all(DUPLICATE_DIFFERENT_CONTENT_REASON);
+  const exists = db.prepare("SELECT 1 FROM changes WHERE change_id = ?");
+  let marked = 0;
+  for (const row of rows) {
+    let deviceId;
+    let localSeq;
+    try {
+      const raw = JSON.parse(row.raw_record);
+      deviceId = raw.device_id;
+      localSeq = raw.local_seq;
+    } catch {
+      continue;
+    }
+    if (typeof deviceId !== "string") continue;
+    if (typeof localSeq !== "number" || !Number.isInteger(localSeq)) continue;
+    const changeIdStr = `${deviceId}:${localSeq}`;
+    if (exists.get(changeIdStr)) {
+      if (markQuarantineResolved(db, row.quarantine_id, "revalidated_on_restart")) {
+        marked++;
+      }
+    }
+  }
+  return { examined: rows.length, marked };
+}
+function listQuarantineStats(db) {
+  const row = db.prepare(
+    `SELECT SUM(CASE WHEN resolved_at_hlc IS NULL THEN 1 ELSE 0 END) AS active,
+              SUM(CASE WHEN resolved_at_hlc IS NOT NULL THEN 1 ELSE 0 END) AS resolved,
+              COUNT(*) AS total
+       FROM quarantine`
+  ).get();
+  const pruned = db.prepare(
+    "SELECT total_pruned FROM quarantine_prune_stats WHERE id = 1"
+  ).get();
+  return {
+    active: row?.active ?? 0,
+    resolved: row?.resolved ?? 0,
+    total: row?.total ?? 0,
+    total_pruned: pruned?.total_pruned ?? 0
+  };
+}
+var QUARANTINE_RESOLVED_RETENTION_CAP = 1e3;
+function pruneResolvedQuarantine(db, cap = QUARANTINE_RESOLVED_RETENTION_CAP) {
+  if (!Number.isInteger(cap) || cap < 0) {
+    throw new Error(`invalid retention cap: ${cap}`);
+  }
+  let pruned = 0;
+  db.transaction(() => {
+    const prunable = `resolved_at_hlc IS NOT NULL
+           AND COALESCE(resolved_reason, '') != 'user_deleted'
+           AND json_valid(raw_record)
+           AND NOT (COALESCE(resolved_reason, '') = 'retried_by_user'
+                    AND quarantine_reason NOT IN (?, ?)
+                    AND NOT EXISTS (SELECT 1 FROM changes c
+                                    WHERE c.change_id = json_extract(raw_record, '$.change_id')))`;
+    const info = db.prepare(
+      `DELETE FROM quarantine
+         WHERE ${prunable}
+           AND quarantine_id NOT IN (
+             SELECT quarantine_id FROM quarantine
+             WHERE ${prunable}
+             ORDER BY quarantine_id DESC LIMIT ?)`
+    ).run(DUPLICATE_DIFFERENT_CONTENT_REASON, WAITING_ON_CHANGE_REASON, DUPLICATE_DIFFERENT_CONTENT_REASON, WAITING_ON_CHANGE_REASON, cap);
+    pruned = info.changes;
+    if (pruned > 0) {
+      db.prepare(
+        `INSERT INTO quarantine_prune_stats (id, total_pruned) VALUES (1, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           total_pruned = total_pruned + excluded.total_pruned`
+      ).run(pruned);
+    }
+  })();
+  return pruned;
+}
+function dismissQuarantineWarning(db, quarantineId) {
+  const row = db.prepare("SELECT quarantine_reason FROM quarantine WHERE quarantine_id = ?").get(quarantineId);
+  if (!row) throw new Error(`quarantine row ${quarantineId} not found`);
+  if (row.quarantine_reason !== DUPLICATE_DIFFERENT_CONTENT_REASON) {
+    throw new Error("only a duplicate-content warning can be dismissed");
+  }
+  markQuarantineResolved(db, quarantineId, "dismissed_by_user");
+  return { ok: true };
+}
+function deleteQuarantineByUser(db, quarantineId, opts) {
+  if (opts?.confirm !== true) {
+    throw new Error(
+      "delete_quarantine requires explicit confirm: true (destructive action, DC-15 \xA73.5)"
+    );
+  }
+  const row = db.prepare(
+    "SELECT raw_record, resolved_at_hlc, quarantine_reason FROM quarantine WHERE quarantine_id = ?"
+  ).get(quarantineId);
+  if (!row) throw new Error(`quarantine row ${quarantineId} not found`);
+  if (row.quarantine_reason === DUPLICATE_DIFFERENT_CONTENT_REASON) {
+    throw new Error("a warning cannot be skipped; use dismiss_quarantine_warning");
+  }
+  let producer = null;
+  let seq = null;
+  try {
+    const raw = JSON.parse(row.raw_record);
+    if (typeof raw.device_id === "string" && raw.device_id.length > 0) {
+      producer = raw.device_id;
+    }
+    if (typeof raw.local_seq === "number" && Number.isInteger(raw.local_seq) && raw.local_seq > 0) {
+      seq = raw.local_seq;
+    }
+  } catch {
+  }
+  let skipRowPresent = false;
+  let recreated = false;
+  db.transaction(() => {
+    if (row.resolved_at_hlc === null) {
+      markQuarantineResolved(db, quarantineId, "user_deleted");
+    }
+    if (producer !== null && seq !== null) {
+      const applied = !!db.prepare("SELECT 1 FROM changes WHERE change_id = ?").get(`${producer}:${seq}`);
+      if (!applied) {
+        skipRowPresent = isSeqSkipped(db, producer, seq);
+        if (!skipRowPresent) {
+          markSeqSkipped(db, producer, seq);
+          recreated = true;
+        }
+        console.warn(
+          `[tide][sync] change ${producer}#${seq} skipped on this device by the user; it will not be applied here`
+        );
+      } else {
+        skipRowPresent = true;
+      }
+    }
+  })();
+  return {
+    ok: true,
+    skip_row_present: skipRowPresent,
+    skip_row_recreated: recreated
+  };
+}
+var HARD_BLOCK_LOOKUP_SQL = "SELECT 1 FROM hard_blocks WHERE producer_device_id = ?";
+function makeHardBlockCheck(db) {
+  const stmt = db.prepare(HARD_BLOCK_LOOKUP_SQL);
+  return (producerDeviceId) => !!stmt.get(producerDeviceId);
+}
+function hardBlockProducer(db, producerDeviceId) {
+  const now = Date.now();
+  db.prepare(
+    `INSERT INTO hard_blocks
+       (producer_device_id, first_triggered_at, last_triggered_at, trigger_count)
+     VALUES (?, ?, ?, 1)
+     ON CONFLICT(producer_device_id) DO UPDATE SET
+       last_triggered_at = excluded.last_triggered_at,
+       trigger_count = trigger_count + 1`
+  ).run(producerDeviceId, now, now);
+}
+function unhardBlockProducer(db, producerDeviceId) {
+  const info = db.prepare("DELETE FROM hard_blocks WHERE producer_device_id = ?").run(producerDeviceId);
+  return info.changes > 0;
+}
+function listHardBlocks(db) {
+  return db.prepare(`SELECT producer_device_id, first_triggered_at, last_triggered_at,
+              trigger_count
+       FROM hard_blocks ORDER BY last_triggered_at DESC`).all();
+}
+function appendInvalidTally(db, producerDeviceId) {
+  db.prepare(
+    `INSERT INTO peer_invalid_tally
+       (producer_device_id, total_invalid, last_invalid_at)
+     VALUES (?, 1, ?)
+     ON CONFLICT(producer_device_id) DO UPDATE SET
+       total_invalid = total_invalid + 1,
+       last_invalid_at = excluded.last_invalid_at`
+  ).run(producerDeviceId, Date.now());
+}
+function listPeerInvalidTally(db) {
+  return db.prepare(`SELECT producer_device_id, total_invalid, last_invalid_at
+       FROM peer_invalid_tally ORDER BY last_invalid_at DESC`).all();
+}
+
+// src/persistence/bridges/event_core.ts
+var DEFAULT_CALENDAR_ID = "local";
+var HlcTicker = class {
+  last = 0;
+  now() {
+    const wall = Date.now();
+    this.last = wall > this.last ? wall : this.last + 1;
+    return this.last;
+  }
+};
+function loadOrCreateDeviceId(dbPath) {
+  const marker = `${dbPath}.device_id`;
+  if (existsSync(marker)) {
+    return readFileSync(marker, "utf8").trim();
+  }
+  const id = `dev-${randomUUID2()}`;
+  writeFileSync(marker, id, "utf8");
+  return id;
+}
+function localDateStr(ms) {
+  const d = new Date(ms);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+function localWallStr(ms) {
+  const d = new Date(ms);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+function inclusiveEndDateFromExclusiveMs(endMs) {
+  return localDateStr(endMs - 1);
+}
+function timezoneId() {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  } catch {
+    return "UTC";
+  }
+}
+function assertNoInjectedId(input, op) {
+  if (input !== null && typeof input === "object" && "id" in input) {
+    throw new Error(
+      `${op}_event: input.id is not accepted \u2014 event ids are assigned by the sidecar (update targets come from the op's id argument) and a client-injected id is rejected without any state change`
+    );
+  }
+}
+var MAX_EVENT_MS = 864e13;
+function validateEventValues(input, op) {
+  for (const k of ["startMs", "endMs"]) {
+    const v = input[k];
+    if (typeof v !== "number" || !Number.isInteger(v)) {
+      throw new Error(
+        `${op}: input.${k} must be an integer number of epoch milliseconds (fractional/non-numeric values are rejected, never coerced)`
+      );
+    }
+    if (Math.abs(v) > MAX_EVENT_MS) {
+      throw new Error(
+        `${op}: input.${k} ${v} is outside the epoch-ms domain (+/-${MAX_EVENT_MS}); values beyond it are rejected because Date-derived columns and exact JSON round-trips cannot represent them`
+      );
+    }
+  }
+  if (input.endMs < input.startMs) {
+    throw new Error(
+      `${op}: input.endMs (${input.endMs}) must be >= input.startMs (${input.startMs}) \u2014 inverted ranges are rejected without any state change`
+    );
+  }
+}
+var RRULE_FREQS = /* @__PURE__ */ new Set(["DAILY", "WEEKLY", "MONTHLY", "YEARLY"]);
+var RRULE_KEYS = /* @__PURE__ */ new Set(["FREQ", "INTERVAL", "BYDAY", "COUNT", "UNTIL"]);
+var RRULE_DAYS = /* @__PURE__ */ new Set(["MO", "TU", "WE", "TH", "FR", "SA", "SU"]);
+var RECURRENCE_ID_RE = /^\d{8}T\d{6}$/;
+function validateRRule(rule, op) {
+  if (typeof rule !== "string" || rule.trim().length === 0) {
+    throw new Error(`${op}: recurrence_rule must be a non-empty RRULE string`);
+  }
+  const segments = rule.split(";");
+  let sawFreq = false;
+  for (const seg of segments) {
+    const eq = seg.indexOf("=");
+    if (eq <= 0) {
+      throw new Error(
+        `${op}: recurrence_rule segment "${seg}" is not KEY=VALUE \u2014 the rule must be a semicolon-separated RFC 5545 RRULE`
+      );
+    }
+    const key = seg.slice(0, eq).trim().toUpperCase();
+    const value = seg.slice(eq + 1).trim();
+    if (!RRULE_KEYS.has(key)) {
+      throw new Error(
+        `${op}: recurrence_rule key "${key}" is not supported \u2014 allowed: FREQ, INTERVAL, BYDAY, COUNT, UNTIL`
+      );
+    }
+    if (value.length === 0) {
+      throw new Error(`${op}: recurrence_rule key "${key}" has an empty value`);
+    }
+    switch (key) {
+      case "FREQ": {
+        const f = value.toUpperCase();
+        if (!RRULE_FREQS.has(f)) {
+          throw new Error(
+            `${op}: recurrence_rule FREQ "${value}" is not supported \u2014 allowed: DAILY, WEEKLY, MONTHLY, YEARLY`
+          );
+        }
+        sawFreq = true;
+        break;
+      }
+      case "INTERVAL": {
+        const n = Number(value);
+        if (!Number.isInteger(n) || n < 1) {
+          throw new Error(
+            `${op}: recurrence_rule INTERVAL "${value}" must be an integer >= 1`
+          );
+        }
+        break;
+      }
+      case "COUNT": {
+        const n = Number(value);
+        if (!Number.isInteger(n) || n < 1) {
+          throw new Error(
+            `${op}: recurrence_rule COUNT "${value}" must be an integer >= 1`
+          );
+        }
+        break;
+      }
+      case "UNTIL": {
+        if (!/^\d{8}$/.test(value) && !/^\d{8}T\d{6}Z$/.test(value)) {
+          throw new Error(
+            `${op}: recurrence_rule UNTIL "${value}" must be YYYYMMDD or YYYYMMDDTHHMMSSZ (RFC 5545 \xA73.3.10)`
+          );
+        }
+        break;
+      }
+      case "BYDAY": {
+        for (const d of value.split(",")) {
+          if (!RRULE_DAYS.has(d.trim().toUpperCase())) {
+            throw new Error(
+              `${op}: recurrence_rule BYDAY value "${d}" is not a weekday (MO TU WE TH FR SA SU)`
+            );
+          }
+        }
+        break;
+      }
+    }
+  }
+  if (!sawFreq) {
+    throw new Error(`${op}: recurrence_rule is missing required FREQ`);
+  }
+  return rule;
+}
+function validateRecurrenceId(rid, op) {
+  if (typeof rid !== "string" || !RECURRENCE_ID_RE.test(rid)) {
+    throw new Error(
+      `${op}: recurrence_id must be the canonical wall-clock form "YYYYMMDDTHHMMSS" (DC-12 \xA72.3), got: ${JSON.stringify(rid)}`
+    );
+  }
+  return rid;
+}
+var OVERRIDE_FIELDS = [
+  "cancelled",
+  "title",
+  "start_wall",
+  "end_wall",
+  "tz_id"
+];
+function deleteEventRows(db, eventId, seriesId) {
+  if (seriesId !== void 0) {
+    db.prepare("DELETE FROM occurrence_overrides WHERE series_id = ?").run(seriesId);
+    db.prepare("DELETE FROM series WHERE series_id = ?").run(seriesId);
+  }
+  db.prepare("DELETE FROM events WHERE event_id = ?").run(eventId);
+}
+var EventCore = class {
+  db;
+  dbPath;
+  deviceId;
+  hlc = new HlcTicker();
+  /**
+   * DC-27 V3: the ONE hybrid logical clock of this process, the same ticker
+   * that stamps local change records (revoked_at_hlc must come from it).
+   */
+  hlcNow() {
+    return this.hlc.now();
+  }
+  constructor(dbPath, deviceId) {
+    this.dbPath = dbPath;
+    this.db = openDatabase({ path: dbPath });
+    this.deviceId = deviceId ?? loadOrCreateDeviceId(dbPath);
+    this.ensureDefaultCalendar();
+  }
+  get selfDeviceId() {
+    return this.deviceId;
+  }
+  // -------------------------------------------------------------------------
+  // DC-22: reminder members (collection members; replicate per D5).
+  // -------------------------------------------------------------------------
+  /** Read one event's reminder member, or null. */
+  reminderFor(eventId) {
+    const row = this.db.prepare(
+      "SELECT minutes_before, enabled FROM reminders WHERE entity_id = ?"
+    ).get(eventId);
+    if (row === void 0) return null;
+    return { minutesBefore: row.minutes_before, enabled: row.enabled !== 0 };
+  }
+  /**
+   * Create-or-update this event's reminder member (v1 UI: one member per
+   * event). Replicates as member_add / member_update (D5: disabled members
+   * are stored-but-inactive AND still replicate).
+   */
+  setReminder(eventId, reminder) {
+    if (!Number.isInteger(reminder.minutesBefore) || reminder.minutesBefore < 0) {
+      throw new Error("setReminder: minutes_before must be a non-negative integer");
+    }
+    if (this.getEventRow(eventId) === void 0) {
+      throw new Error(`setReminder: event not found: ${eventId}`);
+    }
+    const existing = this.db.prepare(
+      "SELECT member_id FROM reminders WHERE entity_id = ?"
+    ).get(eventId);
+    const hlc = this.hlc.now();
+    if (existing !== void 0) {
+      createLocalChange(
+        this.db,
+        this.deviceId,
+        {
+          entity_id: eventId,
+          entity_type: "reminder",
+          field_path: `reminders.${existing.member_id}`,
+          operation: "member_update",
+          payload: {
+            value: { minutes_before: reminder.minutesBefore, enabled: reminder.enabled ? 1 : 0 }
+          },
+          hlc_now: () => hlc
+        },
+        (db) => {
+          db.prepare(
+            "UPDATE reminders SET minutes_before = ?, enabled = ?, updated_hlc = ? WHERE member_id = ?"
+          ).run(reminder.minutesBefore, reminder.enabled ? 1 : 0, hlc, existing.member_id);
+        }
+      );
+      return;
+    }
+    const memberId = `rem-${randomUUID2()}`;
+    createLocalChange(
+      this.db,
+      this.deviceId,
+      {
+        entity_id: eventId,
+        entity_type: "reminder",
+        field_path: `reminders.${memberId}`,
+        operation: "member_add",
+        payload: {
+          value: { minutes_before: reminder.minutesBefore, enabled: reminder.enabled ? 1 : 0 }
+        },
+        hlc_now: () => hlc
+      },
+      (db) => {
+        db.prepare(
+          `INSERT INTO reminders (member_id, entity_id, collection_path, minutes_before, enabled, updated_hlc)
+           VALUES (?, ?, 'reminders', ?, ?, ?)`
+        ).run(memberId, eventId, reminder.minutesBefore, reminder.enabled ? 1 : 0, hlc);
+      }
+    );
+  }
+  /** Remove the event's reminder member (member_remove). Idempotent. */
+  clearReminder(eventId) {
+    const existing = this.db.prepare(
+      "SELECT member_id FROM reminders WHERE entity_id = ?"
+    ).get(eventId);
+    if (existing === void 0) return;
+    const hlc = this.hlc.now();
+    createLocalChange(
+      this.db,
+      this.deviceId,
+      {
+        entity_id: eventId,
+        entity_type: "reminder",
+        field_path: `reminders.${existing.member_id}`,
+        operation: "member_remove",
+        payload: { value: null },
+        hlc_now: () => hlc
+      },
+      (db) => {
+        db.prepare("DELETE FROM reminders WHERE member_id = ?").run(existing.member_id);
+      }
+    );
+  }
+  /**
+   * Bootstrap the shell-local calendar through the same T1 path so even
+   * this bootstrap produces an auditable change record.
+   *
+   * Pkg6 (QA-2 F-1): the bootstrap change is emitted ONLY when the calendar
+   * row is MISSING. Previously the T1 ran unconditionally, so every
+   * sidecar restart emitted a fresh authoritative "title='My Calendar'"
+   * change for an entity that already existed — a spurious change per
+   * restart (QA-2 s5_cycles.json: changes_delta=1 x N). Beyond noise, that
+   * is a latent LWW data-loss trap: once calendar rename ships, a restart
+   * would re-assert the DEFAULT title over a peer-renamed calendar. An
+   * existing row (local or synced) is left completely untouched — no
+   * change record, no device_clock advance, no updated_hlc churn.
+   */
+  ensureDefaultCalendar() {
+    const exists = this.db.prepare(
+      "SELECT 1 FROM calendars WHERE calendar_id = ?"
+    ).get(DEFAULT_CALENDAR_ID);
+    if (exists !== void 0) return;
+    const hlc = this.hlc.now();
+    createLocalChange(
+      this.db,
+      this.deviceId,
+      {
+        entity_id: DEFAULT_CALENDAR_ID,
+        entity_type: "calendar",
+        field_path: "title",
+        operation: "set",
+        payload: { value: "My Calendar" },
+        hlc_now: () => hlc
+      },
+      (db) => {
+        db.prepare(
+          `INSERT INTO calendars (calendar_id, title, color, created_hlc, updated_hlc)
+           VALUES (?, ?, NULL, ?, ?)
+           ON CONFLICT(calendar_id) DO NOTHING`
+        ).run(DEFAULT_CALENDAR_ID, "My Calendar", hlc, hlc);
+      }
+    );
+  }
+  listEvents(range) {
+    let rows;
+    if (range?.fromMs != null && range?.toMs != null) {
+      rows = this.db.prepare(
+        `SELECT event_id, title, description, all_day, start_date, end_date,
+                  start_wall, end_wall, utc_start_ms, utc_end_ms
+           FROM events WHERE utc_start_ms IS NOT NULL
+             AND utc_start_ms < ? AND utc_end_ms > ?
+           ORDER BY utc_start_ms`
+      ).all(range.toMs, range.fromMs);
+    } else {
+      rows = this.db.prepare(
+        `SELECT event_id, title, description, all_day, start_date, end_date,
+                  start_wall, end_wall, utc_start_ms, utc_end_ms
+           FROM events ORDER BY utc_start_ms`
+      ).all();
+    }
+    return rows.map(rowToEvent).sort(byStart);
+  }
+  createEvent(input) {
+    assertNoInjectedId(input, "create");
+    const rule = input.recurrenceRule !== void 0 ? validateRRule(input.recurrenceRule, "create_event") : void 0;
+    const event = {
+      id: `evt-${randomUUID2()}`,
+      title: input.title,
+      description: input.description,
+      startMs: input.startMs,
+      endMs: input.endMs,
+      allDay: input.allDay
+    };
+    validateEventValues(event, "create_event");
+    const hlc = this.hlc.now();
+    createLocalChange(
+      this.db,
+      this.deviceId,
+      {
+        entity_id: event.id,
+        entity_type: "event",
+        field_path: "event",
+        operation: "set",
+        payload: { value: eventFields(event) },
+        hlc_now: () => hlc
+      },
+      (db, _record) => {
+        insertEventRow(db, event, hlc);
+      }
+    );
+    if (rule !== void 0) {
+      const seriesId = `ser-${randomUUID2()}`;
+      const seriesHlc = this.hlc.now();
+      createLocalChange(
+        this.db,
+        this.deviceId,
+        {
+          entity_id: seriesId,
+          entity_type: "series",
+          field_path: "recurrence_rule",
+          operation: "set",
+          // base_event_id lets a receiving device materialize the series row.
+          payload: { value: rule, base_event_id: event.id },
+          hlc_now: () => seriesHlc
+        },
+        (db) => {
+          db.prepare(
+            `INSERT INTO series (series_id, base_event_id, recurrence_rule, created_hlc, updated_hlc)
+             VALUES (?, ?, ?, ?, ?)`
+          ).run(seriesId, event.id, rule, seriesHlc, seriesHlc);
+        }
+      );
+    }
+    return event;
+  }
+  /**
+   * DC-23 §4 Case B: create an event with a CALLER-SUPPLIED canonical Tide
+   * id (import identity resolution). Same T1/validation machinery as
+   * createEvent — the ONLY difference is the id source. Guard: the id must
+   * match the canonical evt-<uuid> shape AND not already exist (a collision
+   * is a hard error, never a silent upsert). Non-canonical ids are refused
+   * here so the M-1 invariant (core-owned identity) keeps holding for the
+   * ordinary createEvent path — this method exists for the importer only
+   * and is NOT exposed on any surface op.
+   */
+  createEventWithId(id, input) {
+    if (!/^evt-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+      throw new Error(`create_event_with_id: id is not canonical evt-<uuid> shape: ${id}`);
+    }
+    assertNoInjectedId(input, "create");
+    if (this.getEventRow(id) !== void 0) {
+      throw new Error(`create_event_with_id: event already exists: ${id}`);
+    }
+    const rule = input.recurrenceRule !== void 0 ? validateRRule(input.recurrenceRule, "create_event") : void 0;
+    const event = {
+      id,
+      title: input.title,
+      description: input.description,
+      startMs: input.startMs,
+      endMs: input.endMs,
+      allDay: input.allDay
+    };
+    validateEventValues(event, "create_event");
+    const hlc = this.hlc.now();
+    createLocalChange(
+      this.db,
+      this.deviceId,
+      {
+        entity_id: event.id,
+        entity_type: "event",
+        field_path: "event",
+        operation: "set",
+        payload: { value: eventFields(event) },
+        hlc_now: () => hlc
+      },
+      (db, _record) => {
+        insertEventRow(db, event, hlc);
+      }
+    );
+    if (rule !== void 0) {
+      const seriesId = `ser-${randomUUID2()}`;
+      const seriesHlc = this.hlc.now();
+      createLocalChange(
+        this.db,
+        this.deviceId,
+        {
+          entity_id: seriesId,
+          entity_type: "series",
+          field_path: "recurrence_rule",
+          operation: "set",
+          // base_event_id lets a receiving device materialize the series row.
+          payload: { value: rule, base_event_id: event.id },
+          hlc_now: () => seriesHlc
+        },
+        (db) => {
+          db.prepare(
+            `INSERT INTO series (series_id, base_event_id, recurrence_rule, created_hlc, updated_hlc)
+             VALUES (?, ?, ?, ?, ?)`
+          ).run(seriesId, event.id, rule, seriesHlc, seriesHlc);
+        }
+      );
+    }
+    return event;
+  }
+  updateEvent(id, input) {
+    assertNoInjectedId(input, "update");
+    const existing = this.getEventRow(id);
+    if (!existing) throw new Error(`event not found: ${id}`);
+    const before = rowToEvent(existing);
+    const updated = {
+      id,
+      title: input.title,
+      description: input.description,
+      startMs: input.startMs,
+      endMs: input.endMs,
+      allDay: input.allDay
+    };
+    validateEventValues(updated, "update_event");
+    const groups = [
+      {
+        field_path: "title",
+        value: input.title,
+        changed: before.title !== input.title
+      },
+      {
+        field_path: "description",
+        value: input.description,
+        changed: before.description !== input.description
+      },
+      {
+        field_path: "schedule",
+        value: { startMs: input.startMs, endMs: input.endMs, allDay: input.allDay },
+        changed: before.startMs !== input.startMs || before.endMs !== input.endMs || before.allDay !== input.allDay
+      }
+    ];
+    for (const g of groups.filter((g2) => g2.changed)) {
+      const hlc = this.hlc.now();
+      createLocalChange(
+        this.db,
+        this.deviceId,
+        {
+          entity_id: id,
+          entity_type: "event",
+          field_path: g.field_path,
+          operation: "set",
+          payload: { value: g.value },
+          hlc_now: () => hlc
+        },
+        (db) => {
+          insertEventRow(db, updated, hlc, true);
+        }
+      );
+    }
+    return updated;
+  }
+  deleteEvent(id) {
+    const existing = this.getEventRow(id);
+    if (!existing) return;
+    const series = this.seriesForBaseEvent(id);
+    const hlc = this.hlc.now();
+    createLocalChange(
+      this.db,
+      this.deviceId,
+      {
+        entity_id: id,
+        entity_type: "event",
+        field_path: "*",
+        operation: "remove",
+        payload: {},
+        hlc_now: () => hlc
+      },
+      (db) => {
+        deleteEventRows(db, id, series?.series_id);
+      }
+    );
+    if (series) {
+      const seriesHlc = this.hlc.now();
+      createLocalChange(
+        this.db,
+        this.deviceId,
+        {
+          entity_id: series.series_id,
+          entity_type: "series",
+          field_path: "*",
+          operation: "remove",
+          payload: {},
+          hlc_now: () => seriesHlc
+        }
+      );
+    }
+  }
+  getEventRow(id) {
+    return this.db.prepare(
+      `SELECT event_id, title, description, all_day, start_date, end_date,
+                start_wall, end_wall, utc_start_ms, utc_end_ms
+         FROM events WHERE event_id = ?`
+    ).get(id);
+  }
+  seriesForBaseEvent(baseEventId) {
+    return this.db.prepare(
+      `SELECT series_id, recurrence_rule FROM series WHERE base_event_id = ?`
+    ).get(baseEventId);
+  }
+  /**
+   * DC-12 §2.1 / §3: edit the series' recurrence rule. Its own conflict
+   * entity (series_id, "recurrence_rule"); stored VERBATIM (validated first).
+   * No-op (no change record) when the rule is byte-identical.
+   */
+  updateSeriesRule(seriesId, rule) {
+    if (typeof seriesId !== "string" || seriesId.length === 0) {
+      throw new Error("update_series_rule: series_id must be a non-empty string");
+    }
+    const validated = validateRRule(rule, "update_series_rule");
+    const row = this.db.prepare(
+      `SELECT series_id, recurrence_rule FROM series WHERE series_id = ?`
+    ).get(seriesId);
+    if (!row) throw new Error(`series not found: ${seriesId}`);
+    if (row.recurrence_rule === validated) {
+      return { seriesId, recurrenceRule: validated };
+    }
+    const hlc = this.hlc.now();
+    createLocalChange(
+      this.db,
+      this.deviceId,
+      {
+        entity_id: seriesId,
+        entity_type: "series",
+        field_path: "recurrence_rule",
+        operation: "set",
+        payload: { value: validated },
+        hlc_now: () => hlc
+      },
+      (db) => {
+        db.prepare(
+          `UPDATE series SET recurrence_rule = ?, updated_hlc = ? WHERE series_id = ?`
+        ).run(validated, hlc, seriesId);
+      }
+    );
+    return { seriesId, recurrenceRule: validated };
+  }
+  /**
+   * DC-12 §2.2/§2.3/§4.1: create or edit ONE occurrence override, keyed
+   * (series_id, recurrence_id). recurrence_id is the canonical wall-clock
+   * form of the ORIGINAL occurrence start (never rewritten — R2). Each
+   * changed field is its own DC-03 conflict entity
+   * (series_id, "overrides.<rid>.<field>") — exactly one change record per
+   * field per DC-01 §3.1. Unchanged fields produce nothing (TR-8 idempotence).
+   */
+  updateOccurrence(seriesId, recurrenceId, patch) {
+    if (typeof seriesId !== "string" || seriesId.length === 0) {
+      throw new Error("update_occurrence: series_id must be a non-empty string");
+    }
+    const rid = validateRecurrenceId(recurrenceId, "update_occurrence");
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new Error("update_occurrence: patch must be an object");
+    }
+    const unknown = Object.keys(patch).filter(
+      (k) => !OVERRIDE_FIELDS.includes(k)
+    );
+    if (unknown.length > 0) {
+      throw new Error(
+        `update_occurrence: unknown patch field(s): ${unknown.join(", ")} \u2014 allowed: ${OVERRIDE_FIELDS.join(", ")}`
+      );
+    }
+    if (Object.keys(patch).length === 0) {
+      throw new Error("update_occurrence: patch must set at least one field");
+    }
+    for (const k of ["title", "start_wall", "end_wall", "tz_id"]) {
+      const v = patch[k];
+      if (v !== void 0 && typeof v !== "string") {
+        throw new Error(`update_occurrence: patch.${k} must be a string`);
+      }
+      if (typeof v === "string" && v.trim().length === 0) {
+        throw new Error(`update_occurrence: patch.${k} must be a non-empty string`);
+      }
+    }
+    if (patch.cancelled !== void 0 && typeof patch.cancelled !== "boolean") {
+      throw new Error("update_occurrence: patch.cancelled must be a boolean");
+    }
+    const series = this.db.prepare(
+      `SELECT series_id FROM series WHERE series_id = ?`
+    ).get(seriesId);
+    if (!series) throw new Error(`series not found: ${seriesId}`);
+    const existing = this.db.prepare(
+      `SELECT series_id, recurrence_id, cancelled, title, start_wall,
+                end_wall, tz_id, updated_hlc
+         FROM occurrence_overrides WHERE series_id = ? AND recurrence_id = ?`
+    ).get(seriesId, rid);
+    const wanted = {};
+    if (patch.cancelled !== void 0 && (existing?.cancelled ?? 0) !== (patch.cancelled ? 1 : 0)) {
+      wanted.cancelled = patch.cancelled;
+    }
+    for (const k of ["title", "start_wall", "end_wall", "tz_id"]) {
+      if (patch[k] !== void 0 && (existing?.[k] ?? null) !== patch[k]) {
+        wanted[k] = patch[k];
+      }
+    }
+    if (Object.keys(wanted).length === 0) {
+      return { seriesId, recurrenceId: rid, changed: [] };
+    }
+    const merged = {
+      series_id: seriesId,
+      recurrence_id: rid,
+      cancelled: wanted.cancelled !== void 0 ? wanted.cancelled ? 1 : 0 : existing?.cancelled ?? 0,
+      title: wanted.title ?? existing?.title ?? null,
+      start_wall: wanted.start_wall ?? existing?.start_wall ?? null,
+      end_wall: wanted.end_wall ?? existing?.end_wall ?? null,
+      tz_id: wanted.tz_id ?? existing?.tz_id ?? null
+    };
+    for (const field of OVERRIDE_FIELDS) {
+      if (!(field in wanted)) continue;
+      const fieldHlc = this.hlc.now();
+      const value = field === "cancelled" ? wanted.cancelled : wanted[field];
+      createLocalChange(
+        this.db,
+        this.deviceId,
+        {
+          entity_id: seriesId,
+          entity_type: "occurrence_override",
+          field_path: `overrides.${rid}.${field}`,
+          operation: "set",
+          payload: { value },
+          hlc_now: () => fieldHlc
+        },
+        (db) => {
+          db.prepare(
+            `INSERT INTO occurrence_overrides (series_id, recurrence_id, cancelled,
+                title, start_wall, end_wall, tz_id, updated_hlc)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(series_id, recurrence_id) DO UPDATE SET
+                cancelled = excluded.cancelled,
+                title = excluded.title,
+                start_wall = excluded.start_wall,
+                end_wall = excluded.end_wall,
+                tz_id = excluded.tz_id,
+                updated_hlc = excluded.updated_hlc`
+          ).run(
+            seriesId,
+            rid,
+            merged.cancelled,
+            merged.title,
+            merged.start_wall,
+            merged.end_wall,
+            merged.tz_id,
+            fieldHlc
+          );
+        }
+      );
+    }
+    return {
+      seriesId,
+      recurrenceId: rid,
+      changed: Object.keys(wanted)
+    };
+  }
+  /**
+   * READ-ONLY series listing for recurrence surfacing (DC-12 §2): every
+   * series row with its verbatim RRULE joined to its occurrence_overrides.
+   * No change records, no mutation — pure SELECT over stored state.
+   */
+  listSeries() {
+    const rows = this.db.prepare(`SELECT series_id, base_event_id, recurrence_rule FROM series`).all();
+    const overrides = this.db.prepare(
+      `SELECT series_id, recurrence_id, cancelled, title, start_wall,
+                end_wall, tz_id
+         FROM occurrence_overrides ORDER BY recurrence_id`
+    ).all();
+    const bySeries = /* @__PURE__ */ new Map();
+    for (const o of overrides) {
+      let list = bySeries.get(o.series_id);
+      if (!list) bySeries.set(o.series_id, list = []);
+      list.push({
+        recurrenceId: o.recurrence_id,
+        cancelled: o.cancelled !== 0,
+        title: o.title,
+        startWall: o.start_wall,
+        endWall: o.end_wall,
+        tzId: o.tz_id
+      });
+    }
+    return rows.map((r) => ({
+      seriesId: r.series_id,
+      baseEventId: r.base_event_id,
+      recurrenceRule: r.recurrence_rule,
+      overrides: bySeries.get(r.series_id) ?? []
+    }));
+  }
+};
+function eventFields(e) {
+  return {
+    title: e.title,
+    description: e.description,
+    startMs: e.startMs,
+    endMs: e.endMs,
+    allDay: e.allDay
+  };
+}
+function insertEventRow(db, e, hlc, upsert = false) {
+  const derived = derivedScheduleColumns(e);
+  if (upsert) {
+    const exists = !!db.prepare("SELECT 1 FROM events WHERE event_id = ?").get(e.id);
+    if (!exists) {
+      insertNewEventRow(db, e, hlc, derived);
+    } else {
+      updateEventRowDerived(db, e.id, e, hlc, derived);
+    }
+    return;
+  }
+  insertNewEventRow(db, e, hlc, derived);
+}
+function derivedScheduleColumns(e) {
+  return {
+    all_day: e.allDay ? 1 : 0,
+    start_date: e.allDay ? localDateStr(e.startMs) : null,
+    end_date: e.allDay ? inclusiveEndDateFromExclusiveMs(Math.max(e.endMs, e.startMs)) : null,
+    start_wall: e.allDay ? null : localWallStr(e.startMs),
+    end_wall: e.allDay ? null : localWallStr(e.endMs),
+    tz_id: e.allDay ? null : timezoneId(),
+    utc_start_ms: e.startMs,
+    utc_end_ms: Math.max(e.endMs, e.startMs)
+  };
+}
+function insertNewEventRow(db, e, hlc, d) {
+  db.prepare(`INSERT INTO events (event_id, calendar_id, title, description,
+      all_day, start_date, end_date, start_wall, end_wall, tz_id,
+      utc_start_ms, utc_end_ms, created_hlc, updated_hlc)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    e.id,
+    DEFAULT_CALENDAR_ID,
+    e.title,
+    e.description,
+    d.all_day,
+    d.start_date,
+    d.end_date,
+    d.start_wall,
+    d.end_wall,
+    d.tz_id,
+    d.utc_start_ms,
+    d.utc_end_ms,
+    hlc,
+    hlc
+  );
+}
+function updateEventRowDerived(db, eventId, e, hlc, d) {
+  const info = db.prepare(`
+    UPDATE events SET title = ?, description = ?, all_day = ?, start_date = ?,
+      end_date = ?, start_wall = ?, end_wall = ?, tz_id = ?,
+      utc_start_ms = ?, utc_end_ms = ?, updated_hlc = ?
+    WHERE event_id = ?`).run(
+    e.title,
+    e.description,
+    d.all_day,
+    d.start_date,
+    d.end_date,
+    d.start_wall,
+    d.end_wall,
+    d.tz_id,
+    d.utc_start_ms,
+    d.utc_end_ms,
+    hlc,
+    eventId
+  );
+  return info.changes > 0;
+}
+function rowToEvent(r) {
+  let startMs = r.utc_start_ms;
+  let endMs = r.utc_end_ms;
+  if (startMs == null || endMs == null) {
+    if (r.all_day && r.start_date && r.end_date) {
+      startMs = (/* @__PURE__ */ new Date(`${r.start_date}T00:00:00`)).getTime();
+      endMs = (/* @__PURE__ */ new Date(`${r.end_date}T23:59:59.999`)).getTime();
+    } else if (r.start_wall && r.end_wall && r.start_date) {
+      startMs = (/* @__PURE__ */ new Date(`${r.start_date}T${r.start_wall}`)).getTime();
+      endMs = (/* @__PURE__ */ new Date(`${r.start_date}T${r.end_wall}`)).getTime();
+    } else {
+      startMs = 0;
+      endMs = 0;
+    }
+  }
+  return {
+    id: r.event_id,
+    title: r.title,
+    description: r.description,
+    startMs,
+    endMs,
+    allDay: r.all_day !== 0
+  };
+}
+function byStart(a, b) {
+  return a.startMs - b.startMs || a.title.localeCompare(b.title);
+}
+
+// src/network/sync_runtime.ts
+import { createServer, connect } from "node:net";
+import { existsSync as existsSync2, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { join } from "node:path";
+import { networkInterfaces } from "node:os";
+
 // src/network/noise_transport.ts
 import { createRequire } from "node:module";
 
-// node_modules/@noble/curves/utils.js
+// ../../../node_modules/@noble/curves/utils.js
 function aarray(item, title, inner = () => {
 }) {
   if (!Array.isArray(item))
@@ -3643,7 +4380,7 @@ function validateObject(object, fields = {}, optFields = {}, title = "object") {
   iter(optFields, true);
 }
 
-// node_modules/@noble/curves/abstract/modular.js
+// ../../../node_modules/@noble/curves/abstract/modular.js
 var _0n2 = /* @__PURE__ */ BigInt(0);
 var _1n2 = /* @__PURE__ */ BigInt(1);
 var _2n = /* @__PURE__ */ BigInt(2);
@@ -4072,7 +4809,7 @@ function Field(ORDER, opts = {}) {
   return new _Field(ORDER, opts);
 }
 
-// node_modules/@noble/curves/abstract/curve.js
+// ../../../node_modules/@noble/curves/abstract/curve.js
 var _0n3 = /* @__PURE__ */ BigInt(0);
 var _1n3 = /* @__PURE__ */ BigInt(1);
 var _4n2 = /* @__PURE__ */ BigInt(4);
@@ -4459,7 +5196,7 @@ function createKeygen(randomSecretKey, getPublicKey2) {
   };
 }
 
-// node_modules/@noble/curves/abstract/edwards.js
+// ../../../node_modules/@noble/curves/abstract/edwards.js
 var _0n4 = /* @__PURE__ */ BigInt(0);
 var _1n4 = /* @__PURE__ */ BigInt(1);
 var _2n2 = /* @__PURE__ */ BigInt(2);
@@ -4910,7 +5647,7 @@ function eddsa(Point2, cHash, eddsaOpts = {}) {
   });
 }
 
-// node_modules/@noble/curves/abstract/montgomery.js
+// ../../../node_modules/@noble/curves/abstract/montgomery.js
 var _0n5 = /* @__PURE__ */ BigInt(0);
 var _1n5 = /* @__PURE__ */ BigInt(1);
 var _2n3 = /* @__PURE__ */ BigInt(2);
@@ -5057,7 +5794,7 @@ function montgomery(curveDef) {
   });
 }
 
-// node_modules/@noble/curves/ed25519.js
+// ../../../node_modules/@noble/curves/ed25519.js
 var _0n6 = /* @__PURE__ */ BigInt(0);
 var _1n6 = /* @__PURE__ */ BigInt(1);
 var _2n4 = /* @__PURE__ */ BigInt(2);
@@ -7196,433 +7933,6 @@ var PairingSession = class _PairingSession {
   }
 };
 
-// src/security/revocation.ts
-var RevocationError = class extends Error {
-  constructor(code, message) {
-    super(message);
-    this.code = code;
-    this.name = "RevocationError";
-  }
-  code;
-};
-var encoder = new TextEncoder();
-function isNonEmptyString(v) {
-  return typeof v === "string" && v.length > 0;
-}
-function validateRevocationRecord(r) {
-  if (typeof r !== "object" || r === null) {
-    throw new RevocationError("missing_field", "record is not an object");
-  }
-  const rec = r;
-  if (rec.v !== 1) {
-    throw new RevocationError("bad_version", `unsupported version ${String(rec.v)}`);
-  }
-  for (const key of [
-    "revoked_device_id",
-    "revoked_by_device_id"
-  ]) {
-    if (!isNonEmptyString(rec[key])) {
-      throw new RevocationError("missing_field", `invalid ${key}`);
-    }
-  }
-  if (typeof rec.revoked_at_hlc !== "number" || !Number.isInteger(rec.revoked_at_hlc) || rec.revoked_at_hlc < 0) {
-    throw new RevocationError("bad_hlc", "revoked_at_hlc must be a non-negative integer");
-  }
-  if (rec.reason !== void 0 && !isNonEmptyString(rec.reason)) {
-    throw new RevocationError("missing_field", "invalid reason");
-  }
-  if (rec.revoked_after_seq !== void 0 && (typeof rec.revoked_after_seq !== "number" || !Number.isInteger(rec.revoked_after_seq) || rec.revoked_after_seq < 0)) {
-    throw new RevocationError("bad_hlc", "revoked_after_seq must be a non-negative integer");
-  }
-  const out = {
-    v: 1,
-    revoked_device_id: rec.revoked_device_id,
-    revoked_by_device_id: rec.revoked_by_device_id,
-    revoked_at_hlc: rec.revoked_at_hlc
-  };
-  if (rec.reason !== void 0) out.reason = rec.reason;
-  if (rec.revoked_after_seq !== void 0) {
-    out.revoked_after_seq = rec.revoked_after_seq;
-  }
-  return out;
-}
-function canonicalRevocationBytes(record) {
-  const obj = record;
-  const keys = Object.keys(obj).filter((k) => obj[k] !== void 0).sort();
-  const parts = keys.map(
-    (k) => `${JSON.stringify(k)}:${JSON.stringify(obj[k])}`
-  );
-  return encoder.encode(`{${parts.join(",")}}`);
-}
-async function createRevocation(fields, privateKey) {
-  const record = validateRevocationRecord({ ...fields, v: 1 });
-  const signature = await signAsync2(canonicalRevocationBytes(record), privateKey);
-  return { record, signature };
-}
-async function verifyRevocation(signed, trustStoreLookup) {
-  try {
-    let record;
-    try {
-      record = validateRevocationRecord(signed.record);
-    } catch {
-      return { valid: false, reason: "malformed" };
-    }
-    if (!(signed.signature instanceof Uint8Array) || signed.signature.length === 0) {
-      return { valid: false, reason: "malformed" };
-    }
-    if (record.revoked_by_device_id === record.revoked_device_id) {
-      return { valid: false, reason: "self_signed" };
-    }
-    const entry = trustStoreLookup(record.revoked_by_device_id);
-    if (entry === void 0) {
-      return { valid: false, reason: "unknown_revoker" };
-    }
-    if (entry.status !== "trusted") {
-      return { valid: false, reason: "revoker_not_trusted" };
-    }
-    const ok = await verifyAsync2(
-      canonicalRevocationBytes(record),
-      signed.signature,
-      entry.publicKey
-    );
-    return ok ? { valid: true } : { valid: false, reason: "bad_signature" };
-  } catch {
-    return { valid: false, reason: "malformed" };
-  }
-}
-function recordTriple(record) {
-  return {
-    revoked_device_id: record.revoked_device_id,
-    revoked_at_hlc: record.revoked_at_hlc,
-    revoked_by_device_id: record.revoked_by_device_id
-  };
-}
-function shortDeviceId(deviceId) {
-  return deviceId.length > 16 ? deviceId.slice(0, 16) + "\u2026" : deviceId;
-}
-function keysEqual(a, b) {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= (a[i] ?? 0) ^ (b[i] ?? 0);
-  return diff === 0;
-}
-function canSynchronize(trustStore, peerId, claimedPublicKey) {
-  const entry = trustStore.get(peerId);
-  if (entry === void 0) return "DENY_UNPAIRED";
-  if (claimedPublicKey !== void 0) {
-    const claimedId = deriveDeviceId(claimedPublicKey);
-    if (claimedId !== peerId || !keysEqual(entry.publicKey, claimedPublicKey)) {
-      return "DENY_KEY_MISMATCH";
-    }
-  }
-  if (entry.status === "revoked") return "DENY_REVOKED";
-  return "ALLOW";
-}
-
-// src/security/revocation_store.ts
-var defaultLog = (line) => console.error(`[tide] ${line}`);
-function bytesEqual(a, b) {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-  return true;
-}
-function dbTrustLookup(db, self2) {
-  const stmt = db.prepare(
-    "SELECT public_key, status FROM peers WHERE device_id = ?"
-  );
-  return (deviceId) => {
-    if (self2 !== void 0 && deviceId === self2.deviceId) {
-      return { publicKey: self2.publicKey, status: "trusted" };
-    }
-    const row = stmt.get(deviceId);
-    if (row === void 0) return void 0;
-    return { publicKey: new Uint8Array(row.public_key), status: row.status };
-  };
-}
-function rowToSigned(row) {
-  try {
-    const record = validateRevocationRecord(
-      JSON.parse(Buffer.from(row.record_bytes).toString("utf8"))
-    );
-    return { record, signature: new Uint8Array(row.signature) };
-  } catch {
-    return void 0;
-  }
-}
-function revokedCutoffs(db) {
-  const rows = db.prepare(
-    `SELECT revoked_device_id AS d, MAX(COALESCE(revoked_after_seq, 0)) AS c
-       FROM revocation_records WHERE verification_state = 'valid'
-       GROUP BY revoked_device_id`
-  ).all();
-  return new Map(rows.map((r) => [r.d, r.c]));
-}
-function isKnownRevoked(db, deviceId) {
-  const row = db.prepare(
-    `SELECT 1 FROM peers WHERE device_id = @id AND status = 'revoked'
-       UNION ALL
-       SELECT 1 FROM revocation_records
-        WHERE revoked_device_id = @id AND verification_state = 'valid'
-       LIMIT 1`
-  ).get({ id: deviceId });
-  return row !== void 0;
-}
-function insertRecordStmt(db) {
-  return db.prepare(
-    `INSERT INTO revocation_records
-       (revoked_device_id, revoked_by_device_id, revoked_at_hlc, reason,
-        record_bytes, signature, verification_state, received_at_hlc,
-        revoked_after_seq)
-     VALUES (?, ?, ?, NULL, ?, ?, 'valid', ?, ?)`
-  );
-}
-function deletePendingAboveCutoff(db, producer) {
-  const cutoff = revokedCutoffs(db).get(producer) ?? 0;
-  db.prepare(
-    "DELETE FROM pending_changes WHERE device_id = ? AND local_seq > ?"
-  ).run(producer, cutoff);
-}
-function clearRevokedPeerState(db, deviceId) {
-  db.prepare(
-    `UPDATE peers SET last_endpoint_host = NULL, last_endpoint_port = NULL,
-            last_endpoint_seen = NULL
-     WHERE device_id = ?`
-  ).run(deviceId);
-  db.prepare("DELETE FROM hard_blocks WHERE producer_device_id = ?").run(deviceId);
-  db.prepare("DELETE FROM peer_invalid_tally WHERE producer_device_id = ?").run(deviceId);
-}
-function makeDbRevocationChannel(db, opts) {
-  const log = opts.log ?? defaultLog;
-  const lookup = dbTrustLookup(db, {
-    deviceId: opts.selfDeviceId,
-    publicKey: opts.selfPublicKey
-  });
-  const findStored = db.prepare(
-    `SELECT signature FROM revocation_records
-     WHERE revoked_device_id = ? AND revoked_by_device_id = ? AND revoked_at_hlc = ?
-       AND verification_state = 'valid'`
-  );
-  return {
-    queueFor(peer) {
-      const rows = db.prepare(
-        `SELECT r.record_bytes, r.signature FROM revocation_records r
-           WHERE r.verification_state = 'valid'
-             AND r.revoked_device_id != ?
-             AND NOT EXISTS (
-               SELECT 1 FROM revocation_acks a
-               WHERE a.peer_device_id = ?
-                 AND a.revoked_device_id = r.revoked_device_id
-                 AND a.revoked_by_device_id = r.revoked_by_device_id
-                 AND a.revoked_at_hlc = r.revoked_at_hlc)
-           ORDER BY r.received_at_hlc`
-      ).all(peer, peer);
-      const out = [];
-      for (const r of rows) {
-        const s = rowToSigned(r);
-        if (s !== void 0) out.push(s);
-      }
-      return out;
-    },
-    async acceptInbound(signed, fromPeer) {
-      const from = shortDeviceId(fromPeer);
-      let record;
-      try {
-        record = validateRevocationRecord(signed.record);
-      } catch {
-        log(`revocation: rejected record (malformed) from ${from}`);
-        return false;
-      }
-      const existing = findStored.get(
-        record.revoked_device_id,
-        record.revoked_by_device_id,
-        record.revoked_at_hlc
-      );
-      if (existing !== void 0) {
-        if (bytesEqual(new Uint8Array(existing.signature), signed.signature)) {
-          return false;
-        }
-        log(`revocation: rejected record (conflicting_triple) from ${from}`);
-        return false;
-      }
-      const verdict = await verifyRevocation({ record, signature: signed.signature }, lookup);
-      if (!verdict.valid) {
-        log(`revocation: rejected record (${verdict.reason}) from ${from}`);
-        return false;
-      }
-      let flipped = false;
-      const stored = db.transaction(() => {
-        const revoker = lookup(record.revoked_by_device_id);
-        if (revoker === void 0 || revoker.status !== "trusted") return "untrusted";
-        const dup = findStored.get(
-          record.revoked_device_id,
-          record.revoked_by_device_id,
-          record.revoked_at_hlc
-        );
-        if (dup !== void 0) return "duplicate";
-        insertRecordStmt(db).run(
-          record.revoked_device_id,
-          record.revoked_by_device_id,
-          record.revoked_at_hlc,
-          Buffer.from(canonicalRevocationBytes(record)),
-          Buffer.from(signed.signature),
-          opts.hlcNow(),
-          record.revoked_after_seq ?? null
-        );
-        const res = db.prepare(
-          "UPDATE peers SET status = 'revoked' WHERE device_id = ? AND status = 'trusted'"
-        ).run(record.revoked_device_id);
-        flipped = res.changes > 0;
-        clearRevokedPeerState(db, record.revoked_device_id);
-        deletePendingAboveCutoff(db, record.revoked_device_id);
-        return "stored";
-      })();
-      if (stored === "duplicate") return false;
-      if (stored === "untrusted") {
-        log(`revocation: rejected record (revoker_not_trusted) from ${from}`);
-        return false;
-      }
-      log(
-        `revocation: accepted record for ${shortDeviceId(record.revoked_device_id)} from ${from}`
-      );
-      if (flipped) {
-        try {
-          opts.onPeerRevoked?.(record.revoked_device_id);
-        } catch {
-        }
-      }
-      return true;
-    },
-    acceptedTriples() {
-      return db.prepare(
-        `SELECT revoked_device_id, revoked_at_hlc, revoked_by_device_id
-             FROM revocation_records WHERE verification_state = 'valid'`
-      ).all().map((t) => ({
-        revoked_device_id: t.revoked_device_id,
-        revoked_at_hlc: t.revoked_at_hlc,
-        revoked_by_device_id: t.revoked_by_device_id
-      }));
-    },
-    recordAck(fromPeer, triples) {
-      if (!Array.isArray(triples)) return;
-      const ins = db.prepare(
-        `INSERT OR IGNORE INTO revocation_acks
-           (peer_device_id, revoked_device_id, revoked_by_device_id, revoked_at_hlc, acked_at)
-         SELECT ?, revoked_device_id, revoked_by_device_id, revoked_at_hlc, ?
-         FROM revocation_records
-         WHERE revoked_device_id = ? AND revoked_by_device_id = ? AND revoked_at_hlc = ?
-           AND verification_state = 'valid'`
-      );
-      const now = Date.now();
-      db.transaction(() => {
-        for (const t of triples) {
-          if (t === null || typeof t !== "object" || typeof t.revoked_device_id !== "string" || typeof t.revoked_by_device_id !== "string" || typeof t.revoked_at_hlc !== "number") {
-            continue;
-          }
-          ins.run(fromPeer, now, t.revoked_device_id, t.revoked_by_device_id, t.revoked_at_hlc);
-        }
-      })();
-    },
-    revokedCutoffs() {
-      return revokedCutoffs(db);
-    }
-  };
-}
-var UnpairError = class extends Error {
-  constructor(code, message) {
-    super(`${code}: ${message}`);
-    this.code = code;
-    this.name = "UnpairError";
-  }
-  code;
-};
-async function unpairLocal(db, opts) {
-  const statusOf = db.prepare("SELECT status FROM peers WHERE device_id = ?");
-  const cutoffOf = db.prepare(
-    "SELECT applied_through FROM applied_upto WHERE producer_device_id = ?"
-  );
-  const readCutoff = () => cutoffOf.get(opts.deviceId)?.applied_through ?? 0;
-  if (opts.deviceId === opts.selfDeviceId) {
-    throw new UnpairError("ERR_NOT_PAIRED", "this device cannot unpair itself");
-  }
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const pre = statusOf.get(opts.deviceId);
-    if (pre === void 0) throw new UnpairError("ERR_NOT_PAIRED", "device is not paired");
-    if (pre.status === "revoked") return { already: true };
-    const hlc = opts.hlcNow();
-    const cutoff = readCutoff();
-    const signed = await createRevocation(
-      {
-        revoked_device_id: opts.deviceId,
-        revoked_by_device_id: opts.selfDeviceId,
-        revoked_at_hlc: hlc,
-        revoked_after_seq: cutoff
-      },
-      opts.privateKey
-    );
-    const result = db.transaction(() => {
-      const row = statusOf.get(opts.deviceId);
-      if (row === void 0) throw new UnpairError("ERR_NOT_PAIRED", "device is not paired");
-      if (row.status === "revoked") return { already: true };
-      if (readCutoff() !== cutoff) return "retry";
-      db.prepare("UPDATE peers SET status = 'revoked' WHERE device_id = ?").run(opts.deviceId);
-      insertRecordStmt(db).run(
-        signed.record.revoked_device_id,
-        signed.record.revoked_by_device_id,
-        signed.record.revoked_at_hlc,
-        Buffer.from(canonicalRevocationBytes(signed.record)),
-        Buffer.from(signed.signature),
-        hlc,
-        cutoff
-      );
-      clearRevokedPeerState(db, opts.deviceId);
-      db.prepare(
-        "DELETE FROM pending_changes WHERE device_id = ? AND local_seq > ?"
-      ).run(opts.deviceId, cutoff);
-      opts.beforeCommit?.();
-      return { already: false, triple: recordTriple(signed.record), cutoff };
-    })();
-    if (result !== "retry") return result;
-  }
-  throw new UnpairError("ERR_BUSY", "the device is still syncing; try again");
-}
-function listRemovedDevices(db, selfDeviceId) {
-  const revoked = db.prepare(
-    "SELECT device_id, display_name, announced_name FROM peers WHERE status = 'revoked' ORDER BY device_id"
-  ).all();
-  const trusted = db.prepare(
-    "SELECT device_id, display_name, announced_name FROM peers WHERE status = 'trusted' ORDER BY paired_at, device_id"
-  ).all();
-  const removedLabels = deviceNameViews(revoked, selfDeviceId);
-  const toldLabels = new Map(
-    deviceNameViews(trusted, selfDeviceId).map((v) => [v.device_id, v.label])
-  );
-  const removedAt = db.prepare(
-    `SELECT COALESCE(
-        (SELECT MIN(revoked_at_hlc) FROM revocation_records
-          WHERE revoked_device_id = @d AND revoked_by_device_id = @self
-            AND verification_state = 'valid'),
-        (SELECT MIN(received_at_hlc) FROM revocation_records
-          WHERE revoked_device_id = @d AND verification_state = 'valid')) AS t`
-  );
-  const acked = db.prepare(
-    `SELECT 1 FROM revocation_acks a JOIN revocation_records r
-       ON r.revoked_device_id = a.revoked_device_id
-      AND r.revoked_by_device_id = a.revoked_by_device_id
-      AND r.revoked_at_hlc = a.revoked_at_hlc
-     WHERE a.peer_device_id = ? AND r.revoked_device_id = ? LIMIT 1`
-  );
-  return revoked.map((p, i) => ({
-    device_id: p.device_id,
-    label: removedLabels[i].label,
-    removed_at: removedAt.get({ d: p.device_id, self: selfDeviceId })?.t ?? 0,
-    told: trusted.filter((t) => t.device_id !== p.device_id).map((t) => ({
-      device_id: t.device_id,
-      label: toldLabels.get(t.device_id),
-      done: acked.get(t.device_id, p.device_id) !== void 0
-    }))
-  }));
-}
-
 // src/network/pairing_manager.ts
 var REVOKED_REPAIR_MESSAGE = "This device was unpaired earlier. To pair it again, start it fresh first.";
 var PairingRefusedError = class extends Error {
@@ -8218,12 +8528,12 @@ function localRowMatchesEntry(db, entry) {
     const b = parsed;
     return a["title"] === b["title"] && a["color"] === b["color"];
   }
-  return canonicalJson(row) === canonicalJson(parsed);
+  return canonicalJson2(row) === canonicalJson2(parsed);
 }
-function canonicalJson(value) {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+function canonicalJson2(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson2).join(",")}]`;
   if (typeof value === "object" && value !== null) {
-    const entries = Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`);
+    const entries = Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson2(v)}`);
     return `{${entries.join(",")}}`;
   }
   return JSON.stringify(value);
@@ -8349,8 +8659,8 @@ var SnapshotStream = class {
       this.discard();
       return "declined";
     }
-    const clockKey = canonicalJson(snapshot.snapshot_clock);
-    const declaredKey = snapshot.applied_upto === void 0 ? "" : canonicalJson(snapshot.applied_upto);
+    const clockKey = canonicalJson2(snapshot.snapshot_clock);
+    const declaredKey = snapshot.applied_upto === void 0 ? "" : canonicalJson2(snapshot.applied_upto);
     if (this.head === void 0) {
       this.head = {
         clockKey,
@@ -8765,6 +9075,7 @@ var PeerClosedBeforeHelloError = class extends Error {
   }
 };
 var helloClockAnomalyCount = 0;
+var HELD_SESSIONS_BEFORE_NOTICE = 3;
 function createSyncEngine(deps) {
   const knowledge = deps.knowledge ?? loadKnowledgeFromDb2(deps.db);
   revalidateQuarantine(deps.db, deps.mutateEntity, knowledge);
@@ -8872,7 +9183,24 @@ function createSyncEngine(deps) {
       holder.knowledge.appliedUpto[deps.selfDeviceId] = frontier;
     }
   }
+  const sessionHeld = /* @__PURE__ */ new Map();
+  const heldKey = (r) => `${r.device_id}#${r.local_seq}`;
+  function noteHeldAtSessionEnd() {
+    gcHeldChanges(deps.db);
+    for (const record of sessionHeld.values()) {
+      const n = bumpHeldSessions(deps.db, record.device_id, record.local_seq);
+      if (n >= HELD_SESSIONS_BEFORE_NOTICE) {
+        recordWaitingNotice(
+          deps.db,
+          record,
+          missingPrerequisiteOrigin(deps.db, record) ?? record.device_id
+        );
+      }
+    }
+    sessionHeld.clear();
+  }
   async function runSession(transport) {
+    sessionHeld.clear();
     const stats = {
       sent: 0,
       receivedApplied: 0,
@@ -8893,6 +9221,7 @@ function createSyncEngine(deps) {
       return stats;
     } finally {
       dropSnapshotStream();
+      noteHeldAtSessionEnd();
     }
   }
   async function runSessionInner(transport, stats) {
@@ -8928,11 +9257,15 @@ function createSyncEngine(deps) {
       stats.sent++;
       const batch = await expectBatchOrPeerRequest(nextMessage(transport), transport, stats);
       if (batch === null) break;
+      const notYetBefore = stats.receivedNotApplicableYet ?? 0;
       applyBatch(batch.changes, stats);
       const before = JSON.stringify(ranges);
       ranges = clampRevoked(
         batch.remaining_ranges ?? neededRanges(holder.knowledge, peerHello.device_clock, deps.selfDeviceId)
       );
+      if (JSON.stringify(ranges) === before && (stats.receivedNotApplicableYet ?? 0) > notYetBefore) {
+        break;
+      }
       if (JSON.stringify(ranges) === before) {
         gapRetries++;
         triggers.recordGapRound(peerKey);
@@ -8941,7 +9274,7 @@ function createSyncEngine(deps) {
         triggers.resetStreak(peerKey);
       }
     }
-    if (gapRetries > 0 && triggers.shouldOfferTriggerA(peerKey)) {
+    if (deps.snapshots === true && gapRetries > 0 && triggers.shouldOfferTriggerA(peerKey)) {
       const key = offerSessionKey(deps.selfDeviceId, peerKey, "OUTGOING");
       if (sessionDedup.shouldOffer(key, "GAP_ROUNDS")) {
         sessionDedup.markOffered(key);
@@ -9215,6 +9548,11 @@ function createSyncEngine(deps) {
   }
   function applyIncomingSnapshot(msg, stats) {
     assertPeerNotRevoked();
+    if (deps.snapshots !== true) {
+      stats.snapshotsDeclined = (stats.snapshotsDeclined ?? 0) + 1;
+      console.warn("[tide][sync] full-state snapshot message dropped: snapshots are off in this version");
+      return;
+    }
     if (snapshotStreamDeclined) {
       stats.snapshotsDeclined = (stats.snapshotsDeclined ?? 0) + 1;
       if (msg.final) snapshotStreamDeclined = false;
@@ -9290,6 +9628,10 @@ function createSyncEngine(deps) {
     }
   }
   async function handleIncomingOffer(offer, getNext, transport, stats) {
+    if (deps.snapshots !== true) {
+      stats.snapshotsDeclined = (stats.snapshotsDeclined ?? 0) + 1;
+      return;
+    }
     if (offer.reason === "GAP_ROUNDS") {
       const key = offerSessionKey(deps.selfDeviceId, offer.sender_device_id ?? "", "OUTGOING");
       if (sessionDedup.shouldOffer(key, "GAP_ROUNDS")) {
@@ -9388,7 +9730,7 @@ function createSyncEngine(deps) {
         record = validateChangeRecord(raw);
       } catch (e) {
         quarantineRecord(deps.db, {
-          reason: "invalid_change_record:" + (e instanceof Error ? e.message.slice(0, 120) : String(e).slice(0, 120)),
+          reason: INVALID_RECORD_REASON_PREFIX + (e instanceof Error ? e.message.slice(0, 120) : String(e).slice(0, 120)),
           senderDeviceId: deps.selfDeviceId,
           rawRecord: raw
         });
@@ -9409,15 +9751,40 @@ function createSyncEngine(deps) {
         appendInvalidTally(deps.db, producer);
         continue;
       }
-      const outcome = applyRemoteChange(
+      const outcome = applyRemoteChangeDetailed(
         deps.db,
         record,
         holder.knowledge,
         deps.mutateEntity
       );
+      if (outcome === "applied" || outcome === "target_gone" || outcome === "quarantined") {
+        sessionHeld.delete(heldKey(record));
+      }
       if (outcome === "applied") stats.receivedApplied++;
       else if (outcome === "buffered") stats.receivedBuffered++;
-      else stats.receivedDuplicate++;
+      else if (outcome === "quarantined") {
+        stats.receivedQuarantined++;
+        console.warn(
+          `[tide][sync] change ${record.device_id}#${record.local_seq} (${record.entity_type} ${record.entity_id}) quarantined: a change it depends on was quarantined here`
+        );
+      } else if (outcome === "target_gone") {
+        stats.receivedTargetGone = (stats.receivedTargetGone ?? 0) + 1;
+        console.warn(
+          `[tide][sync] change ${record.device_id}#${record.local_seq} (${record.entity_type} ${record.entity_id} ${record.field_path}) counted as done: its target no longer exists here`
+        );
+      } else if (outcome === "duplicate_different_content") {
+        stats.receivedDuplicate++;
+        stats.receivedDuplicateDifferentContent = (stats.receivedDuplicateDifferentContent ?? 0) + 1;
+        console.warn(
+          `[tide][sync] WARNING: change ${record.device_id}#${record.local_seq} arrived again with DIFFERENT content than the stored copy; stored copy kept, incoming copy recorded in the quarantine list`
+        );
+      } else if (outcome === "not_applicable") {
+        stats.receivedNotApplicableYet = (stats.receivedNotApplicableYet ?? 0) + 1;
+        sessionHeld.set(heldKey(record), record);
+        console.warn(
+          `[tide][sync] change ${record.device_id}#${record.local_seq} (${record.entity_type} ${record.entity_id} ${record.field_path}) not applicable yet: a change it depends on has not arrived; read position held`
+        );
+      } else stats.receivedDuplicate++;
       misbehavior.recordOk(producer);
     }
   }
@@ -9496,12 +9863,18 @@ function loadKnowledgeFromDb2(db) {
   }
   return k;
 }
-function revalidateOneQuarantineRaw(db, rawRecord, mutate, knowledge) {
+function revalidateOneQuarantineRaw(db, rawRecord, mutate, knowledge, reason) {
   let record;
   try {
     record = validateChangeRecord(JSON.parse(rawRecord));
   } catch {
     return { outcome: "invalid" };
+  }
+  if (reason === DEPENDS_ON_QUARANTINED_REASON && appliedFrontierOf(db, record.device_id) >= record.local_seq) {
+    const r = reapplyQuarantinedInPlace(db, record, mutate);
+    if (r === "applied") return { outcome: "applied" };
+    if (r === "duplicate") return { outcome: "duplicate" };
+    return { outcome: "failed" };
   }
   try {
     let outcome;
@@ -9510,11 +9883,19 @@ function revalidateOneQuarantineRaw(db, rawRecord, mutate, knowledge) {
         "DELETE FROM skipped_seqs WHERE producer_device_id = ? AND local_seq = ?"
       ).run(record.device_id, record.local_seq);
       const k = knowledge ?? loadKnowledgeFromDb2(db);
-      const res = applyRemoteChange(db, record, k, mutate);
+      const res = applyRemoteChangeDetailed(db, record, k, mutate);
       outcome = res;
     })();
-    if (outcome === "applied") return { outcome: "applied" };
+    if (outcome === "applied" || outcome === "target_gone") {
+      return { outcome: "applied" };
+    }
     if (outcome === "buffered") return { outcome: "buffered" };
+    if (outcome === "not_applicable" || outcome === "quarantined") {
+      if (reason !== WAITING_ON_CHANGE_REASON) {
+        markSeqSkipped(db, record.device_id, record.local_seq);
+      }
+      return { outcome: "failed" };
+    }
     return { outcome: "duplicate" };
   } catch {
     markSeqSkipped(db, record.device_id, record.local_seq);
@@ -9523,21 +9904,40 @@ function revalidateOneQuarantineRaw(db, rawRecord, mutate, knowledge) {
 }
 function retryQuarantineRecord(db, quarantineId, mutate) {
   const row = db.prepare(
-    "SELECT raw_record, resolved_at_hlc FROM quarantine WHERE quarantine_id = ?"
+    "SELECT raw_record, resolved_at_hlc, quarantine_reason FROM quarantine WHERE quarantine_id = ?"
   ).get(quarantineId);
   if (!row) return { outcome: "not_found", resolved: false };
   if (row.resolved_at_hlc !== null) {
     return { outcome: "already_resolved", resolved: false };
   }
-  const res = revalidateOneQuarantineRaw(db, row.raw_record, mutate);
+  if (row.quarantine_reason === DUPLICATE_DIFFERENT_CONTENT_REASON) {
+    return { outcome: "failed", resolved: false };
+  }
+  const res = revalidateOneQuarantineRaw(
+    db,
+    row.raw_record,
+    mutate,
+    void 0,
+    row.quarantine_reason
+  );
   if (res.outcome === "invalid" || res.outcome === "failed") {
     return { outcome: res.outcome, resolved: false };
   }
   const resolved = markQuarantineResolved(db, quarantineId, "retried_by_user");
   return { outcome: res.outcome, resolved };
 }
+var INVALID_RECORD_REASON_PREFIX = "invalid_change_record:";
 function revalidateQuarantine(db, mutate, knowledge) {
-  const rows = db.prepare("SELECT raw_record FROM quarantine ORDER BY quarantine_id").all();
+  const rows = db.prepare(
+    `SELECT raw_record, quarantine_reason FROM quarantine
+       WHERE resolved_at_hlc IS NULL
+         AND (quarantine_reason = ? OR substr(quarantine_reason, 1, ?) = ?)
+       ORDER BY quarantine_id`
+  ).all(
+    DEPENDS_ON_QUARANTINED_REASON,
+    INVALID_RECORD_REASON_PREFIX.length,
+    INVALID_RECORD_REASON_PREFIX
+  );
   const result = {
     examined: 0,
     revalidated: 0,
@@ -9545,7 +9945,13 @@ function revalidateQuarantine(db, mutate, knowledge) {
   };
   for (const row of rows) {
     result.examined++;
-    const res = revalidateOneQuarantineRaw(db, row.raw_record, mutate, knowledge);
+    const res = revalidateOneQuarantineRaw(
+      db,
+      row.raw_record,
+      mutate,
+      knowledge,
+      row.quarantine_reason
+    );
     if (res.outcome === "applied") result.revalidated++;
     else if (res.outcome === "invalid" || res.outcome === "failed") {
       result.stillInvalid++;
@@ -9568,15 +9974,102 @@ function existingText(db, eventId, col) {
 function eventRowExists(db, eventId) {
   return !!db.prepare(`SELECT 1 FROM events WHERE event_id = ?`).get(eventId);
 }
+var ABSENT = "target_absent";
+var OVERRIDE_FIELD_SET = new Set(OVERRIDE_FIELDS);
+function seriesRowExists(db, seriesId) {
+  return !!db.prepare("SELECT 1 FROM series WHERE series_id = ?").get(seriesId);
+}
+function applySeries(db, record) {
+  const id = record.entity_id;
+  if (record.operation === "remove") {
+    if (seriesRowExists(db, id)) {
+      db.prepare("DELETE FROM occurrence_overrides WHERE series_id = ?").run(id);
+      db.prepare("DELETE FROM series WHERE series_id = ?").run(id);
+      return;
+    }
+    return ABSENT;
+  }
+  if (record.field_path !== "recurrence_rule") return;
+  const p = record.payload;
+  if (typeof p.value !== "string") return;
+  if (typeof p.base_event_id === "string") {
+    if (seriesRowExists(db, id)) return;
+    if (!eventRowExists(db, p.base_event_id)) {
+      return ABSENT;
+    }
+    if (db.prepare("SELECT 1 FROM series WHERE base_event_id = ?").get(p.base_event_id)) return;
+    db.prepare(
+      `INSERT INTO series (series_id, base_event_id, recurrence_rule, created_hlc, updated_hlc)
+       VALUES (?, ?, ?, ?, ?)`
+    ).run(id, p.base_event_id, p.value, record.hlc_timestamp, record.hlc_timestamp);
+    return;
+  }
+  if (!seriesRowExists(db, id)) return ABSENT;
+  db.prepare("UPDATE series SET recurrence_rule = ?, updated_hlc = ? WHERE series_id = ?").run(
+    p.value,
+    record.hlc_timestamp,
+    id
+  );
+}
+function applyOverride(db, record) {
+  const m = /^overrides\.([^.]+)\.([a-z_]+)$/.exec(record.field_path);
+  if (!m || record.operation !== "set") return;
+  const [, rid, field] = m;
+  if (!OVERRIDE_FIELD_SET.has(field)) return;
+  const seriesId = record.entity_id;
+  if (!seriesRowExists(db, seriesId)) return ABSENT;
+  const value = record.payload.value;
+  const col = field === "cancelled" ? value === true ? 1 : value === false ? 0 : null : value;
+  if (col === null && field === "cancelled") return;
+  if (field !== "cancelled" && typeof col !== "string") return;
+  db.prepare(
+    `INSERT INTO occurrence_overrides (series_id, recurrence_id, updated_hlc)
+     VALUES (?, ?, ?) ON CONFLICT(series_id, recurrence_id) DO NOTHING`
+  ).run(seriesId, rid, record.hlc_timestamp);
+  db.prepare(
+    `UPDATE occurrence_overrides SET ${field} = ?, updated_hlc = ?
+     WHERE series_id = ? AND recurrence_id = ?`
+  ).run(col, record.hlc_timestamp, seriesId, rid);
+}
+function applyCalendar(db, record) {
+  if (record.operation !== "set") return;
+  if (record.field_path !== "title" && record.field_path !== "color") return;
+  const value = record.payload.value;
+  if (typeof value !== "string" && !(record.field_path === "color" && value === null)) return;
+  const id = record.entity_id;
+  const exists = !!db.prepare("SELECT 1 FROM calendars WHERE calendar_id = ?").get(id);
+  if (exists) {
+    db.prepare(`UPDATE calendars SET ${record.field_path} = ?, updated_hlc = ? WHERE calendar_id = ?`).run(
+      value,
+      record.hlc_timestamp,
+      id
+    );
+    return;
+  }
+  if (record.field_path !== "title") return ABSENT;
+  const pre = prerequisiteState(db, record, { rejectionIgnoresOwnOrigin: true });
+  if (pre.missingOrigin !== null || pre.rejectedPrerequisite) return ABSENT;
+  db.prepare(
+    `INSERT INTO calendars (calendar_id, title, color, created_hlc, updated_hlc)
+     VALUES (?, ?, NULL, ?, ?) ON CONFLICT(calendar_id) DO NOTHING`
+  ).run(id, value, record.hlc_timestamp, record.hlc_timestamp);
+}
 function makeEntityMutator() {
   return (db, record) => {
+    if (record.entity_type === "series") return applySeries(db, record);
+    if (record.entity_type === "occurrence_override") return applyOverride(db, record);
+    if (record.entity_type === "calendar") return applyCalendar(db, record);
     if (record.entity_type !== "event") return;
+    const absent = () => ABSENT;
     if (record.operation === "remove") {
-      db.prepare("DELETE FROM events WHERE event_id = ?").run(record.entity_id);
+      if (!eventRowExists(db, record.entity_id)) return absent();
+      const series = db.prepare("SELECT series_id FROM series WHERE base_event_id = ?").get(record.entity_id);
+      deleteEventRows(db, record.entity_id, series?.series_id);
       return;
     }
     if (record.field_path === "title") {
       if (typeof record.payload.value !== "string") return;
+      if (!eventRowExists(db, record.entity_id)) return absent();
       db.prepare(
         "UPDATE events SET title = ?, updated_hlc = ? WHERE event_id = ?"
       ).run(record.payload.value, record.hlc_timestamp, record.entity_id);
@@ -9584,6 +10077,7 @@ function makeEntityMutator() {
     }
     if (record.field_path === "description") {
       if (typeof record.payload.value !== "string") return;
+      if (!eventRowExists(db, record.entity_id)) return absent();
       db.prepare(
         "UPDATE events SET description = ?, updated_hlc = ? WHERE event_id = ?"
       ).run(record.payload.value, record.hlc_timestamp, record.entity_id);
@@ -9593,7 +10087,7 @@ function makeEntityMutator() {
       const v2 = record.payload.value;
       if (!v2 || typeof v2.startMs !== "number" || typeof v2.endMs !== "number")
         return;
-      if (!eventRowExists(db, record.entity_id)) return;
+      if (!eventRowExists(db, record.entity_id)) return absent();
       insertEventRow(
         db,
         {
@@ -9617,6 +10111,9 @@ function makeEntityMutator() {
       return;
     }
     const allDay = v.allDay === true;
+    if (!db.prepare("SELECT 1 FROM calendars WHERE calendar_id = ?").get(DEFAULT_CALENDAR_ID)) {
+      return ABSENT;
+    }
     insertEventRow(
       db,
       {
@@ -11820,6 +12317,16 @@ function makeSyncDispatcher(sync, core, endpoints) {
         pruneResolvedQuarantine(core.db);
         return result;
       }
+      // Dismiss a duplicate-content warning: hides the warning row only.
+      // Never skips a change (no skipped_seqs row, no change state touched).
+      case "dismiss_quarantine_warning": {
+        if (typeof args.quarantine_id !== "number" || !Number.isInteger(args.quarantine_id)) {
+          throw new Error("quarantine_id required");
+        }
+        const result = dismissQuarantineWarning(core.db, args.quarantine_id);
+        pruneResolvedQuarantine(core.db);
+        return result;
+      }
       // --- TD-006 / DC-16 §4: peer misbehavior visibility + recovery ------
       // Read-only per-peer state (Sync-Errors badge section + Paired Devices).
       case "peer_state": {
@@ -11942,7 +12449,7 @@ function main() {
     }
     schedulerHandle.updateSchedulerSettings(partial);
     return { applied: true, next_start_only: "max_incremental_backlog" };
-  })() : op.startsWith("sync_") || op === "device_info" || op === "pairing_offer" || op === "pairing_accept" || op === "cancel_pairing_offer" || op === "pairing_offer_status" || op === "list_quarantine" || op === "quarantine_stats" || op === "retry_quarantine" || op === "delete_quarantine" || op === "peer_state" || op === "list_paired_devices" || op === "reset_peer_state" || op === "unblock_peer" || op === "unpair_device" || op === "list_removed_devices" || // DC-28: own name (shell-only) + local nickname
+  })() : op.startsWith("sync_") || op === "device_info" || op === "pairing_offer" || op === "pairing_accept" || op === "cancel_pairing_offer" || op === "pairing_offer_status" || op === "list_quarantine" || op === "quarantine_stats" || op === "retry_quarantine" || op === "delete_quarantine" || op === "dismiss_quarantine_warning" || op === "peer_state" || op === "list_paired_devices" || op === "reset_peer_state" || op === "unblock_peer" || op === "unpair_device" || op === "list_removed_devices" || // DC-28: own name (shell-only) + local nickname
   op === "set_device_name" || op === "set_peer_nickname" ? syncDispatch(op, args) : dispatch(op, args);
   const pairedDeviceIds = () => listTrustedPeers(core.db).map((p) => p.device_id);
   const expectedPrefixes = () => {

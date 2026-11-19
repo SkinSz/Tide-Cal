@@ -40,7 +40,7 @@ export interface ChangeRecord {
 }
 
 export type ChangePayload =
-  | { value: unknown }
+  | { value: unknown; base_event_id?: string } // series create carries its base event
   | { member_id: string; value?: unknown }
   | Record<string, never>; // remove: {}
 

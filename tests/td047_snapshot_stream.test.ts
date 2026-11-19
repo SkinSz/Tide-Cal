@@ -80,6 +80,7 @@ function engineOf(d: Device, peerId: string) {
     selfDeviceId: d.identity.deviceId,
     mutateEntity: makeEntityMutator(),
     peerDeviceId: peerId,
+    snapshots: true,
   });
 }
 
