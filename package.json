@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
+    "dev": "bash scripts/dev.sh",
     "ui:dev": "vite --config vite.ui.config.ts",
     "ui:build": "vite build --config vite.ui.config.ts",
     "test": "vitest run",
