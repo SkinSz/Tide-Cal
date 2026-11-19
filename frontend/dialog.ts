@@ -335,9 +335,33 @@ function occurrenceScope(): boolean {
   );
 }
 
+/** Reminders held by the event being edited (0 for a new event); drives the notice. */
+let reminderCount = 0;
+
+/**
+ * Shown whenever the event holds more than one reminder and the reminder
+ * option is offered (not whole-day), so it is on screen before any save that
+ * removes reminders. "Remind me" ticked: saving keeps the shown one and
+ * removes the others. Unticked: saving removes all of them.
+ */
+function syncReminderNote(): void {
+  const note = field<HTMLParagraphElement>("ev-remind-note");
+  if (reminderCount > 1 && !wholeDay()) {
+    note.textContent = field<HTMLInputElement>("ev-remind-on").checked
+      ? `This event has ${reminderCount} reminders. Saving keeps only this one.`
+      : `Saving removes all ${reminderCount} reminders.`;
+    note.hidden = false;
+  } else {
+    note.hidden = true;
+  }
+}
+
 function syncTimeVisibility(): void {
   const row = field<HTMLDivElement>("ev-time-row");
   row.style.display = wholeDay() ? "none" : "";
+  // Reminders are not offered for whole-day events (they would never fire).
+  field<HTMLLabelElement>("ev-remind-row").style.display = wholeDay() ? "none" : "";
+  syncReminderNote();
   syncAmPmToggles();
 }
 
@@ -540,6 +564,8 @@ function openFor(date: Date, existing?: CalendarEvent): void {
   // Save writes whatever the checkbox shows at click time).
   field<HTMLInputElement>("ev-remind-on").checked = false;
   field<HTMLSelectElement>("ev-remind-minutes").value = "15";
+  reminderCount = 0;
+  syncReminderNote();
   if (existing) {
     void getReminder(existing.id)
       .then((rem) => {
@@ -547,6 +573,10 @@ function openFor(date: Date, existing?: CalendarEvent): void {
           field<HTMLInputElement>("ev-remind-on").checked = true;
           field<HTMLSelectElement>("ev-remind-minutes").value = String(rem.minutesBefore);
         }
+        // Several reminders (added on different devices): the dialog shows the
+        // first by a fixed rule (same on every device) and says so before saving.
+        reminderCount = rem?.count ?? (rem ? 1 : 0);
+        syncReminderNote();
       })
       .catch((e) => console.warn("[tide] reminder lookup unavailable:", e));
   }
@@ -633,6 +663,7 @@ export function initDialog(): void {
   });
 
   field("ev-allday").addEventListener("change", syncTimeVisibility);
+  field("ev-remind-on").addEventListener("change", syncReminderNote);
 
   // DC-12 rule builder: freq select, interval, weekday toggles.
   field("ev-repeat").addEventListener("change", syncRepeatVisibility);
@@ -869,14 +900,18 @@ export function initDialog(): void {
               await updateSeriesRule(currentSeries.seriesId, rule);
             }
           }
-          // DC-22: reminder member follows the checkbox (update path).
-          if (field<HTMLInputElement>("ev-remind-on").checked) {
-            await setReminder(
-              id,
-              Number(field<HTMLSelectElement>("ev-remind-minutes").value),
-            );
-          } else {
-            await clearReminder(id);
+          // DC-22: reminder member follows the checkbox (update path). The option
+          // is hidden for whole-day events; saving one leaves any existing
+          // reminder untouched and writes no reminder change.
+          if (!wholeDay()) {
+            if (field<HTMLInputElement>("ev-remind-on").checked) {
+              await setReminder(
+                id,
+                Number(field<HTMLSelectElement>("ev-remind-minutes").value),
+              );
+            } else {
+              await clearReminder(id);
+            }
           }
         } else {
           // New event: optional create-time RRULE makes it a series (DC-12 §2.1).
@@ -885,7 +920,7 @@ export function initDialog(): void {
             rule ? { ...input, recurrenceRule: rule } : input,
           );
           // DC-22: reminder member follows the checkbox (create path).
-          if (field<HTMLInputElement>("ev-remind-on").checked) {
+          if (!wholeDay() && field<HTMLInputElement>("ev-remind-on").checked) {
             await setReminder(
               saved.id,
               Number(field<HTMLSelectElement>("ev-remind-minutes").value),

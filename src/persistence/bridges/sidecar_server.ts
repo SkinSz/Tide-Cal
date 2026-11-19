@@ -63,11 +63,9 @@ import {
   startSchedulerRuntime,
   makeSessionOpener,
 } from "../../application/scheduler_runtime.ts";
-import {
-  rebuildSchedule,
-  filterDelivered,
-  markDelivered,
-} from "../../application/reminder_engine.ts";
+import { replayReminderHistory } from "../reminder_replay.ts";
+import { markDelivered } from "../../application/reminder_engine.ts";
+import { computeDueReminders, formatTickProblem } from "../../application/reminder_tick.ts";
 import { deliverNotification } from "../../application/notification_delivery.ts";
 // Smoke-test fix (2026-09-03): reminders on series events fired against the
 // BASE row's stored instant only — a reminder set on any occurrence chip
@@ -76,7 +74,6 @@ import { deliverNotification } from "../../application/notification_delivery.ts"
 // the engine one synthetic event row PER OCCURRENCE in the reminder window
 // (id `<base>#<recurrence_id>`), so per-occurrence reminders work without
 // touching the replicated reminder member (still one per event, DC-22 D5).
-import { expandOccurrences } from "../../domain/recurrence_conflicts.ts";
 import {
   deviceNameViews,
   validateName,
@@ -84,17 +81,6 @@ import {
   type NameRule,
 } from "../../domain/device_names.ts";
 
-/** Local wall "YYYYMMDDTHHMMSS" -> epoch ms (same math as calendar.ts). */
-function msFromWallId(id: string): number {
-  const digits = id.replace(/\D/g, "");
-  const y = +digits.slice(0, 4);
-  const mo = +digits.slice(4, 6);
-  const dd = +digits.slice(6, 8);
-  const hh = +digits.slice(8, 10) || 0;
-  const mi = +digits.slice(10, 12) || 0;
-  const ss = +digits.slice(12, 14) || 0;
-  return new Date(y, mo - 1, dd, hh, mi, ss, 0).getTime();
-}
 import {
   listQuarantine,
   countQuarantined,
@@ -1024,7 +1010,9 @@ export function makeDispatcher(core: EventCore, sync?: SyncManager): Dispatcher 
       // Replicates as reminder member_add/update/remove (D5).
       case "get_reminder": {
         if (typeof args.event_id !== "string") fail("get_reminder: args.event_id required");
-        return core.reminderFor(args.event_id as string);
+        const rem = core.reminderFor(args.event_id as string);
+        // `count`: how many reminders the event holds (the dialog warns when > 1).
+        return rem === null ? null : { ...rem, count: core.reminderCountFor(args.event_id as string) };
       }
       case "set_reminder": {
         if (typeof args.event_id !== "string") fail("set_reminder: args.event_id required");
@@ -1615,6 +1603,18 @@ function main(): void {
       dbPath.replace(/[/\\][^/\\]+$/, "") ?? ".",
   );
   const core = new EventCore(dbPath, syncIdentity.deviceId);
+  // DC-22 / TD-073: rebuild reminder rows from reminder changes already in
+  // history (idempotent; every start, before the first alarm check).
+  try {
+    const rr = replayReminderHistory(core.db);
+    if (rr.applied > 0 || rr.unresolved > 0) {
+      console.error(
+        `[tide] reminder replay: examined=${rr.examined} applied=${rr.applied} unresolved=${rr.unresolved}`,
+      );
+    }
+  } catch (err) {
+    console.error("[tide] reminder replay failed:", err instanceof Error ? err.message : String(err));
+  }
   const sync = new SyncManager(core, syncIdentity);
   // DC-26 §3.1/§3.2: id-less NDJSON notice on the same stdout channel as RPC
   // responses (one write per line, so lines never interleave). Count only:
@@ -1742,6 +1742,7 @@ function main(): void {
   // failures (§7.1/D11). Delivery is an EPHEMERAL LOCAL SIDE EFFECT (D9) —
   // nothing here ever enters the changelog.
   const deliveredReminderKeys = new Set<string>();
+  const reportedTickProblems = new Set<string>();
   // D1 on-time decision context (owner question 2026-09-04): epoch ms of the
   // previous tick, null until the second tick runs. rebuildSchedule uses it
   // to distinguish "fire moment passed while we were ticking" (on-time) from
@@ -1763,102 +1764,20 @@ function main(): void {
   };
   const reminderTick = (): void => {
     try {
-      // Real events schema: timed events carry utc_start_ms/utc_end_ms (the
-      // authoritative INSTANT — respects tz_id per DC-22 §5.1) plus wall
-      // strings for labels; all-day events carry start_date/end_date
-      // (midnight wall convention, local by definition).
-      const baseEvents = core.db
-        .prepare(
-          `SELECT e.event_id AS entity_id, e.title,
-                  e.utc_start_ms, e.utc_end_ms,
-                  COALESCE(e.start_wall, e.start_date || 'T00:00') AS start_wall,
-                  COALESCE(e.end_wall, e.end_date || 'T23:59')      AS end_wall,
-                  e.all_day, e.all_day_reminder_time
-           FROM events e`
-        )
-        .all() as never[];
-      // Smoke-test fix (2026-09-03): expand each timed series into per-
-      // occurrence synthetic rows so reminders fire for the OCCURRENCE the
-      // reminder is due on — not just the base's first instant. All-day
-      // series keep single-row semantics (D2: day-before fire, day-granular).
-      // Window: 25h back (missed horizon, D1) to 1y forward — deterministic
-      // and comfortably wider than any notify horizon. Overrides (moved/
-      // retitled occurrences) apply via the same chip math the calendar uses.
-      const events: never[] = [];
-      const seriesRows = core.db
-        .prepare(
-          `SELECT s.series_id, s.base_event_id, s.recurrence_rule
-           FROM series s`,
-        )
-        .all() as Array<{
-        series_id: string;
-        base_event_id: string;
-        recurrence_rule: string;
-      }>;
-      const seriesByBase = new Map(seriesRows.map((s) => [s.base_event_id, s]));
-      const now = Date.now();
-      const WIN_LO = `${new Date(now - 25 * 3_600_000).getFullYear()}0101T000000`;
-      for (const ev of baseEvents) {
-        const row = seriesByBase.get((ev as { entity_id: string }).entity_id);
-        const timed =
-          (ev as { all_day: number }).all_day !== 1 &&
-          (ev as { utc_start_ms: number | null }).utc_start_ms != null;
-        if (!row || !timed) {
-          events.push(ev);
-          continue;
-        }
-        let occIds: string[] = [];
-        try {
-          occIds = expandOccurrences(
-            {
-              series_id: row.series_id,
-              base_start_wall: (ev as { start_wall: string }).start_wall,
-              tz_id: "local",
-              recurrence_rule: row.recurrence_rule,
-            },
-            WIN_LO,
-            `${new Date(now).getFullYear() + 1}1231T235959`,
-          );
-        } catch {
-          events.push(ev); // expansion failure → base-row behavior (degraded)
-          continue;
-        }
-        if (occIds.length === 0) {
-          events.push(ev);
-          continue;
-        }
-        const durMs =
-          ((ev as { utc_end_ms: number }).utc_end_ms ?? 0) -
-          (ev as { utc_start_ms: number }).utc_start_ms;
-        for (const occId of occIds) {
-          const startMs = msFromWallId(occId);
-          events.push({
-            ...(ev as Record<string, unknown>),
-            entity_id: `${(ev as { entity_id: string }).entity_id}#${occId}`,
-            utc_start_ms: startMs,
-            utc_end_ms: startMs + Math.max(durMs, 0),
-          } as never);
-        }
-      }
-      const reminders = core.db
-        .prepare(
-          // DC-22 D5: disabled reminders (enabled = 0) are stored but INACTIVE
-          // — the schedule engine never schedules them (NULL/1 = active).
-          // updated_hlc feeds the late-configuration discard (reminder_engine).
-          "SELECT member_id, entity_id, minutes_before, updated_hlc AS updated_hlc_ms FROM reminders WHERE enabled IS NULL OR enabled = 1",
-        )
-        .all() as never[];
-      const schedule = rebuildSchedule(events, reminders, Date.now(), lastTickMs);
+      // The per-tick schedule logic lives in application/reminder_tick.ts
+      // (shared with the tests); dispatch and logging stay here.
       deliveredPrune();
-      // Smoke-test bug (2026-09-04, delegate investigation deleg_25c67eca):
-      // filterDelivered only removes already-delivered keys — FUTURE fires
-      // (fire_at_ms > now) passed straight through and were delivered on the
-      // next 30s tick, then marked delivered, so the reminder NEVER fired at
-      // its actual due time ("set 10min before, nothing at the time"). The
-      // tick must deliver only fires that are DUE NOW; future ones stay in
-      // the schedule and fire on a later tick.
-      const due = filterDelivered(schedule, deliveredReminderKeys).filter(
-        (f) => f.fire_at_ms <= Date.now(),
+      const due = computeDueReminders(
+        core.db,
+        Date.now(),
+        lastTickMs,
+        deliveredReminderKeys,
+        (p) => {
+          // Once per series per process (the tick runs every 30 s); ids only.
+          if (reportedTickProblems.has(p.seriesId)) return;
+          reportedTickProblems.add(p.seriesId);
+          console.error(formatTickProblem(p));
+        },
       );
       for (const fire of due) {
         // pkg10 F1: mark delivered ONLY on confirmed dispatch. A failed

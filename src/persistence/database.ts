@@ -671,7 +671,7 @@ function loadConflictLocals(
   return rows;
 }
 
-interface ChangeRow {
+export interface ChangeRow {
   change_id: string;
   device_id: string;
   local_seq: number;
@@ -685,7 +685,7 @@ interface ChangeRow {
   schema_version: number;
 }
 
-function deserializeChangeRow(r: ChangeRow): ChangeRecord {
+export function deserializeChangeRow(r: ChangeRow): ChangeRecord {
   return {
     change_id: r.change_id,
     device_id: r.device_id,
@@ -699,6 +699,28 @@ function deserializeChangeRow(r: ChangeRow): ChangeRecord {
     causality_clock: JSON.parse(r.causality_clock) as VectorClock,
     schema_version: r.schema_version,
   };
+}
+
+/**
+ * DC-03 §3.2a "stale": true when a change already stored here for the same
+ * (entity_id, field_path) happened AFTER `record` (its causality clock covers
+ * record's origin sequence). Applying `record` would roll the materialized row
+ * back to an older value, which happens when a dependent change reaches this
+ * device before the change it builds on. Causal order only; no timestamp is
+ * compared (DC-03 §5). The record's own stored copy is excluded, so the same
+ * rule serves live sync and the reminder history replay.
+ */
+export function isCausallyStale(db: Database.Database, record: ChangeRecord): boolean {
+  const rows = db
+    .prepare(
+      "SELECT causality_clock FROM changes WHERE entity_id = ? AND field_path = ? AND change_id != ?",
+    )
+    .all(record.entity_id, record.field_path, record.change_id) as Array<{ causality_clock: string }>;
+  for (const r of rows) {
+    const clock = JSON.parse(r.causality_clock) as Record<string, number>;
+    if ((clock[record.device_id] ?? 0) >= record.local_seq) return true;
+  }
+  return false;
 }
 
 /**
@@ -720,6 +742,11 @@ function detectAndRecordConflict(
   db: Database.Database,
   record: ChangeRecord,
 ): "apply" | "noop" | "conflict" | "stale" {
+  // Reminder members: only the causal stale rule (DC-03 §3.2a), nothing else.
+  // Concurrent reminder edits are NOT detected (last arrival wins, TD-070).
+  if (record.entity_type === "reminder") {
+    return isCausallyStale(db, record) ? "stale" : "apply";
+  }
   if (record.entity_type !== "event") return "apply";
   const localCurrent = eventRowLocalValue(db, record.entity_id, record.field_path);
   const locals = loadConflictLocals(db, record.entity_id, record.field_path);

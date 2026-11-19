@@ -449,7 +449,7 @@ var abytes = (value, length, title = "") => {
 };
 var u8n = (len) => new Uint8Array(len);
 var u8fr = (buf) => Uint8Array.from(buf);
-var padh = (n, pad2) => n.toString(16).padStart(pad2, "0");
+var padh = (n, pad3) => n.toString(16).padStart(pad3, "0");
 var bytesToHex = (b) => Array.from(abytes(b)).map((e) => padh(e, 2)).join("");
 var C = { _0: 48, _9: 57, A: 65, F: 70, a: 97, f: 102 };
 var _ch = (ch) => {
@@ -486,10 +486,10 @@ var concatBytes = (...arrs) => {
   for (const a of arrs)
     len += abytes(a).length;
   const r = u8n(len);
-  let pad2 = 0;
+  let pad3 = 0;
   arrs.forEach((a) => {
-    r.set(a, pad2);
-    pad2 += a.length;
+    r.set(a, pad3);
+    pad3 += a.length;
   });
   return r;
 };
@@ -1064,10 +1064,10 @@ function concatBytes2(...arrays) {
     sum += a.length;
   }
   const res = new Uint8Array(sum);
-  for (let i = 0, pad2 = 0; i < arrays.length; i++) {
+  for (let i = 0, pad3 = 0; i < arrays.length; i++) {
     const a = arrays[i];
-    res.set(a, pad2);
-    pad2 += a.length;
+    res.set(a, pad3);
+    pad3 += a.length;
   }
   return res;
 }
@@ -2729,7 +2729,20 @@ function deserializeChangeRow(r) {
     schema_version: r.schema_version
   };
 }
+function isCausallyStale(db, record) {
+  const rows = db.prepare(
+    "SELECT causality_clock FROM changes WHERE entity_id = ? AND field_path = ? AND change_id != ?"
+  ).all(record.entity_id, record.field_path, record.change_id);
+  for (const r of rows) {
+    const clock = JSON.parse(r.causality_clock);
+    if ((clock[record.device_id] ?? 0) >= record.local_seq) return true;
+  }
+  return false;
+}
 function detectAndRecordConflict(db, record) {
+  if (record.entity_type === "reminder") {
+    return isCausallyStale(db, record) ? "stale" : "apply";
+  }
   if (record.entity_type !== "event") return "apply";
   const localCurrent = eventRowLocalValue(db, record.entity_id, record.field_path);
   const locals = loadConflictLocals(db, record.entity_id, record.field_path);
@@ -3565,7 +3578,22 @@ function deleteEventRows(db, eventId, seriesId) {
     db.prepare("DELETE FROM occurrence_overrides WHERE series_id = ?").run(seriesId);
     db.prepare("DELETE FROM series WHERE series_id = ?").run(seriesId);
   }
+  db.prepare("DELETE FROM reminders WHERE entity_id = ?").run(eventId);
   db.prepare("DELETE FROM events WHERE event_id = ?").run(eventId);
+}
+function upsertReminderRow(db, r) {
+  db.prepare(
+    `INSERT INTO reminders (member_id, entity_id, collection_path, minutes_before, enabled, updated_hlc)
+     VALUES (?, ?, 'reminders', ?, ?, ?)
+     ON CONFLICT(member_id) DO UPDATE SET
+       minutes_before = excluded.minutes_before,
+       enabled = excluded.enabled,
+       updated_hlc = excluded.updated_hlc
+     WHERE reminders.entity_id = excluded.entity_id`
+  ).run(r.memberId, r.eventId, r.minutesBefore, r.enabled ? 1 : 0, r.hlc);
+}
+function deleteReminderRow(db, memberId) {
+  db.prepare("DELETE FROM reminders WHERE member_id = ?").run(memberId);
 }
 var EventCore = class {
   db;
@@ -3591,18 +3619,33 @@ var EventCore = class {
   // -------------------------------------------------------------------------
   // DC-22: reminder members (collection members; replicate per D5).
   // -------------------------------------------------------------------------
-  /** Read one event's reminder member, or null. */
+  /**
+   * Read the event's reminder the dialog shows, or null. An event can hold
+   * several reminders (two devices adding offline); the dialog shows the one
+   * with the LOWEST member_id, the same on every device.
+   */
   reminderFor(eventId) {
     const row = this.db.prepare(
-      "SELECT minutes_before, enabled FROM reminders WHERE entity_id = ?"
+      "SELECT minutes_before, enabled FROM reminders WHERE entity_id = ? ORDER BY member_id LIMIT 1"
     ).get(eventId);
     if (row === void 0) return null;
     return { minutesBefore: row.minutes_before, enabled: row.enabled !== 0 };
   }
+  /** How many reminders the event holds (the dialog warns when more than one). */
+  reminderCountFor(eventId) {
+    return this.db.prepare("SELECT COUNT(*) AS n FROM reminders WHERE entity_id = ?").get(eventId)?.n ?? 0;
+  }
+  /** Member ids of the event's reminders, lowest first (the dialog rule's order). */
+  reminderMemberIds(eventId) {
+    return this.db.prepare(
+      "SELECT member_id FROM reminders WHERE entity_id = ? ORDER BY member_id"
+    ).all(eventId).map((r) => r.member_id);
+  }
   /**
-   * Create-or-update this event's reminder member (v1 UI: one member per
-   * event). Replicates as member_add / member_update (D5: disabled members
-   * are stored-but-inactive AND still replicate).
+   * Set this event's reminder (v1 UI: one reminder shown per event). Updates
+   * the lowest-member_id reminder (member_update) or creates one (member_add).
+   * Any EXTRA reminders (added concurrently on other devices) are removed as
+   * ordinary member_remove changes, so saving keeps exactly one everywhere.
    */
   setReminder(eventId, reminder) {
     if (!Number.isInteger(reminder.minutesBefore) || reminder.minutesBefore < 0) {
@@ -3611,33 +3654,11 @@ var EventCore = class {
     if (this.getEventRow(eventId) === void 0) {
       throw new Error(`setReminder: event not found: ${eventId}`);
     }
-    const existing = this.db.prepare(
-      "SELECT member_id FROM reminders WHERE entity_id = ?"
-    ).get(eventId);
+    const ids = this.reminderMemberIds(eventId);
+    const value = { minutes_before: reminder.minutesBefore, enabled: reminder.enabled ? 1 : 0 };
+    const keep = ids[0];
+    const memberId = keep ?? `rem-${randomUUID2()}`;
     const hlc = this.hlc.now();
-    if (existing !== void 0) {
-      createLocalChange(
-        this.db,
-        this.deviceId,
-        {
-          entity_id: eventId,
-          entity_type: "reminder",
-          field_path: `reminders.${existing.member_id}`,
-          operation: "member_update",
-          payload: {
-            value: { minutes_before: reminder.minutesBefore, enabled: reminder.enabled ? 1 : 0 }
-          },
-          hlc_now: () => hlc
-        },
-        (db) => {
-          db.prepare(
-            "UPDATE reminders SET minutes_before = ?, enabled = ?, updated_hlc = ? WHERE member_id = ?"
-          ).run(reminder.minutesBefore, reminder.enabled ? 1 : 0, hlc, existing.member_id);
-        }
-      );
-      return;
-    }
-    const memberId = `rem-${randomUUID2()}`;
     createLocalChange(
       this.db,
       this.deviceId,
@@ -3645,26 +3666,21 @@ var EventCore = class {
         entity_id: eventId,
         entity_type: "reminder",
         field_path: `reminders.${memberId}`,
-        operation: "member_add",
-        payload: {
-          value: { minutes_before: reminder.minutesBefore, enabled: reminder.enabled ? 1 : 0 }
-        },
+        operation: keep !== void 0 ? "member_update" : "member_add",
+        payload: { value },
         hlc_now: () => hlc
       },
       (db) => {
-        db.prepare(
-          `INSERT INTO reminders (member_id, entity_id, collection_path, minutes_before, enabled, updated_hlc)
-           VALUES (?, ?, 'reminders', ?, ?, ?)`
-        ).run(memberId, eventId, reminder.minutesBefore, reminder.enabled ? 1 : 0, hlc);
+        upsertReminderRow(db, { memberId, eventId, minutesBefore: reminder.minutesBefore, enabled: reminder.enabled, hlc });
       }
     );
+    for (const extra of ids.slice(1)) this.removeReminderMember(eventId, extra);
   }
-  /** Remove the event's reminder member (member_remove). Idempotent. */
+  /** Remove ALL of the event's reminders (member_remove each). Idempotent. */
   clearReminder(eventId) {
-    const existing = this.db.prepare(
-      "SELECT member_id FROM reminders WHERE entity_id = ?"
-    ).get(eventId);
-    if (existing === void 0) return;
+    for (const memberId of this.reminderMemberIds(eventId)) this.removeReminderMember(eventId, memberId);
+  }
+  removeReminderMember(eventId, memberId) {
     const hlc = this.hlc.now();
     createLocalChange(
       this.db,
@@ -3672,13 +3688,13 @@ var EventCore = class {
       {
         entity_id: eventId,
         entity_type: "reminder",
-        field_path: `reminders.${existing.member_id}`,
+        field_path: `reminders.${memberId}`,
         operation: "member_remove",
         payload: { value: null },
         hlc_now: () => hlc
       },
       (db) => {
-        db.prepare("DELETE FROM reminders WHERE member_id = ?").run(existing.member_id);
+        deleteReminderRow(db, memberId);
       }
     );
   }
@@ -8654,19 +8670,19 @@ var SnapshotStream = class {
   id = nextStreamId++;
   head;
   /** Check and stage one message of the stream. */
-  add(snapshot) {
-    if (refusesDeclaredFrontier(snapshot.applied_upto, heldCutoffs(this.db))) {
+  add(snapshot2) {
+    if (refusesDeclaredFrontier(snapshot2.applied_upto, heldCutoffs(this.db))) {
       this.discard();
       return "declined";
     }
-    const clockKey = canonicalJson2(snapshot.snapshot_clock);
-    const declaredKey = snapshot.applied_upto === void 0 ? "" : canonicalJson2(snapshot.applied_upto);
+    const clockKey = canonicalJson2(snapshot2.snapshot_clock);
+    const declaredKey = snapshot2.applied_upto === void 0 ? "" : canonicalJson2(snapshot2.applied_upto);
     if (this.head === void 0) {
       this.head = {
         clockKey,
         declaredKey,
-        snapshot_clock: snapshot.snapshot_clock,
-        applied_upto: snapshot.applied_upto
+        snapshot_clock: snapshot2.snapshot_clock,
+        applied_upto: snapshot2.applied_upto
       };
     } else if (this.head.clockKey !== clockKey || this.head.declaredKey !== declaredKey) {
       this.discard();
@@ -8687,7 +8703,7 @@ var SnapshotStream = class {
       VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(stream_id, entity_id, producer_device_id, seq) DO NOTHING`);
     this.db.transaction(() => {
-      for (const e of snapshot.entities) {
+      for (const e of snapshot2.entities) {
         putEntity.run(
           this.id,
           e.entity_id,
@@ -8698,7 +8714,7 @@ var SnapshotStream = class {
           JSON.stringify(e.causality_clock)
         );
       }
-      for (const t of snapshot.tombstones) {
+      for (const t of snapshot2.tombstones) {
         putTombstone.run(
           this.id,
           t.entity_id,
@@ -9964,6 +9980,102 @@ function derivePeerKey(clock) {
   return producers.length > 0 ? producers.join(",") : "unknown";
 }
 
+// src/persistence/bridges/reminder_apply.ts
+var MEMBER_PATH = /^reminders\.(.+)$/;
+function reminderMemberId(fieldPath) {
+  const m = MEMBER_PATH.exec(fieldPath);
+  return m ? m[1] : null;
+}
+function applyReminderChangeDetailed(db, record) {
+  const memberId = reminderMemberId(record.field_path);
+  if (memberId === null) return "ignored";
+  const eventId = record.entity_id;
+  if (!db.prepare("SELECT 1 FROM events WHERE event_id = ?").get(eventId)) {
+    return "target_absent";
+  }
+  const row = db.prepare("SELECT entity_id, minutes_before, enabled, updated_hlc FROM reminders WHERE member_id = ?").get(memberId);
+  if (record.operation === "member_remove") {
+    if (row === void 0 || row.entity_id !== eventId) return "unchanged";
+    deleteReminderRow(db, memberId);
+    return "written";
+  }
+  if (record.operation !== "member_add" && record.operation !== "member_update") return "ignored";
+  const v = record.payload.value;
+  if (!v || typeof v !== "object") return "ignored";
+  const minutes = v.minutes_before;
+  if (typeof minutes !== "number" || !Number.isInteger(minutes) || minutes < 0) return "ignored";
+  const enabled = v.enabled !== 0 && v.enabled !== false;
+  if (row !== void 0) {
+    if (row.entity_id !== eventId) return "ignored";
+    if (row.minutes_before === minutes && row.enabled !== 0 === enabled && row.updated_hlc === record.hlc_timestamp) {
+      return "unchanged";
+    }
+  }
+  upsertReminderRow(db, { memberId, eventId, minutesBefore: minutes, enabled, hlc: record.hlc_timestamp });
+  return "written";
+}
+function applyReminderChange(db, record) {
+  return applyReminderChangeDetailed(db, record) === "target_absent" ? "target_absent" : void 0;
+}
+
+// src/persistence/reminder_replay.ts
+var NoNetChange = class extends Error {
+};
+function snapshot(db, eventId) {
+  const rows = eventId === void 0 ? db.prepare("SELECT member_id, entity_id, minutes_before, enabled, updated_hlc FROM reminders").all() : db.prepare("SELECT member_id, entity_id, minutes_before, enabled, updated_hlc FROM reminders WHERE entity_id = ?").all(eventId);
+  return new Map(
+    rows.map((r) => [r.member_id, `${r.entity_id}|${r.minutes_before}|${r.enabled}|${r.updated_hlc}`])
+  );
+}
+function replayReminderHistory(db, opts = {}) {
+  const res = { examined: 0, applied: 0, skippedStale: 0, eventGone: 0, inConflict: 0, unresolved: 0 };
+  const rows = (opts.eventId === void 0 ? db.prepare("SELECT * FROM changes WHERE entity_type = 'reminder' ORDER BY rowid") : db.prepare("SELECT * FROM changes WHERE entity_type = 'reminder' AND entity_id = ? ORDER BY rowid")).all(...opts.eventId === void 0 ? [] : [opts.eventId]);
+  if (rows.length === 0) return res;
+  const conflicted = db.prepare(
+    "SELECT 1 FROM conflicts WHERE entity_id = ? AND field_path = ? AND status = 'unresolved' LIMIT 1"
+  );
+  const unresolved = [];
+  try {
+    db.transaction(() => {
+      const before = snapshot(db, opts.eventId);
+      for (const r of rows) {
+        res.examined++;
+        const rec = deserializeChangeRow(r);
+        if (reminderMemberId(rec.field_path) === null) continue;
+        if (conflicted.get(rec.entity_id, rec.field_path) !== void 0) {
+          res.inConflict++;
+          continue;
+        }
+        if (isCausallyStale(db, rec)) {
+          res.skippedStale++;
+          continue;
+        }
+        if (applyReminderChangeDetailed(db, rec) === "target_absent") {
+          const pre = prerequisiteState(db, rec);
+          if (pre.missingOrigin !== null || pre.rejectedPrerequisite) {
+            res.unresolved++;
+            unresolved.push(rec.change_id);
+          } else {
+            res.eventGone++;
+          }
+        }
+      }
+      const after = snapshot(db, opts.eventId);
+      for (const [id, v] of after) if (before.get(id) !== v) res.applied++;
+      for (const id of before.keys()) if (!after.has(id)) res.applied++;
+      if (res.applied === 0) throw new NoNetChange();
+    })();
+  } catch (e) {
+    if (!(e instanceof NoNetChange)) throw e;
+  }
+  if (unresolved.length > 0) {
+    console.error(
+      `[tide] reminder replay: ${unresolved.length} change(s) not applicable now, kept in history for the next run: ${unresolved.slice(0, 10).join(", ")}`
+    );
+  }
+  return res;
+}
+
 // src/persistence/bridges/sync_service.ts
 function existingText(db, eventId, col) {
   const row = db.prepare(`SELECT title, description FROM events WHERE event_id = ?`).get(eventId);
@@ -10059,6 +10171,7 @@ function makeEntityMutator() {
     if (record.entity_type === "series") return applySeries(db, record);
     if (record.entity_type === "occurrence_override") return applyOverride(db, record);
     if (record.entity_type === "calendar") return applyCalendar(db, record);
+    if (record.entity_type === "reminder") return applyReminderChange(db, record);
     if (record.entity_type !== "event") return;
     const absent = () => ABSENT;
     if (record.operation === "remove") {
@@ -10114,6 +10227,7 @@ function makeEntityMutator() {
     if (!db.prepare("SELECT 1 FROM calendars WHERE calendar_id = ?").get(DEFAULT_CALENDAR_ID)) {
       return ABSENT;
     }
+    const restoring = !eventRowExists(db, record.entity_id);
     insertEventRow(
       db,
       {
@@ -10128,6 +10242,7 @@ function makeEntityMutator() {
       true
       // upsert
     );
+    if (restoring) replayReminderHistory(db, { eventId: record.entity_id });
     void eventFields;
   };
 }
@@ -10580,155 +10695,6 @@ function renderNotification(f) {
   };
 }
 
-// src/application/notification_delivery.ts
-import { spawn } from "node:child_process";
-var deadStrategies = /* @__PURE__ */ new Set();
-function argsFor(strategy, fire, summary, body) {
-  switch (strategy) {
-    case "notify-send":
-      return [
-        "--app-name=Tide",
-        "--category=calendar",
-        "--expire-time=10000",
-        ...fire.missed ? ["--urgency=normal"] : [],
-        summary,
-        body
-      ];
-    case "gdbus":
-      return [
-        "call",
-        "--session",
-        "--dest",
-        "org.freedesktop.Notifications",
-        "--object-path",
-        "/org/freedesktop/Notifications",
-        "--method",
-        "org.freedesktop.Notifications.Notify",
-        "Tide",
-        "0",
-        "",
-        summary,
-        body,
-        "[]",
-        "{}",
-        "10000"
-      ];
-    case "dbus-send":
-      return [
-        "--session",
-        "--print-reply=literal",
-        "--dest=org.freedesktop.Notifications",
-        "/org/freedesktop/Notifications",
-        "org.freedesktop.Notifications.Notify",
-        "string:Tide",
-        "uint32:0",
-        "string:",
-        `string:${summary}`,
-        `string:${body}`,
-        "array:string:",
-        "dict:string:variant:",
-        "int32:10000"
-      ];
-    default:
-      if (strategy === "powershell-toast") {
-        return case_powershell_toast_args(summary, body);
-      }
-      if (strategy === "powershell-messagebox") {
-        return case_powershell_messagebox_args(summary, body);
-      }
-      return null;
-  }
-}
-function xmlEscape(s) {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
-}
-function case_powershell_toast_args(summary, body) {
-  const toastXml = `<toast><visual><binding template="ToastText02"><text id="1">${xmlEscape(summary)}</text><text id="2">${xmlEscape(body)}</text></binding></visual></toast>`;
-  return [
-    "-NoProfile",
-    "-NonInteractive",
-    "-WindowStyle",
-    "Hidden",
-    "-Command",
-    `[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null;[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null;$x = New-Object Windows.Data.Xml.Dom.XmlDocument;$x.LoadXml('${toastXml.replace(/'/g, "''")}');$t = New-Object Windows.UI.Notifications.ToastNotification $x;[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Tide').Show($t)`
-  ];
-}
-function case_powershell_messagebox_args(summary, body) {
-  const q = (s) => s.replace(/'/g, "''");
-  return [
-    "-NoProfile",
-    "-NonInteractive",
-    "-WindowStyle",
-    "Hidden",
-    "-Command",
-    `Add-Type -AssemblyName System.Windows.Forms | Out-Null; [System.Windows.Forms.MessageBox]::Show('${q(body)}', '${q(summary)}')`
-  ];
-}
-var STRATEGIES_LINUX = ["notify-send", "gdbus", "dbus-send"];
-var STRATEGIES_WINDOWS = ["powershell-toast", "powershell-messagebox"];
-var STRATEGIES = process.platform === "win32" ? STRATEGIES_WINDOWS : STRATEGIES_LINUX;
-function deliverNotification(fire, onResult) {
-  const { summary, body } = renderNotification(fire);
-  let settled = false;
-  const settle = (ok) => {
-    if (!settled) {
-      settled = true;
-      onResult(ok);
-    }
-  };
-  const attempt = (index) => {
-    if (index >= STRATEGIES.length) {
-      console.error(
-        "[tide] desktop notifications: ALL strategies failed this dispatch; reminder will retry on next rebuild (DC-22 \xA77.1)"
-      );
-      settle(false);
-      return;
-    }
-    const strategy = STRATEGIES[index];
-    if (deadStrategies.has(strategy)) {
-      attempt(index + 1);
-      return;
-    }
-    const args = argsFor(strategy, fire, summary, body);
-    if (!args) {
-      deadStrategies.add(strategy);
-      attempt(index + 1);
-      return;
-    }
-    console.log(`[tide] notify via ${strategy}`);
-    try {
-      const [exe, spawnArgs] = strategy === "powershell-toast" || strategy === "powershell-messagebox" ? ["powershell.exe", args] : [strategy, args];
-      const child = spawn(exe, spawnArgs, { stdio: "ignore" });
-      child.on("error", (err2) => {
-        deadStrategies.add(strategy);
-        console.error(
-          `[tide] notify strategy "${strategy}" unavailable (${err2.message}); falling back`
-        );
-        attempt(index + 1);
-      });
-      child.on("exit", (code) => {
-        if (code === 0) {
-          settle(true);
-        } else {
-          deadStrategies.add(strategy);
-          console.error(
-            `[tide] notify strategy "${strategy}" exited ${code ?? "signal"}; falling back`
-          );
-          attempt(index + 1);
-        }
-      });
-      setTimeout(() => settle(false), 1e4).unref();
-    } catch (err2) {
-      deadStrategies.add(strategy);
-      console.error(
-        `[tide] notify strategy "${strategy}" spawn threw: ${err2 instanceof Error ? err2.message : String(err2)}`
-      );
-      attempt(index + 1);
-    }
-  };
-  attempt(0);
-}
-
 // src/domain/recurrence_conflicts.ts
 var DAY_NAMES = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"];
 var JS_DAY_TO_NAME = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"];
@@ -10889,6 +10855,273 @@ function expandOccurrences(series, windowStartId, windowEndId) {
     return out;
   }
   return out;
+}
+
+// src/domain/wall_time.ts
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+function msFromWallId(id) {
+  const digits = id.replace(/\D/g, "");
+  const y = +digits.slice(0, 4);
+  const mo = +digits.slice(4, 6);
+  const dd = +digits.slice(6, 8);
+  const hh = +digits.slice(8, 10) || 0;
+  const mi = +digits.slice(10, 12) || 0;
+  const ss = +digits.slice(12, 14) || 0;
+  return new Date(y, mo - 1, dd, hh, mi, ss, 0).getTime();
+}
+function baseStartWall(ms) {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
+// src/application/reminder_tick.ts
+function formatTickProblem(p) {
+  return `[tide] reminder schedule: recurring event not expanded (${p.errorName}); only its first occurrence can fire: series=${p.seriesId} event=${p.eventId}`;
+}
+function buildTickSchedule(db, nowMs, lastTickMs, onProblem) {
+  const baseEvents = db.prepare(
+    `SELECT e.event_id AS entity_id, e.title,
+              e.utc_start_ms, e.utc_end_ms,
+              COALESCE(e.start_wall, e.start_date || 'T00:00') AS start_wall,
+              COALESCE(e.end_wall, e.end_date || 'T23:59')      AS end_wall,
+              e.all_day, e.all_day_reminder_time
+       FROM events e`
+  ).all();
+  const seriesRows = db.prepare(`SELECT s.series_id, s.base_event_id, s.recurrence_rule FROM series s`).all();
+  const seriesByBase = new Map(seriesRows.map((s) => [s.base_event_id, s]));
+  const overridesFor = db.prepare(
+    `SELECT recurrence_id, cancelled, title, start_wall, end_wall
+     FROM occurrence_overrides WHERE series_id = ?`
+  );
+  const WIN_LO = `${new Date(nowMs - 25 * 36e5).getFullYear()}0101T000000`;
+  const WIN_HI = `${new Date(nowMs).getFullYear() + 1}1231T235959`;
+  const events = [];
+  const occurrencesOf = /* @__PURE__ */ new Map();
+  for (const ev0 of baseEvents) {
+    const timed = ev0.all_day !== 1 && ev0.utc_start_ms != null;
+    const ev = timed ? { ...ev0, start_wall: baseStartWall(ev0.utc_start_ms) } : ev0;
+    const row = seriesByBase.get(ev.entity_id);
+    if (!row || !timed) {
+      events.push(ev);
+      continue;
+    }
+    let occIds = [];
+    try {
+      occIds = expandOccurrences(
+        {
+          series_id: row.series_id,
+          base_start_wall: ev.start_wall,
+          // full "YYYY-MM-DDTHH:MM", as the calendar builds it
+          tz_id: "local",
+          recurrence_rule: row.recurrence_rule
+        },
+        WIN_LO,
+        WIN_HI
+      );
+    } catch (err2) {
+      onProblem?.({
+        kind: "series_expansion_failed",
+        seriesId: row.series_id,
+        eventId: ev.entity_id,
+        errorName: err2 instanceof Error ? err2.name : "Error"
+      });
+      events.push(ev);
+      continue;
+    }
+    if (occIds.length === 0) {
+      events.push(ev);
+      continue;
+    }
+    const overrides = new Map(
+      overridesFor.all(row.series_id).map((o) => [o.recurrence_id, o])
+    );
+    const durMs = Math.max((ev.utc_end_ms ?? 0) - ev.utc_start_ms, 0);
+    const kept = [];
+    for (const occId of occIds) {
+      const ov = overrides.get(occId);
+      if (ov?.cancelled) continue;
+      const startMs = ov?.start_wall ? msFromWallId(ov.start_wall) : msFromWallId(occId);
+      const endMs = ov?.end_wall ? msFromWallId(ov.end_wall) : startMs + durMs;
+      const id = `${ev.entity_id}#${occId}`;
+      kept.push(id);
+      events.push({
+        ...ev,
+        entity_id: id,
+        title: ov?.title ?? ev.title,
+        start_wall: baseStartWall(startMs),
+        utc_start_ms: startMs,
+        utc_end_ms: endMs
+      });
+    }
+    occurrencesOf.set(ev.entity_id, kept);
+  }
+  const baseReminders = db.prepare(
+    // DC-22 D5: disabled reminders (enabled = 0) are stored but INACTIVE
+    // (NULL/1 = active). updated_hlc feeds the late-configuration discard.
+    "SELECT member_id, entity_id, minutes_before, updated_hlc AS updated_hlc_ms FROM reminders WHERE enabled IS NULL OR enabled = 1"
+  ).all();
+  const reminders = [];
+  for (const rem of baseReminders) {
+    const occ = occurrencesOf.get(rem.entity_id);
+    if (occ === void 0) reminders.push(rem);
+    else for (const id of occ) reminders.push({ ...rem, entity_id: id });
+  }
+  return rebuildSchedule(events, reminders, nowMs, lastTickMs);
+}
+function computeDueReminders(db, nowMs, lastTickMs, delivered, onProblem) {
+  const schedule = buildTickSchedule(db, nowMs, lastTickMs, onProblem);
+  return filterDelivered(schedule, delivered).filter((f) => f.fire_at_ms <= nowMs);
+}
+
+// src/application/notification_delivery.ts
+import { spawn } from "node:child_process";
+var deadStrategies = /* @__PURE__ */ new Set();
+function argsFor(strategy, fire, summary, body) {
+  switch (strategy) {
+    case "notify-send":
+      return [
+        "--app-name=Tide",
+        "--category=calendar",
+        "--expire-time=10000",
+        ...fire.missed ? ["--urgency=normal"] : [],
+        summary,
+        body
+      ];
+    case "gdbus":
+      return [
+        "call",
+        "--session",
+        "--dest",
+        "org.freedesktop.Notifications",
+        "--object-path",
+        "/org/freedesktop/Notifications",
+        "--method",
+        "org.freedesktop.Notifications.Notify",
+        "Tide",
+        "0",
+        "",
+        summary,
+        body,
+        "[]",
+        "{}",
+        "10000"
+      ];
+    case "dbus-send":
+      return [
+        "--session",
+        "--print-reply=literal",
+        "--dest=org.freedesktop.Notifications",
+        "/org/freedesktop/Notifications",
+        "org.freedesktop.Notifications.Notify",
+        "string:Tide",
+        "uint32:0",
+        "string:",
+        `string:${summary}`,
+        `string:${body}`,
+        "array:string:",
+        "dict:string:variant:",
+        "int32:10000"
+      ];
+    default:
+      if (strategy === "powershell-toast") {
+        return case_powershell_toast_args(summary, body);
+      }
+      if (strategy === "powershell-messagebox") {
+        return case_powershell_messagebox_args(summary, body);
+      }
+      return null;
+  }
+}
+function xmlEscape(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+}
+function case_powershell_toast_args(summary, body) {
+  const toastXml = `<toast><visual><binding template="ToastText02"><text id="1">${xmlEscape(summary)}</text><text id="2">${xmlEscape(body)}</text></binding></visual></toast>`;
+  return [
+    "-NoProfile",
+    "-NonInteractive",
+    "-WindowStyle",
+    "Hidden",
+    "-Command",
+    `[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null;[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null;$x = New-Object Windows.Data.Xml.Dom.XmlDocument;$x.LoadXml('${toastXml.replace(/'/g, "''")}');$t = New-Object Windows.UI.Notifications.ToastNotification $x;[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Tide').Show($t)`
+  ];
+}
+function case_powershell_messagebox_args(summary, body) {
+  const q = (s) => s.replace(/'/g, "''");
+  return [
+    "-NoProfile",
+    "-NonInteractive",
+    "-WindowStyle",
+    "Hidden",
+    "-Command",
+    `Add-Type -AssemblyName System.Windows.Forms | Out-Null; [System.Windows.Forms.MessageBox]::Show('${q(body)}', '${q(summary)}')`
+  ];
+}
+var STRATEGIES_LINUX = ["notify-send", "gdbus", "dbus-send"];
+var STRATEGIES_WINDOWS = ["powershell-toast", "powershell-messagebox"];
+var STRATEGIES = process.platform === "win32" ? STRATEGIES_WINDOWS : STRATEGIES_LINUX;
+function deliverNotification(fire, onResult) {
+  const { summary, body } = renderNotification(fire);
+  let settled = false;
+  const settle = (ok) => {
+    if (!settled) {
+      settled = true;
+      onResult(ok);
+    }
+  };
+  const attempt = (index) => {
+    if (index >= STRATEGIES.length) {
+      console.error(
+        "[tide] desktop notifications: ALL strategies failed this dispatch; reminder will retry on next rebuild (DC-22 \xA77.1)"
+      );
+      settle(false);
+      return;
+    }
+    const strategy = STRATEGIES[index];
+    if (deadStrategies.has(strategy)) {
+      attempt(index + 1);
+      return;
+    }
+    const args = argsFor(strategy, fire, summary, body);
+    if (!args) {
+      deadStrategies.add(strategy);
+      attempt(index + 1);
+      return;
+    }
+    console.log(`[tide] notify via ${strategy}`);
+    try {
+      const [exe, spawnArgs] = strategy === "powershell-toast" || strategy === "powershell-messagebox" ? ["powershell.exe", args] : [strategy, args];
+      const child = spawn(exe, spawnArgs, { stdio: "ignore" });
+      child.on("error", (err2) => {
+        deadStrategies.add(strategy);
+        console.error(
+          `[tide] notify strategy "${strategy}" unavailable (${err2.message}); falling back`
+        );
+        attempt(index + 1);
+      });
+      child.on("exit", (code) => {
+        if (code === 0) {
+          settle(true);
+        } else {
+          deadStrategies.add(strategy);
+          console.error(
+            `[tide] notify strategy "${strategy}" exited ${code ?? "signal"}; falling back`
+          );
+          attempt(index + 1);
+        }
+      });
+      setTimeout(() => settle(false), 1e4).unref();
+    } catch (err2) {
+      deadStrategies.add(strategy);
+      console.error(
+        `[tide] notify strategy "${strategy}" spawn threw: ${err2 instanceof Error ? err2.message : String(err2)}`
+      );
+      attempt(index + 1);
+    }
+  };
+  attempt(0);
 }
 
 // src/application/conflicts_ui.ts
@@ -11343,16 +11576,6 @@ var ConflictsViewModel = class {
 };
 
 // src/persistence/bridges/sidecar_server.ts
-function msFromWallId(id) {
-  const digits = id.replace(/\D/g, "");
-  const y = +digits.slice(0, 4);
-  const mo = +digits.slice(4, 6);
-  const dd = +digits.slice(6, 8);
-  const hh = +digits.slice(8, 10) || 0;
-  const mi = +digits.slice(10, 12) || 0;
-  const ss = +digits.slice(12, 14) || 0;
-  return new Date(y, mo - 1, dd, hh, mi, ss, 0).getTime();
-}
 function discoveryKickNoticeLine() {
   return JSON.stringify({ notice: "discovery_kick" });
 }
@@ -11966,7 +12189,8 @@ function makeDispatcher(core, sync) {
       // Replicates as reminder member_add/update/remove (D5).
       case "get_reminder": {
         if (typeof args.event_id !== "string") fail("get_reminder: args.event_id required");
-        return core.reminderFor(args.event_id);
+        const rem = core.reminderFor(args.event_id);
+        return rem === null ? null : { ...rem, count: core.reminderCountFor(args.event_id) };
       }
       case "set_reminder": {
         if (typeof args.event_id !== "string") fail("set_reminder: args.event_id required");
@@ -12424,6 +12648,16 @@ function main() {
     process.env.TIDE_DATA_DIR ?? dbPath.replace(/[/\\][^/\\]+$/, "") ?? "."
   );
   const core = new EventCore(dbPath, syncIdentity.deviceId);
+  try {
+    const rr = replayReminderHistory(core.db);
+    if (rr.applied > 0 || rr.unresolved > 0) {
+      console.error(
+        `[tide] reminder replay: examined=${rr.examined} applied=${rr.applied} unresolved=${rr.unresolved}`
+      );
+    }
+  } catch (err2) {
+    console.error("[tide] reminder replay failed:", err2 instanceof Error ? err2.message : String(err2));
+  }
   const sync = new SyncManager(core, syncIdentity);
   sync.onDataChanged = (applied) => {
     process.stdout.write(dataChangedNoticeLine(applied) + "\n");
@@ -12492,6 +12726,7 @@ function main() {
     });
   });
   const deliveredReminderKeys = /* @__PURE__ */ new Set();
+  const reportedTickProblems = /* @__PURE__ */ new Set();
   let lastTickMs = null;
   const deliveredPrune = () => {
     const cutoff = Date.now() - 25 * 36e5;
@@ -12502,70 +12737,17 @@ function main() {
   };
   const reminderTick = () => {
     try {
-      const baseEvents = core.db.prepare(
-        `SELECT e.event_id AS entity_id, e.title,
-                  e.utc_start_ms, e.utc_end_ms,
-                  COALESCE(e.start_wall, e.start_date || 'T00:00') AS start_wall,
-                  COALESCE(e.end_wall, e.end_date || 'T23:59')      AS end_wall,
-                  e.all_day, e.all_day_reminder_time
-           FROM events e`
-      ).all();
-      const events = [];
-      const seriesRows = core.db.prepare(
-        `SELECT s.series_id, s.base_event_id, s.recurrence_rule
-           FROM series s`
-      ).all();
-      const seriesByBase = new Map(seriesRows.map((s) => [s.base_event_id, s]));
-      const now = Date.now();
-      const WIN_LO = `${new Date(now - 25 * 36e5).getFullYear()}0101T000000`;
-      for (const ev of baseEvents) {
-        const row = seriesByBase.get(ev.entity_id);
-        const timed = ev.all_day !== 1 && ev.utc_start_ms != null;
-        if (!row || !timed) {
-          events.push(ev);
-          continue;
-        }
-        let occIds = [];
-        try {
-          occIds = expandOccurrences(
-            {
-              series_id: row.series_id,
-              base_start_wall: ev.start_wall,
-              tz_id: "local",
-              recurrence_rule: row.recurrence_rule
-            },
-            WIN_LO,
-            `${new Date(now).getFullYear() + 1}1231T235959`
-          );
-        } catch {
-          events.push(ev);
-          continue;
-        }
-        if (occIds.length === 0) {
-          events.push(ev);
-          continue;
-        }
-        const durMs = (ev.utc_end_ms ?? 0) - ev.utc_start_ms;
-        for (const occId of occIds) {
-          const startMs = msFromWallId(occId);
-          events.push({
-            ...ev,
-            entity_id: `${ev.entity_id}#${occId}`,
-            utc_start_ms: startMs,
-            utc_end_ms: startMs + Math.max(durMs, 0)
-          });
-        }
-      }
-      const reminders = core.db.prepare(
-        // DC-22 D5: disabled reminders (enabled = 0) are stored but INACTIVE
-        // — the schedule engine never schedules them (NULL/1 = active).
-        // updated_hlc feeds the late-configuration discard (reminder_engine).
-        "SELECT member_id, entity_id, minutes_before, updated_hlc AS updated_hlc_ms FROM reminders WHERE enabled IS NULL OR enabled = 1"
-      ).all();
-      const schedule = rebuildSchedule(events, reminders, Date.now(), lastTickMs);
       deliveredPrune();
-      const due = filterDelivered(schedule, deliveredReminderKeys).filter(
-        (f) => f.fire_at_ms <= Date.now()
+      const due = computeDueReminders(
+        core.db,
+        Date.now(),
+        lastTickMs,
+        deliveredReminderKeys,
+        (p) => {
+          if (reportedTickProblems.has(p.seriesId)) return;
+          reportedTickProblems.add(p.seriesId);
+          console.error(formatTickProblem(p));
+        }
       );
       for (const fire of due) {
         console.log(

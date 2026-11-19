@@ -3,6 +3,7 @@ import type { CalendarEvent } from "./store.ts";
 import { listEvents, listSeries, updateEvent, deleteEvent, type SeriesRow } from "./store.ts";
 import { recurrenceBadge, type SeriesInfo } from "./recurrence.ts";
 import { expandOccurrences } from "../src/domain/recurrence_conflicts.ts";
+import { msFromWallId, baseStartWall } from "../src/domain/wall_time.ts";
 import { formatTimeLabel, getTimeFormat } from "./theme.ts";
 
 export type ViewMode = "month" | "week";
@@ -174,27 +175,6 @@ function wallIdFromMs(ms: number): string {
   return (
     `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}` +
     `T${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`
-  );
-}
-
-/** Epoch ms from a 'YYYYMMDD[THHMMSS]' wall-clock id (local time). */
-function msFromWallId(id: string): number {
-  const digits = id.replace(/\D/g, "");
-  const y = +digits.slice(0, 4);
-  const mo = +digits.slice(4, 6);
-  const dd = +digits.slice(6, 8);
-  const hh = +digits.slice(8, 10) || 0;
-  const mi = +digits.slice(10, 12) || 0;
-  const ss = +digits.slice(12, 14) || 0;
-  return new Date(y, mo - 1, dd, hh, mi, ss, 0).getTime();
-}
-
-/** 'YYYY-MM-DDTHH:MM' naive wall clock from epoch ms (SeriesState form). */
-function baseStartWall(ms: number): string {
-  const d = new Date(ms);
-  return (
-    `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}` +
-    `T${pad2(d.getHours())}:${pad2(d.getMinutes())}`
   );
 }
 

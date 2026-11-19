@@ -623,7 +623,7 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 
 ## TD-070 — Concurrent edits to series, occurrence overrides and calendars are not detected as conflicts
 - **ID:** TD-070
-- **Title:** `detectAndRecordConflict` (src/persistence/database.ts) returns "apply" for every entity type except events, so two devices that edit the same series rule, the same occurrence override field or the same calendar field at the same time create no conflict record. Each device keeps whichever change it applied last, so devices can end with different values depending on the order the changes arrived in. Events do not have this problem.
+- **Title:** `detectAndRecordConflict` (src/persistence/database.ts) returns "apply" for every entity type except events, so two devices that edit the same series rule, the same occurrence override field or the same calendar field at the same time create no conflict record. Each device keeps whichever change it applied last, so devices can end with different values depending on the order the changes arrived in. Events do not have this problem. The same applies to reminders: two devices editing the same reminder at once keep the change that arrived last (a change that is causally older than one already stored is skipped, but concurrent edits are not detected). A reminder added while another device deletes the same event is a delete-versus-edit conflict on the event: the event stays on the device that added the reminder.
 - **Priority:** 6/10 — MEDIUM (data differs between devices without any warning; no loss of history, every change is stored and every device holds the same set of changes)
 - **Status:** OPEN. Known convergence defect: the calendar state of two devices holding the same changes should be identical. Scheduled for the conflict-engine work.
 
@@ -643,7 +643,7 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 - **ID:** TD-073
 - **Title:** Reminder changes (member add, update, remove) received from another device are stored in the change history but not written to the `reminders` table: the change applier accepts and ignores that entity type, so reminders do not sync between devices. A later fix has to replay the reminder changes already stored in the history. A reminder also references its event (a second referenced object), so the same rule for a missing referenced object applies to it.
 - **Priority:** 6/10 — MEDIUM (a reminder set on one device never appears on the others)
-- **Status:** OPEN. Reminder changes already stored in history must be replayed when this is fixed.
+- **Status:** ADDRESSED: reminder changes are applied through the prerequisite rule, and `replayReminderHistory` (src/persistence/reminder_replay.ts) rebuilds rows from stored history at every start, in arrival order, with the same causal rule as live sync. A replayed change whose event is absent and whose prerequisite is missing or rejected cannot be decided; it stays in history, is logged by change id and retried at the next start (no visible notice).
 
 ## TD-074 — Concurrent sync sessions can leave a stale hold counter or waiting notice
 - **ID:** TD-074
@@ -679,4 +679,52 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 - **ID:** TD-079
 - **Title:** The next sequence number is taken from the local database only, so restoring an older backup rewinds it and the device can write new changes under numbers its peers already hold. Today this is detected and shown as a warning only (TD-077); devices can end up holding different content for the same change. Intended direction: a restored install gets a new device identity and the old identity is unpaired (as the architecture specification already requires for restores). Open question: how a restore is detected.
 - **Priority:** 6/10 — MEDIUM (silent divergence after a restore)
+- **Status:** OPEN.
+
+## TD-080 — Reminders can fire twice after a restart, and two labels are wrong
+- **ID:** TD-080
+- **Title:** The list of reminders already delivered lives in memory only. After a restart (or the sidecar being restarted) a reminder that already fired, whose event has not ended yet, fires again, labelled "missed". Two labels are also wrong: a reminder whose time falls in the first 30 seconds after the app started is labelled "missed" although the app was running (the first interval check still has no previous check), and a reminder whose time passed while the timer was paused is delivered late but labelled "on time". Nothing is skipped in any of these cases while the event has not ended. Reproduction: run the alarm check with a simulated clock, once with the fire time inside the first 30 seconds after start, once with a gap in the checks that spans the fire time, and once with a restart after the reminder fired.
+- **Priority:** 3/10 — LOW (duplicate or mislabelled notification; nothing lost)
+- **Status:** OPEN. Fix direction: persist the delivered keys (or the last check time) locally.
+
+## TD-081 — All-day reminders never fire
+- **ID:** TD-081
+- **Title:** An all-day reminder fires the day before at a time picked per event (DC-22 D2, section 5.4), stored in `events.all_day_reminder_time`. Nothing writes that column and it is not part of the change-record vocabulary, so an all-day event never gets a fire time and the reminder never fires. The event dialog hides "Remind me" for whole-day events; saving a whole-day event leaves any existing reminder unchanged. To build: a per-event time field in the dialog, a change record that carries it, and the fire rule in the alarm engine.
+- **Priority:** 4/10 — MEDIUM-LOW (feature missing; the option is hidden so users are not misled)
+- **Status:** OPEN.
+
+## TD-082 — A fresh worktree has no dist/sidecar.mjs and one test depends on another having built it
+- **ID:** TD-082
+- **Title:** tests/ensure_listener_port.test.ts needs dist/sidecar.mjs. In a fresh checkout or worktree the file does not exist until `npm run sidecar:build` runs, so the test fails or passes depending on whether another test built it first (test-order dependency).
+- **Priority:** 2/10 — LOW (test setup only)
+- **Status:** OPEN. Fix: build the sidecar in a test setup step or skip with a clear message.
+
+## TD-083 — Applying a full-state snapshot deletes events but not their reminders
+- **ID:** TD-083
+- **Title:** The snapshot apply path (src/sync/full_state.ts, the event delete statement) removes event rows without removing the reminder rows of those events. The local and remote change paths now remove them together with the event (`deleteEventRows`). Snapshots are off in this release.
+- **Priority:** 2/10 — LOW (snapshots are off; orphan rows are harmless to the alarm, which only reads live events)
+- **Status:** OPEN. Fix before snapshots are enabled.
+
+## TD-084 — A recurring event that cannot be expanded for the alarm is reported in the log only
+- **ID:** TD-084
+- **Title:** If a series cannot be expanded for the alarm timer, the timer now writes one log line per series (ids only, no calendar content) and falls back to the first occurrence. There is no visible notice: the user-facing warning list is built from change records (see TD-075), and a fake change record must not be created for it. A visible notice needs its own local warning list.
+- **Priority:** 2/10 — LOW (not reachable with a valid event today)
+- **Status:** OPEN.
+
+## TD-085 — A resolution on the conflict screen does not restore a deleted event
+- **ID:** TD-085
+- **Title:** Resolving a delete-versus-edit conflict with "keep the edit" writes a change record (field path `*`, operation set) but does not recreate the deleted event row on this device, and the record's value shape is not the full-event shape the change applier accepts for an absent event, so other devices do not recreate it either. The only path that recreates an absent event today is an incoming full-event change (field path `event`); it also rebuilds that event's reminders. The restore-versus-delete behaviour (which side wins, how a restored event and its reminders come back) needs its own decision and design together with the conflict-engine work.
+- **Priority:** 5/10 — MEDIUM (a user who chooses to keep an edit over a delete does not get the event back)
+- **Status:** OPEN. Same area as TD-070.
+
+## TD-086 — Reminder replay cost grows quadratically with the number of edits of one reminder
+- **ID:** TD-086
+- **Title:** The startup replay checks each stored reminder change against the other stored changes of the same reminder for causal staleness. For a reminder edited n times this is O(n²): about 0.3 s per start for 10,000 reminders with one change each, but about 1.5 s per start for a single reminder edited 2,000 times (measured on a desktop). Fix: index stored changes per reminder member, or keep the latest causal frontier per member.
+- **Priority:** 2/10 — LOW (needs a reminder edited thousands of times)
+- **Status:** OPEN.
+
+## TD-087 — Saving the event dialog before its reminder lookup finishes can clear reminders
+- **ID:** TD-087
+- **Title:** The dialog loads the event's reminder asynchronously; until the lookup returns (or if it fails), the "Remind me" checkbox shows the no-reminder state. Saving a timed event in that window clears the event's reminders without the several-reminders notice. Over local IPC the window is in the millisecond range. Fix: disable saving until the lookup has returned, or skip reminder changes when the lookup did not complete.
+- **Priority:** 2/10 — LOW (narrow timing window)
 - **Status:** OPEN.

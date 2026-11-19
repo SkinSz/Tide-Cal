@@ -17,6 +17,8 @@ import {
   OVERRIDE_FIELDS,
 } from "./event_core.ts";
 import { prerequisiteState } from "../database.ts";
+import { applyReminderChange } from "./reminder_apply.ts";
+import { replayReminderHistory } from "../reminder_replay.ts";
 import type { EntityMutator, MutateResult } from "../database.ts";
 
 /** Existing non-schedule fields of an event row ("" when absent). */
@@ -141,14 +143,16 @@ function applyCalendar(db: Database, record: ChangeRecord): MutateResult {
  * EventCore: event / series / occurrence_override / calendar changes write
  * their rows. Returns "target_absent" for an edit or remove whose target row is
  * missing; applyRemoteChangeDetailed decides what that means (readiness is
- * checked before the mutator runs). Reminder and other entity types are still
- * accepted-and-ignored.
+ * checked before the mutator runs). Reminder changes are applied by
+ * applyReminderChange (target = the event row, same prerequisite rule). Other
+ * entity types are still accepted-and-ignored.
  */
 export function makeEntityMutator(): EntityMutator {
   return (db, record) => {
     if (record.entity_type === "series") return applySeries(db, record);
     if (record.entity_type === "occurrence_override") return applyOverride(db, record);
     if (record.entity_type === "calendar") return applyCalendar(db, record);
+    if (record.entity_type === "reminder") return applyReminderChange(db, record);
     if (record.entity_type !== "event") return;
 
     const absent = (): MutateResult => ABSENT;
@@ -236,6 +240,7 @@ export function makeEntityMutator(): EntityMutator {
     if (!db.prepare("SELECT 1 FROM calendars WHERE calendar_id = ?").get(DEFAULT_CALENDAR_ID)) {
       return ABSENT;
     }
+    const restoring = !eventRowExists(db, record.entity_id);
     insertEventRow(
       db,
       {
@@ -249,6 +254,11 @@ export function makeEntityMutator(): EntityMutator {
       record.hlc_timestamp,
       true, // upsert
     );
+    // An event row that comes back (e.g. a conflict resolution that keeps the
+    // edit over a delete) brings its reminders back: the delete removed them
+    // locally, their changes are still in history. Same replay as startup,
+    // scoped to this event.
+    if (restoring) replayReminderHistory(db, { eventId: record.entity_id });
     void eventFields;
   };
 }

@@ -385,3 +385,67 @@ D11. All failure modes degrade DC-16-Tier-1 style: log, keep
      schedule, never crash the sidecar. DECIDED (§7).
 D12. Clock jumps and DST: rebuild on discontinuity; bounded missed
      policy; no catch-up storms. DECIDED (§5.5).
+
+10. AMENDMENT 2026-11-19
+
+10.1 Recurring events. A reminder set on a recurring event (series)
+     applies to EVERY occurrence. A moved occurrence keeps the same
+     offset: it fires minutes_before its NEW start. A cancelled
+     occurrence has no reminder. v1 has no per-occurrence reminder
+     overrides. A notification for an occurrence shows that
+     occurrence's own date and time (and its changed title, if any).
+
+10.2 Notification text. The start line shows the date and the time
+     ("Starts 2027-01-25 09:00"), not the time alone.
+
+10.3 Several reminders on one event. Two devices can each add a
+     reminder to the same event while offline; after sync the event
+     holds both and the alarm fires for each. The event dialog shows
+     ONE reminder, chosen by a fixed rule that is the same on every
+     device: the lowest reminder (member) id. When the event holds
+     more than one, the dialog says so before saving ("This event has
+     2 reminders. Saving keeps only this one."). Saving updates the
+     shown reminder and removes the others as ordinary member_remove
+     changes, so every device converges on one. Clearing the reminder
+     removes all of them; while "Remind me" is unticked the dialog
+     says so instead ("Saving removes all 2 reminders.").
+
+10.4 Synchronization. A reminder replicates as member changes
+     (member_add / member_update / member_remove) keyed by the event
+     id and the member id. A device applies them through the same
+     causal-readiness rule as every other change: a reminder whose
+     event is not here yet is held, then applied. A change that is
+     causally older than one already stored for the same reminder does
+     not overwrite it. Concurrent edits to the same reminder are not
+     detected as conflicts: the change that arrives last wins (see
+     docs/technical-debt.md, TD-070). No timestamp decides between
+     changes. The reminder row keeps the timestamp of the change that
+     wrote it.
+     Reminder changes received before this amendment were stored but
+     never applied. On every start the device rebuilds its reminder
+     rows from the stored changes, in storage (arrival) order through
+     the same apply code and the same causal rule, so the result equals
+     what live sync wrote: causally later changes win, concurrent
+     changes are last-arrival, removals and the event's delete are
+     respected. A repeat run changes nothing and rewrites nothing. A
+     stored change that cannot be decided yet (its event is absent and
+     a change it depends on is missing or was rejected here) stays in
+     the history and is retried at the next start.
+
+10.5 Event delete. Deleting an event removes its reminders on every
+     device as a local consequence of applying the delete; no separate
+     reminder changes are written. If an incoming full-event change
+     arrives for an event that is absent here, the event is recreated
+     and that event's reminders are rebuilt from the stored changes
+     (same rebuild as 10.4, scoped to the event). A resolution on the
+     conflict screen does not restore a deleted event today (see
+     docs/technical-debt.md, TD-085).
+
+10.6 Timer pickup. Changes that arrive through sync are picked up by
+     the alarm timer at its next check (at most 30 seconds). This is an
+     accepted deviation from the immediate rebuild of 3.1(c) and 6.4.
+
+10.7 All-day events. The reminder option is hidden for whole-day
+     events in this release. Saving a whole-day event leaves any
+     existing reminder unchanged and writes no reminder change. All-day
+     reminders do not fire yet; see docs/technical-debt.md (TD-081).
