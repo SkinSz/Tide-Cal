@@ -592,3 +592,90 @@ register(S4, { changes: "pass", state: "fail", conflicts: "fail" }, {});
 // device keeps its own latest edit, the conflict never reaches the row).
 // (a) and (c) PASS on current code, so they are plain tests.
 register(S5, { changes: "pass", state: "fail", conflicts: "pass" }, {});
+
+// ---------------------------------------------------------------- reminders (S6-S9)
+//
+// Reminder scenarios (TD-073). Same harness, same three checks. Check (b)
+// now includes the `reminders` table (fingerprint() in sync_probe_helpers.ts
+// was extended by one SELECT; S1-S5 have no reminder rows, so their results are
+// unchanged). All checks are PLAIN tests: they describe the required behavior,
+// and (b) fails on 02563c5 because reminder changes are stored in history but
+// never written to the reminders table on the receiving device.
+//
+// The reminder ops use the real EventCore.setReminder / clearReminder. On code
+// before the fix a receiving device has no reminder row, so an "edit" made by
+// B becomes a second member_add there (OBSERVED shape difference), which only
+// adds to the divergence.
+
+const SIX: Scenario = {
+  name: "S6 reminder created on A for A's event, reaches B and C via relay",
+  causal: true,
+  async setup(w) { await settle(w); },
+  steps: [
+    { kind: "op", id: "createA", by: "A", after: [], run: (w) => { w.ctx.eid = w.d.A.core.createEvent(ev("rem-evt")).id; } },
+    { kind: "op", id: "remA", by: "A", after: ["createA"], run: (w) => { w.d.A.core.setReminder(w.ctx.eid!, { minutesBefore: 15, enabled: true }); } },
+    pull("B", "createA"), pull("C", "createA"), pull("B", "remA"), pull("C", "remA"),
+  ],
+};
+
+const SEVEN: Scenario = {
+  name: "S7 reminder added by B on A's event (the event may reach C after the reminder)",
+  causal: true,
+  async setup(w) { await settle(w); },
+  steps: [
+    { kind: "op", id: "createA", by: "A", after: [], run: (w) => { w.ctx.eid = w.d.A.core.createEvent(ev("rem-evt")).id; } },
+    { kind: "op", id: "remB", by: "B", after: ["B<-createA"], run: (w) => { w.d.B.core.setReminder(w.ctx.eid!, { minutesBefore: 10, enabled: true }); } },
+    pull("B", "createA"), pull("C", "createA"), pull("A", "remB"), pull("C", "remB"),
+  ],
+};
+
+async function setupEventWithReminder(w: World): Promise<void> {
+  w.ctx.eid = w.d.A.core.createEvent(ev("rem-evt")).id;
+  w.d.A.core.setReminder(w.ctx.eid, { minutesBefore: 15, enabled: true });
+  await settle(w);
+}
+
+const EIGHT_EDIT: Scenario = {
+  name: "S8a reminder edit (A changes it, then B changes it again) via relay",
+  causal: true,
+  setup: setupEventWithReminder,
+  steps: [
+    { kind: "op", id: "editA", by: "A", after: [], run: (w) => { w.d.A.core.setReminder(w.ctx.eid!, { minutesBefore: 30, enabled: true }); } },
+    { kind: "op", id: "editB", by: "B", after: ["B<-editA"], run: (w) => { w.d.B.core.setReminder(w.ctx.eid!, { minutesBefore: 60, enabled: false }); } },
+    pull("B", "editA"), pull("C", "editA"), pull("A", "editB"), pull("C", "editB"),
+  ],
+};
+
+const EIGHT_DELETE: Scenario = {
+  name: "S8b reminder delete (A edits it, then B deletes it) via relay",
+  causal: true,
+  setup: setupEventWithReminder,
+  steps: [
+    { kind: "op", id: "editA", by: "A", after: [], run: (w) => { w.d.A.core.setReminder(w.ctx.eid!, { minutesBefore: 30, enabled: true }); } },
+    { kind: "op", id: "delB", by: "B", after: ["B<-editA"], run: (w) => { w.d.B.core.clearReminder(w.ctx.eid!); } },
+    pull("B", "editA"), pull("C", "editA"), pull("A", "delB"), pull("C", "delB"),
+  ],
+};
+
+const NINE: Scenario = {
+  name: "S9 event deleted on A after its reminder was added (A: create + reminder, then delete)",
+  causal: true,
+  async setup(w) { await settle(w); },
+  steps: [
+    {
+      kind: "op", id: "createA", by: "A", after: [],
+      run: (w) => {
+        w.ctx.eid = w.d.A.core.createEvent(ev("rem-evt")).id;
+        w.d.A.core.setReminder(w.ctx.eid, { minutesBefore: 15, enabled: true });
+      },
+    },
+    { kind: "op", id: "delA", by: "A", after: ["createA"], run: (w) => { w.d.A.core.deleteEvent(w.ctx.eid!); } },
+    pull("B", "createA"), pull("C", "createA"), pull("B", "delA"), pull("C", "delA"),
+  ],
+};
+
+register(SIX, { changes: "pass", state: "pass", conflicts: "pass" }, {});
+register(SEVEN, { changes: "pass", state: "pass", conflicts: "pass" }, {});
+register(EIGHT_EDIT, { changes: "pass", state: "pass", conflicts: "pass" }, {});
+register(EIGHT_DELETE, { changes: "pass", state: "pass", conflicts: "pass" }, {});
+register(NINE, { changes: "pass", state: "pass", conflicts: "pass" }, {});

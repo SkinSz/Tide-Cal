@@ -323,6 +323,8 @@ export interface Fingerprint {
   events: unknown[];
   series: unknown[];
   occurrence_overrides: unknown[];
+  /** reminder members; updated_hlc excluded as local-only */
+  reminders: unknown[];
   digest: string;
 }
 
@@ -346,7 +348,10 @@ export function fingerprint(db: Database.Database): Fingerprint {
       "SELECT series_id,recurrence_id,cancelled,title,start_wall,end_wall,tz_id,utc_start_ms,utc_end_ms FROM occurrence_overrides ORDER BY series_id,recurrence_id",
     )
     .all();
-  const body = { calendars, events, series, occurrence_overrides: oo };
+  const reminders = db
+    .prepare("SELECT member_id,entity_id,minutes_before,enabled FROM reminders ORDER BY member_id")
+    .all();
+  const body = { calendars, events, series, occurrence_overrides: oo, reminders };
   return { ...body, digest: sha(body) };
 }
 
