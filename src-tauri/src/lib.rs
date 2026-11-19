@@ -30,8 +30,58 @@
 //   §6    persistence = ~/.config/tide/config.toml (DC-15 §3.2 layout),
 //         fail-open on malformed files (defaults), env vars win.
 
+mod logfile;
 mod sidecar;
 mod mdns_service;
+// DC-24 §6 (2026-10-11): Windows firewall ruleset check/create. Windows-only
+// module (cfg(windows) inside); check_rules() runs at startup, create_rules()
+// on first sync enablement with a single UAC elevation; degraded mode gates
+// sync only (§6.4). Deletion lives in the NSIS uninstaller (§6.5).
+mod firewall_script;
+#[cfg(windows)]
+mod firewall;
+#[cfg(not(windows))]
+mod firewall_stub {
+    // Non-Windows: the firewall module is a no-op seam so lib.rs call sites
+    // compile unchanged on every platform (DC-24 §6 is Windows-only). The
+    // stub ALWAYS reports RulesPresent — sync is never gated on non-Windows.
+    #![allow(dead_code)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum FirewallState {
+        RulesPresent,
+        RulesMissing,
+        CheckFailed,
+    }
+    impl FirewallState {
+        pub fn as_log_str(self) -> &'static str {
+            match self {
+                FirewallState::RulesPresent => "rules present (stub)",
+                FirewallState::RulesMissing => "rules missing (stub; treat as present)",
+                FirewallState::CheckFailed => "check failed (stub; treat as present)",
+            }
+        }
+    }
+    pub fn check_rules() -> FirewallState {
+        FirewallState::RulesPresent
+    }
+    pub fn create_rules(_exe: std::path::PathBuf, _node: std::path::PathBuf) -> Result<(), FirewallError> {
+        Ok(())
+    }
+    #[derive(Debug)]
+    pub enum FirewallError {
+        ElevationRefused,
+        CreateUnverified,
+    }
+    pub const RULE_NAME_MDNS: &str = "Tide mDNS";
+    pub const RULE_NAME_SYNC: &str = "Tide sync";
+}
+#[cfg(not(windows))]
+use firewall_stub as firewall;
+// Shared sync-port constant: mirrored from src/network/sync_runtime.ts
+// SYNC_DEFAULT_PORT (47471). Single Rust-side literal, named here so the
+// firewall module and sync_endpoint() import it (DC-24 §6.3: never
+// re-hardcoded).
+pub const SYNC_PORT_DEFAULT: u16 = 47471;
 // DC-11 §7: mDNS platform adapter. Lives in the lib so mdns_service (DC-21)
 // can name its concrete adapter type via MdnsAdapterImpl; still NOT
 // registered as Tauri commands — browse events flow through mdns_service's
@@ -188,6 +238,25 @@ fn profile_id() -> &'static str {
     }
 }
 
+/// Log files: `tide.log` (active), `tide.1.log` … `tide.<KEEP>.log`.
+const LOG_FILE_STEM: &str = "tide";
+/// Rotate when the active file would exceed 1 MiB.
+const LOG_MAX_FILE_BYTES: u64 = 1024 * 1024;
+/// Numbered archives kept besides the active file → hard ceiling 5 MiB.
+const LOG_KEEP_ARCHIVES: usize = 4;
+
+/// Profile-aware log folder (dev/release isolation like every other path):
+///   Linux:   ~/.local/share/<profile_id>/logs
+///   Windows: %LOCALAPPDATA%\<profile_id>\logs
+fn log_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    let base = app.path().app_local_data_dir().ok()?;
+    let base = base
+        .parent()
+        .map(|p| p.join(profile_id()))
+        .unwrap_or(base);
+    Some(base.join("logs"))
+}
+
 fn config_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     // DC-15 §3.2: $XDG_CONFIG_HOME/<identifier>/. Tauri's app_config_dir
     // resolves from the bundle identifier, which is fixed per tauri.conf.json
@@ -268,13 +337,200 @@ fn load_settings_pub() -> TideSettings {
 }
 
 fn persist_settings(app: &tauri::AppHandle, s: &TideSettings) -> Result<(), String> {
-    let path = config_path(app)?;
+    save_settings_file(&config_path(app)?, s)
+}
+
+/// DC-28 V4: the Options window Save-all and the Devices dialog Rename both
+/// write config.toml. One lock serializes the two read-modify-write cycles,
+/// and Save-all carries "device_name" over from the file, so neither writer
+/// clobbers the other's key.
+fn save_settings_file(path: &std::path::Path, s: &TideSettings) -> Result<(), String> {
+    let _guard = CONFIG_WRITE_LOCK
+        .lock()
+        .map_err(|_| "config lock poisoned".to_string())?;
+    let existing = std::fs::read_to_string(path).ok();
+    let text = settings_text_keeping_device_name(existing.as_deref(), s)?;
+    write_config_atomic(path, &text)
+}
+
+/// DC-28 V4: the Rename read-modify-write under the same lock. `normalize`
+/// is the sidecar's validator (it also makes the sidecar hold the value);
+/// `restore` puts the sidecar back to the old value if the file write fails.
+fn rename_device_name_file(
+    path: &std::path::Path,
+    raw: &str,
+    normalize: impl FnOnce(&str) -> Result<Option<String>, String>,
+    restore: impl FnOnce(Option<&str>),
+) -> Result<Option<String>, String> {
+    let _guard = CONFIG_WRITE_LOCK
+        .lock()
+        .map_err(|_| "config lock poisoned".to_string())?;
+    let existing = match std::fs::read_to_string(path) {
+        Ok(t) => Some(t),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("read config: {e}")),
+    };
+    let old = device_name_in(existing.as_deref());
+    let normalized = normalize(raw)?;
+    let written = config_text_with_device_name(existing.as_deref(), normalized.as_deref())
+        .and_then(|text| write_config_atomic(path, &text));
+    if let Err(e) = written {
+        restore(old.as_deref());
+        return Err(e);
+    }
+    Ok(normalized)
+}
+
+// ---------------------------------------------------------------------------
+// DC-28 friendly device names: the own name (config.toml "device_name", P9).
+// Display-only (D1). The ONE validator (§4.8) is the sidecar's: the shell
+// never judges a name itself, it pushes the raw value and persists the
+// normalized result. The name is never logged.
+// ---------------------------------------------------------------------------
+
+/// DC-28 P9: config.toml key of this device's own name.
+const DEVICE_NAME_KEY: &str = "device_name";
+
+/// DC-28 V4: serializes every config.toml read-modify-write cycle.
+static CONFIG_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Write temp + rename in the config dir, so a reader never sees a torn file.
+fn write_config_atomic(path: &std::path::Path, text: &str) -> Result<(), String> {
     let dir = path
         .parent()
         .ok_or_else(|| "config path has no parent".to_string())?;
     std::fs::create_dir_all(dir).map_err(|e| format!("create config dir: {e}"))?;
-    let text = toml::to_string_pretty(s).map_err(|e| format!("toml serialize: {e}"))?;
-    std::fs::write(&path, text).map_err(|e| format!("write config: {e}"))
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, text).map_err(|e| format!("write config: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("replace config: {e}"))
+}
+
+/// The "device_name" value of a config text, if it parses and is a string.
+fn device_name_in(text: Option<&str>) -> Option<String> {
+    text.and_then(|t| t.parse::<toml::Table>().ok())
+        .and_then(|t| t.get(DEVICE_NAME_KEY).and_then(|v| v.as_str()).map(str::to_string))
+}
+
+/// Save-all text: the settings struct plus the file's existing device_name.
+fn settings_text_keeping_device_name(
+    existing: Option<&str>,
+    s: &TideSettings,
+) -> Result<String, String> {
+    let mut table = match toml::Value::try_from(s).map_err(|e| format!("toml serialize: {e}"))? {
+        toml::Value::Table(t) => t,
+        _ => return Err("toml serialize: settings are not a table".to_string()),
+    };
+    if let Some(name) = device_name_in(existing) {
+        table.insert(DEVICE_NAME_KEY.to_string(), toml::Value::String(name));
+    }
+    toml::to_string_pretty(&table).map_err(|e| format!("toml serialize: {e}"))
+}
+
+/// Rename text: the existing file with ONLY "device_name" set (Some) or
+/// removed (None); every other key is kept as it is. An unreadable file is
+/// refused, never replaced (that would reset the other settings).
+fn config_text_with_device_name(existing: Option<&str>, name: Option<&str>) -> Result<String, String> {
+    let mut table = match existing {
+        None => toml::Table::new(),
+        Some(text) => text
+            .parse::<toml::Table>()
+            .map_err(|_| "The settings file could not be read, so the name was not saved.".to_string())?,
+    };
+    match name {
+        Some(n) => {
+            table.insert(DEVICE_NAME_KEY.to_string(), toml::Value::String(n.to_string()));
+        }
+        None => {
+            table.remove(DEVICE_NAME_KEY);
+        }
+    }
+    toml::to_string_pretty(&table).map_err(|e| format!("toml serialize: {e}"))
+}
+
+/// DC-28 P2 / V3: the rename field's SUGGESTION, from the OS family only
+/// (compile-time target). Never the hostname. Saved only on the user's Save.
+fn os_family_suggestion() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Windows PC"
+    } else if cfg!(target_os = "macos") {
+        "Mac"
+    } else if cfg!(target_os = "linux") {
+        "Linux PC"
+    } else {
+        ""
+    }
+}
+
+/// Push a raw own name to the sidecar (its §4.8 validator) and return the
+/// normalized value it now holds; None = no name. Invalid -> Err(sentence).
+fn sidecar_set_device_name(sc: &sidecar::Sidecar, raw: Option<&str>) -> Result<Option<String>, String> {
+    let v = proxy(sc, "set_device_name", json!({ "name": raw.unwrap_or("") }))?;
+    Ok(v["device_name"].as_str().map(str::to_string))
+}
+
+/// Startup / re-sync: hand the SAVED own name to the sidecar so pairing can
+/// send it (P3). An invalid hand-edited value is ignored (not sent, not
+/// shown); the log line never carries the text.
+fn push_saved_device_name(app: &tauri::AppHandle, sc: &sidecar::Sidecar) -> Option<String> {
+    // Same lock as the writers: never push a value a concurrent Rename is
+    // replacing (the sidecar would end up holding the old one).
+    let _guard = CONFIG_WRITE_LOCK.lock().ok()?;
+    let saved = config_path(app)
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok());
+    let raw = device_name_in(saved.as_deref());
+    match sidecar_set_device_name(sc, raw.as_deref()) {
+        Ok(name) => name,
+        Err(_) => {
+            // invalid hand-edited value, or the call failed: not sent, not shown
+            log::warn!("device_name in config.toml not applied (invalid or sidecar call failed)");
+            let _ = sidecar_set_device_name(sc, None);
+            None
+        }
+    }
+}
+
+/// DC-28 §4.4: the own name for the "This device:" line, plus the P2
+/// suggestion. Re-pushes the saved value (idempotent), so a restarted
+/// sidecar holds it again before the user can start a pairing.
+#[tauri::command]
+async fn get_device_name(
+    app: tauri::AppHandle,
+    sc: State<'_, SidecarState>,
+) -> Result<serde_json::Value, String> {
+    let handle = sidecar_handle(&sc)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let name = push_saved_device_name(&app, &handle);
+        Ok(json!({ "device_name": name, "suggestion": os_family_suggestion() }))
+    })
+    .await
+    .map_err(|e| format!("join sidecar task: {e}"))?
+}
+
+/// DC-28 §4.4/P3/P9: save the own name ("" clears it). Order: the sidecar
+/// validates and holds it, then config.toml is rewritten with only this key
+/// changed; if the write fails the sidecar is put back to the old value.
+#[tauri::command(rename_all = "snake_case")]
+async fn set_device_name(
+    app: tauri::AppHandle,
+    sc: State<'_, SidecarState>,
+    name: String,
+) -> Result<serde_json::Value, String> {
+    let handle = sidecar_handle(&sc)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = config_path(&app)?;
+        let normalized = rename_device_name_file(
+            &path,
+            &name,
+            |raw| sidecar_set_device_name(&handle, Some(raw)),
+            |old| {
+                let _ = sidecar_set_device_name(&handle, old);
+            },
+        )?;
+        Ok(json!({ "device_name": normalized }))
+    })
+    .await
+    .map_err(|e| format!("join sidecar task: {e}"))?
 }
 
 /// DC-20 §4.2: read the effective settings (env > file > default).
@@ -329,6 +585,40 @@ fn proxy(
         log::warn!("sidecar {op} failed: {e}");
         e
     })
+}
+
+/// Blocking sidecar call from a sync runtime context (DC-21 §5.1 startup
+/// sequence: the shell must not block the setup thread on a sidecar RPC —
+/// used only where the call is already order-independent or inside a
+/// spawn_blocking worker).
+fn spawn_blocking_sidecar_call(
+    sc: &Arc<sidecar::Sidecar>,
+    op: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let sc = Arc::clone(sc);
+    let op = op.to_string();
+    tauri::async_runtime::block_on(async move {
+        tauri::async_runtime::spawn_blocking(move || proxy(&sc, &op, args))
+            .await
+            .map_err(|e| format!("join sidecar task: {e}"))?
+    })
+}
+
+/// Shared mDNS registration entry (DC-21 §3.4): registers the tide-sync
+/// service through the app-lifetime RegistrationService (bug #1b: the daemon
+/// must live as long as the app — a function-local daemon was dropped on
+/// return, killing the announce cycle before it ever multicasted).
+#[cfg(feature = "mdns")]
+fn mdns_register_shared(
+    app: &AppHandle,
+    instance_name: &str,
+    port: u16,
+    txt: &std::collections::HashMap<String, String>,
+    host_label: &str,
+) -> Result<(), String> {
+    app.state::<crate::mdns_service::RegistrationService>()
+        .register(instance_name, port, txt, host_label)
 }
 
 #[tauri::command]
@@ -592,11 +882,13 @@ async fn sync_op(
     op: String,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    const ALLOWED: [&str; 24] = [
+    const ALLOWED: [&str; 29] = [
         "device_info",
         "pairing_offer",
         "pairing_accept",
         "cancel_pairing_offer",
+        // DC-05 Appendix B.6: read-only status of the latest pairing offer.
+        "pairing_offer_status",
         "sync_now",
         // TD-005/DC-16 quarantine + peer-misbehavior surface (sync_errors,
         // paired_devices dialogs):
@@ -604,10 +896,19 @@ async fn sync_op(
         "quarantine_stats",
         "retry_quarantine",
         "delete_quarantine",
+        "dismiss_quarantine_warning",
         "peer_state",
         "list_paired_devices",
         "reset_peer_state",
         "unblock_peer",
+        // DC-27: Unpair (sidecar refuses without confirm:true) + the
+        // read-only Removed devices listing.
+        "unpair_device",
+        "list_removed_devices",
+        // DC-28 §4.4: local nickname of a paired device (never sent). The
+        // own name is NOT here: it goes through set_device_name, which
+        // persists it in config.toml.
+        "set_peer_nickname",
         "list_series",
         // DC-22: reminder member write path (event dialog "Remind me").
         "get_reminder",
@@ -635,6 +936,15 @@ async fn sync_op(
         .map_err(|e| format!("join sidecar task: {e}"))?
 }
 
+// NOTE (DC-24 §6.2/§6.4, 2026-10-11): the sync-op firewall gate is NOT
+// placed inside sync_op (Tauri State<'_, SidecarState> has no AppHandle).
+// It lives in trigger_sync_now (which HAS the AppHandle) and in the setup
+// startup call — see ensure_firewall(). Pairing ops currently run through
+// sync_op unconditionally; on Windows the startup check + manual-sync gate
+// cover the §6.2 timing (startup + first sync enablement). This honest
+// scope note travels with the implementation: mdns_browse/pairing ops get
+// the same gate when they gain a reachable AppHandle seam.
+
 fn sidecar_handle(sc: &SidecarState) -> Result<Arc<sidecar::Sidecar>, String> {
     sc.0
         .lock()
@@ -647,17 +957,20 @@ fn sidecar_handle(sc: &SidecarState) -> Result<Arc<sidecar::Sidecar>, String> {
 // DC-19 §4.2 manual "Sync now" (tray menu + in-app toolbar fallback)
 // ---------------------------------------------------------------------------
 
-/// Peer endpoint for the manual sync pass. Honest v1: the DC-07 peers table
-/// stores no host/port and mDNS browse results are not yet plumbed to the
-/// shell, so the endpoint comes from the environment (dev/single-machine
-/// deployments). Defaults match the sidecar's SYNC_DEFAULT_PORT.
+/// Peer endpoint for the manual sync pass. RETIRED (bug #1b, owner decision
+/// B, 2026-11-13): manual sync now resolves endpoints through the sidecar's
+/// sync_endpoints op (live mDNS / last-known chain, DC-21 §4.3/D7). The
+/// env-var override below previously defaulted to 127.0.0.1 — dialing the
+/// local machine itself — which is exactly why cross-device "Sync now"
+/// silently did nothing. Kept as documentation only; no code path reads it.
+#[allow(dead_code)]
 fn sync_endpoint() -> (String, u16) {
     let host = std::env::var("TIDE_SYNC_PEER_HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let port = std::env::var("TIDE_SYNC_PEER_PORT")
         .or_else(|_| std::env::var("TIDE_SYNC_PORT"))
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(47471);
+        .unwrap_or(crate::SYNC_PORT_DEFAULT);
     (host, port)
 }
 
@@ -675,6 +988,110 @@ fn set_sync_enabled(app: &AppHandle, enabled: bool) {
         }
     }
     let _ = app.emit("tide://sync-state", enabled);
+}
+
+// ---------------------------------------------------------------------------
+// DC-24 §6: Windows firewall gate (sync enablement path only).
+// ---------------------------------------------------------------------------
+
+/// Managed flag: true while sync is degraded because the firewall ruleset
+/// could not be established (DC-24 §6.4). Gates trigger_sync_now only —
+/// every other feature is unaffected by definition (owner decision).
+struct SyncDegraded(std::sync::atomic::AtomicBool);
+
+/// Effective tide executable for the firewall rules (program= scope). The
+/// current process's own exe (tide.exe in the NSIS install dir).
+fn effective_exe_path() -> std::path::PathBuf {
+    std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("tide.exe"))
+}
+
+/// Program scope of the "Tide sync" rule (DC-24 §6.3 as amended
+/// 2026-11-14): the Node runtime that actually owns the sync listener.
+/// Falls back to node.exe next to tide.exe when the resolved runtime is a
+/// bare PATH name (dev builds), so the rule still names a concrete file.
+fn firewall_node_path(app: &AppHandle) -> std::path::PathBuf {
+    let node = std::path::PathBuf::from(resolve_node_command(app));
+    if node.is_absolute() {
+        return node;
+    }
+    // Review 2026-11-14 finding 3: a bare PATH name (dev/system node) has
+    // no file to scope the rule to. Name the expected bundled location and
+    // say so, rather than silently scoping to a file that may not exist.
+    let fallback = effective_exe_path()
+        .parent()
+        .map(|d| d.join("node.exe"))
+        .unwrap_or(node);
+    log::warn!(
+        "firewall: sidecar runs on a PATH node, not a bundled runtime; \"Tide sync\" rule scoped to {} (may not match the real listener)",
+        fallback.display()
+    );
+    fallback
+}
+
+/// Ensure the firewall ruleset is present (DC-24 §6.2/§6.3/§6.4). Called at
+/// app startup AND lazily at sync enablement. Returns true when sync may
+/// proceed (rules present); on failure enters degraded mode: sets the flag,
+/// disables the tray sync item, emits the degraded notice, and returns
+/// false. NEVER retries elevation silently — a retry happens only when the
+/// user explicitly acts (§6.4).
+///
+/// Posture (review fix #7): the STARTUP call only CHECKS — it never
+/// elevates. Rule creation happens at the first SYNC-ENABLEMENT moment
+/// (user opened devices/sync) or via explicit Try again. This avoids the
+/// per-launch UAC prompt loop a startup-create would cause after a refusal.
+fn ensure_firewall(app: &AppHandle, allow_create: bool) -> bool {
+    use std::sync::atomic::Ordering;
+    let state = match firewall::check_rules() {
+        firewall::FirewallState::RulesPresent => return true,
+        firewall::FirewallState::RulesMissing => {
+            if !allow_create {
+                // Startup posture: missing rules do NOT trigger elevation
+                // from setup. Sync stays enabled (default-outbound + the
+                // check is advisory here); the create path runs at first
+                // sync enablement instead.
+                log::info!("firewall check: rules missing at startup; deferring creation to first sync enablement (DC-24 §6.2, no launch-time UAC)");
+                return true;
+            }
+            firewall::create_rules(effective_exe_path(), firewall_node_path(app))
+        }
+        firewall::FirewallState::CheckFailed => {
+            // Fail-VISIBLE but not fail-closed at startup: log + surface the
+            // notice; sync enablement will re-check (§6.2 lazy re-check).
+            log::warn!("firewall check failed; degraded notice shown, sync enablement will re-check (DC-24 §6.4)");
+            app.state::<SyncDegraded>().0.store(true, Ordering::SeqCst);
+            let _ = app.emit("tide://firewall-degraded", FIREWALL_NOTICE_CHECK_FAILED);
+            return true;
+        }
+    };
+    match state {
+        Ok(()) => {
+            app.state::<SyncDegraded>()
+                .0
+                .store(false, Ordering::SeqCst);
+            true
+        }
+        Err(_) => {
+            app.state::<SyncDegraded>().0.store(true, Ordering::SeqCst);
+            set_sync_enabled(app, false);
+            let _ = app.emit("tide://firewall-degraded", FIREWALL_NOTICE_CREATE_FAILED);
+            false
+        }
+    }
+}
+
+const FIREWALL_NOTICE_CREATE_FAILED: &str = "Sync is off: Windows Firewall rules could not be created. Use Try again to re-attempt.";
+const FIREWALL_NOTICE_CHECK_FAILED: &str = "Windows Firewall status could not be verified. Sync may not discover devices; open Devices and use Try again to re-check.";
+
+/// Explicit "Try again" entry (DC-24 §6.4): re-runs the check + elevation
+/// ONLY on user action. Registered as a Tauri command (tray/in-app notice).
+/// Blocking child processes (netsh, elevated PowerShell with -Wait) run on
+/// the blocking pool, NOT the async-runtime worker (review fix #6).
+#[tauri::command]
+async fn retry_firewall(app: AppHandle) -> Result<bool, String> {
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || ensure_firewall(&app2, true))
+        .await
+        .map_err(|e| format!("join ensure_firewall: {e}"))
 }
 
 /// Fire-and-forget manual sync pass through the existing sync_now RPC op
@@ -725,24 +1142,152 @@ fn trigger_sync_now(app: &AppHandle) -> Result<serde_json::Value, String> {
         return start(false, "no peers are paired");
     }
 
-    let (host, port) = sync_endpoint();
-    log::info!("manual sync_now -> {host}:{port} (peers: {})", peers.len());
+    // DC-24 §6.2/§6.4: lazy firewall gate at sync enablement (allow_create
+    // = true: pressing Sync now IS the §6.2 "first sync use" moment). It
+    // must run BEFORE endpoint resolution (bug #1b, 2026-11-13): peers are
+    // only resolvable once inbound mDNS is allowed, so gating after the
+    // "no resolvable endpoints" early return meant the rules were never
+    // created. NOTE (pre-existing, tracked as debt): this call blocks its
+    // caller (tray menu thread / the async command worker) while the UAC
+    // prompt is open, so the UI is unresponsive until the user answers.
+    // Failure releases the in-flight flag via start(false, …).
+    if !ensure_firewall(app, true) {
+        return start(false, "sync unavailable: Windows Firewall rules could not be established (see notice; Try again to re-attempt)");
+    }
+
+    // DC-11 A.2 (owner 2026-11-14): pressing Sync now also asks the network
+    // again (rate-limited in BrowseService); the pass below retries unreached
+    // peers once after the query round had time to answer.
+    if let Some(svc) = app.try_state::<mdns_service::BrowseService>() {
+        svc.kick();
+    }
+
+    // Bug #1b (owner decision B, 2026-11-13): resolve each paired peer's
+    // endpoint through the sidecar's sync_endpoints op — the SAME live-mDNS /
+    // last-known chain the scheduler uses (DC-21 §4.3/D7). Each resolved peer
+    // gets its own sync_now pass; peers with no resolvable endpoint are
+    // skipped with a log line (honest degradation, DC-21 §4.3 step 3).
+    //
+    // DC-11 A.2 (owner 2026-11-14, review MAJOR-2): the kick above cannot
+    // help a pass that resolves endpoints immediately, so a peer that was
+    // skipped or failed gets ONE more attempt after SYNC_NOW_REQUERY_WAIT,
+    // and only if it now resolves to a DIFFERENT endpoint (a peer that is
+    // simply offline is not dialled twice). Resolution runs on the worker,
+    // never on the tray/menu thread.
     let app2 = app.clone();
     tauri::async_runtime::spawn(async move {
         let result = tauri::async_runtime::spawn_blocking(move || {
-            proxy(&sc, "sync_now", json!({ "host": host, "port": port }))
+            use std::collections::{HashMap, HashSet};
+            let mut results: Vec<serde_json::Value> = Vec::new();
+            let mut done: HashSet<String> = HashSet::new();
+            let mut tried: HashMap<String, (String, u16)> = HashMap::new();
+            for round in 0..2 {
+                if round == 1 {
+                    if done.len() >= peers.len() {
+                        break;
+                    }
+                    std::thread::sleep(SYNC_NOW_REQUERY_WAIT);
+                }
+                let resolved = match resolve_sync_endpoints(&sc) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        log::warn!("manual sync_now: sync_endpoints failed: {e}");
+                        continue;
+                    }
+                };
+                if round == 0 {
+                    log::info!(
+                        "manual sync_now -> {} peer(s): {} (peers paired: {})",
+                        resolved.len(),
+                        resolved
+                            .iter()
+                            .map(|(d, h, p)| format!("{d}@{h}:{p}"))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        peers.len()
+                    );
+                }
+                // Serial passes: a manual pass is user-triggered; serial keeps
+                // load and log output predictable (DC-13 §4.1 allows either).
+                for (device_id, host, port) in resolved {
+                    if done.contains(&device_id) {
+                        continue;
+                    }
+                    if round == 1 && tried.get(&device_id) == Some(&(host.clone(), port)) {
+                        continue; // same endpoint already failed this press
+                    }
+                    if round == 1 {
+                        log::info!("manual sync_now: retrying {device_id} at a newly discovered endpoint (DC-11 A.2)");
+                    }
+                    tried.insert(device_id.clone(), (host.clone(), port));
+                    match proxy(&sc, "sync_now", json!({ "host": host, "port": port })) {
+                        Ok(v) => {
+                            log::info!("manual sync_now {device_id}@{host}:{port} finished: {v}");
+                            done.insert(device_id.clone());
+                            results.push(json!({
+                                "device_id": device_id, "host": host, "port": port,
+                                "ok": true, "result": v
+                            }));
+                        }
+                        Err(e) => {
+                            log::warn!("manual sync_now {device_id}@{host}:{port} failed: {e}");
+                            results.push(json!({
+                                "device_id": device_id, "host": host, "port": port,
+                                "ok": false, "error": e
+                            }));
+                        }
+                    }
+                }
+            }
+            if tried.is_empty() {
+                log::warn!("manual sync_now: no resolvable peer endpoints (peers paired, but mDNS browse found nothing and no last-known endpoint is stored)");
+            }
+            serde_json::to_value(results).unwrap_or(serde_json::Value::Null)
         })
         .await
-        .unwrap_or_else(|e| Err(format!("join sidecar task: {e}")));
-        match result {
-            Ok(v) => log::info!("manual sync_now finished: {v}"),
-            Err(e) => log::warn!("manual sync_now failed: {e}"),
-        }
+        .unwrap_or_else(|e| {
+            log::warn!("manual sync_now join failure: {e}");
+            serde_json::Value::Null
+        });
+        log::info!("manual sync_now finished: {}", result);
         app2.state::<SyncFlight>().0.store(false, Ordering::SeqCst);
         set_sync_enabled(&app2, true);
         let _ = app2.emit("tide://sync-state", true);
     });
     start(true, "")
+}
+
+/// DC-11 A.2: how long a Sync now press waits for the on-demand mDNS query
+/// round before its single retry of unreached peers.
+const SYNC_NOW_REQUERY_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// sync_endpoints → [(device_id, host, port)] for peers with an endpoint;
+/// peers without one are logged and left out.
+fn resolve_sync_endpoints(
+    sc: &sidecar::Sidecar,
+) -> Result<Vec<(String, String, u16)>, String> {
+    proxy(sc, "sync_endpoints", json!({}))
+        .and_then(|v| {
+            serde_json::from_value::<Vec<serde_json::Value>>(serde_json::Value::Array(
+                v["endpoints"].as_array().cloned().unwrap_or_default(),
+            ))
+            .map_err(|e| e.to_string())
+        })
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    let device_id = row["device_id"].as_str()?.to_string();
+                    let ep = &row["endpoint"];
+                    if ep.is_null() {
+                        log::info!("manual sync_now: peer {device_id} has no resolvable endpoint (mDNS + last-known empty) — skipped");
+                        return None;
+                    }
+                    let host = ep["host"].as_str()?.to_string();
+                    let port = ep["port"].as_u64()? as u16;
+                    Some((device_id, host, port))
+                })
+                .collect()
+        })
 }
 
 #[tauri::command]
@@ -785,6 +1330,32 @@ fn quit_app(app: &AppHandle) {
 /// 1. TIDE_SIDECAR_PATH env override
 /// 2. app resource dir (bundled builds)
 /// 3. ../../dist/sidecar.mjs relative to cwd (dev)
+/// Resolve the Node runtime for the sidecar (DC-24 P3: in-bundle, no system
+/// Node dependency on Windows). Order:
+/// 1. TIDE_NODE_PATH env (test/power-user hook)
+/// 2. bundled node.exe in the app resource dir (Windows NSIS builds)
+/// 3. system `node` on PATH (Linux: deb/rpm nodejs dependency; dev)
+fn resolve_node_command(app: &tauri::AppHandle) -> String {
+    if let Ok(p) = std::env::var("TIDE_NODE_PATH") {
+        if std::path::Path::new(&p).is_file() {
+            return p;
+        }
+        log::warn!("TIDE_NODE_PATH={p} does not exist; trying bundled/system node");
+    }
+    if let Ok(res) = app.path().resource_dir() {
+        let bundled = res.join("node.exe");
+        // A zero-byte/placeholder node.exe (dev builds: .gitignore keeps the
+        // real runtime out of the repo) must NOT shadow the system node —
+        // it isn't executable, and spawning it fails with EACCES, killing
+        // the sidecar (dev-launch regression, 2026-11-12).
+        let bundled_ok = bundled.is_file() && bundled.metadata().map(|m| m.len() > 0).unwrap_or(false);
+        if bundled_ok {
+            return bundled.display().to_string();
+        }
+    }
+    "node".to_string()
+}
+
 fn resolve_sidecar_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("TIDE_SIDECAR_PATH") {
         let p = std::path::PathBuf::from(p);
@@ -901,6 +1472,15 @@ fn open_options_window(app: &tauri::AppHandle) {
     }
 }
 
+/// Burger menu "Options…" (owner request 2026-11-14): same window as the
+/// tray entry, so the options are reachable without a tray (DC-19 §4.6).
+/// async: creating a window from a synchronous command runs on the main
+/// thread and deadlocks on Windows (Tauri docs, WebviewWindowBuilder).
+#[tauri::command]
+async fn open_options(app: tauri::AppHandle) {
+    open_options_window(&app);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // General.locale (DC-20, owner request 2026-09-03): WebKitGTK formats
@@ -957,21 +1537,48 @@ pub fn run() {
             ) {
                 let _ = win.set_icon(icon);
             }
+            // Logging is ON in release builds too (owner decision 2026-11-13:
+            // installed builds previously discarded every log line, which
+            // made field diagnosis impossible). Disk use is hard-bounded by
+            // logfile::RotatingLog (numbered archives, see that module), and
+            // logging is best-effort: a log problem must never stop the app
+            // (a setup() error panics in Tauri = no window at all).
+            let mut log_targets = Vec::new();
+            if let Some(dir) = log_dir(app.handle()) {
+                logfile::prune_legacy_logs(&dir, LOG_FILE_STEM);
+                let writer: Box<dyn std::io::Write + Send> = Box::new(logfile::RotatingLog::new(
+                    dir,
+                    LOG_FILE_STEM,
+                    LOG_MAX_FILE_BYTES,
+                    LOG_KEEP_ARCHIVES,
+                ));
+                log_targets.push(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::Dispatch(
+                        tauri_plugin_log::fern::Dispatch::new().chain(writer),
+                    ),
+                ));
+            }
             if cfg!(debug_assertions) {
-                app.handle().plugin(
-                    tauri_plugin_log::Builder::default()
-                        .level(log::LevelFilter::Info)
-                        // Suppress the libayatana-appindicator deprecation
-                        // notice — it comes from the tray library itself on
-                        // every launch, is not actionable in Tide, and just
-                        // drowns the useful startup lines.
-                        .filter(|metadata| {
-                            !metadata
-                                .target()
-                                .starts_with("libayatana_appindicator")
-                        })
-                        .build(),
-                )?;
+                log_targets.push(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::Stdout,
+                ));
+            }
+            if let Err(e) = app.handle().plugin(
+                tauri_plugin_log::Builder::default()
+                    .targets(log_targets)
+                    .level(log::LevelFilter::Info)
+                    // Suppress the libayatana-appindicator deprecation
+                    // notice — it comes from the tray library itself on
+                    // every launch, is not actionable in Tide, and just
+                    // drowns the useful startup lines.
+                    .filter(|metadata| {
+                        !metadata
+                            .target()
+                            .starts_with("libayatana_appindicator")
+                    })
+                    .build(),
+            ) {
+                eprintln!("tide: logging unavailable ({e}); continuing without a log file");
             }
 
             // DC-19 §2.3: tray-less desktop (no StatusNotifier support) —
@@ -1000,10 +1607,25 @@ pub fn run() {
             // Tauri state() panics on unmanaged types. Snapshot push and
             // browse-loop start both run after this line.
             app.manage(mdns_service::BrowseService::new());
+            // Bug #1b final piece (2026-11-13): the mDNS registration daemon
+            // MUST live for the app's whole lifetime. mdns-sd's register()
+            // only QUEUES the command — probing (750ms), the announce cycle,
+            // and answering later queries all run on the daemon's background
+            // thread. A daemon created as a function-local and dropped on
+            // return dies before announcing anything (verified by controlled
+            // experiment: same-machine browser saw a held-alive probe within
+            // 50ms, and NEVER saw Tide's service). Managed here; register()
+            // below reuses this instance.
+            #[cfg(feature = "mdns")]
+            app.manage(mdns_service::RegistrationService::new());
 
             match resolve_sidecar_path(app.handle()) {
                 Some(path) => {
-                    let mut cmd = std::process::Command::new("node");
+                    // DC-24 P3 (2026-10-12): bundled node.exe preferred on
+                    // Windows; system node stays the Linux/dev path.
+                    let node = resolve_node_command(app.handle());
+                    log::info!("sidecar node runtime: {node}");
+                    let mut cmd = std::process::Command::new(&node);
                     cmd.env("TIDE_DB_PATH", &db_path);
                     // Dev-profile isolation (2026-09-07): set TIDE_DATA_DIR
                     // explicitly so the sidecar's identity bootstrap
@@ -1013,7 +1635,30 @@ pub fn run() {
                     // and a dev instance is a genuinely separate device.
                     cmd.env("TIDE_DATA_DIR", &data_dir);
                     cmd.arg(&path);
-                    match sidecar::Sidecar::spawn(cmd) {
+                    // DC-26 §3.2: forward sidecar data notices to the
+                    // window. Unknown kinds: debug log, ignored. emit() only
+                    // queues, so the reader thread never blocks here.
+                    let notice_app = app.handle().clone();
+                    let notices: sidecar::NoticeSink = Arc::new(move |msg: &serde_json::Value| {
+                        match msg["notice"].as_str() {
+                            Some("data_changed") => {
+                                let applied = msg["applied"].as_u64().unwrap_or(0);
+                                let _ = notice_app.emit(
+                                    "tide://data-changed",
+                                    serde_json::json!({ "applied": applied }),
+                                );
+                            }
+                            // DC-11 A.2: a paired peer was unreachable in a
+                            // background pass; BrowseService rate-limits.
+                            Some("discovery_kick") => {
+                                if let Some(svc) = notice_app.try_state::<mdns_service::BrowseService>() {
+                                    svc.kick();
+                                }
+                            }
+                            other => log::debug!("sidecar notice ignored: {other:?}"),
+                        }
+                    });
+                    match sidecar::Sidecar::spawn_with_notices(cmd, notices) {
                         Ok(sc) => {
                             match sc.ping() {
                                 Ok(_) => log::info!(
@@ -1036,7 +1681,62 @@ pub fn run() {
                                 let sc_arc = Arc::new(sc);
                                 let svc = app.state::<mdns_service::BrowseService>();
                                 svc.push_snapshot(Arc::new(mdns_service::PingSink { sc: Arc::clone(&sc_arc) }));
-                                app.manage(SidecarState(Mutex::new(Some(sc_arc))));
+                                app.manage(SidecarState(Mutex::new(Some(Arc::clone(&sc_arc)))));
+
+                                // DC-28 P3/P9: hand the saved own name to the
+                                // sidecar (pairing sends only that value).
+                                {
+                                    let app2 = app.handle().clone();
+                                    let sc2 = Arc::clone(&sc_arc);
+                                    let _ = tauri::async_runtime::spawn_blocking(move || {
+                                        let _ = push_saved_device_name(&app2, &sc2);
+                                    });
+                                }
+
+                                // DC-21 §3.4 (bug #1b follow-up, 2026-11-13):
+                                // REGISTER this device on mDNS. Until now
+                                // TideMdns::register was never called — both
+                                // devices browsed but neither announced, so
+                                // both endpoint caches stayed empty and
+                                // cross-device sync had no addresses to dial.
+                                // Registration uses the sidecar's ACTUAL
+                                // listening port (device_info.listening_port)
+                                // and an instance name matching the §3.3
+                                // prefilter (8-hex SHA-256(device_id) prefix).
+                                // Failure degrades honestly (§6.1): the log
+                                // line names the reason; sync falls back to
+                                // last-known endpoints.
+                                let reg = spawn_blocking_sidecar_call(&Arc::clone(&sc_arc), "device_info", serde_json::json!({}));
+                                if let Ok(info) = reg {
+                                    let port = info["listening_port"].as_u64().unwrap_or(0) as u16;
+                                    let instance = info["instance_name"]
+                                        .as_str()
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let mut txt = std::collections::HashMap::new();
+                                    if let Some(obj) = info["txt"].as_object() {
+                                        for (k, v) in obj {
+                                            if let Some(s) = v.as_str() {
+                                                txt.insert(k.clone(), s.to_string());
+                                            }
+                                        }
+                                    }
+                                    // Host label: derived from the public,
+                                    // opaque instance name only (DC-11 §2.2),
+                                    // never the device_id. Bug #1b root cause:
+                                    // the device_id form was a 71-byte DNS
+                                    // label, so SRV/A were silently dropped.
+                                    let host_label = tide_discovery::host_label_for(&instance);
+                                    if port == 0 || instance.is_empty() {
+                                        log::warn!("mdns registration skipped: sidecar supplied no listening port/instance name");
+                                    } else if let Err(e) = mdns_register_shared(
+                                        app.handle(), &instance, port, &txt, &host_label,
+                                    ) {
+                                        log::warn!("mdns service registration failed: {e} (browsing still active; peers must have a last-known endpoint to reach us)");
+                                    } else {
+                                        log::info!("mdns service registered: {instance} on port {port}");
+                                    }
+                                }
                             }
                         }
                         Err(e) => {
@@ -1055,6 +1755,19 @@ pub fn run() {
                 }
             }
             app.manage(SyncFlight(AtomicBool::new(false)));
+            // DC-24 §6.4: degraded-mode flag, managed BEFORE the startup
+            // firewall check below can touch it.
+            app.manage(SyncDegraded(AtomicBool::new(false)));
+            // DC-24 §6.2: startup firewall check (Windows; no-op elsewhere).
+            // Check-ONLY at startup (allow_create=false): no launch-time UAC
+            // prompt; creation is deferred to first sync enablement (review
+            // fix #7 posture). Blocking netsh call → blocking pool (fix #6).
+            {
+                let app2 = app.handle().clone();
+                let _ = tauri::async_runtime::spawn_blocking(move || {
+                    let _ = ensure_firewall(&app2, false);
+                });
+            }
 
 
             // DC-21 §3.1/§3.2/§5.1: start continuous mDNS browsing in the
@@ -1159,9 +1872,12 @@ pub fn run() {
             update_event,
             delete_event,
             manual_sync_now,
+            retry_firewall,
             quit_tide,
             get_settings,
             set_settings,
+            get_device_name,
+            set_device_name,
             get_reminder,
             set_reminder,
             clear_reminder,
@@ -1169,7 +1885,8 @@ pub fn run() {
             update_series_rule,
             update_occurrence,
             export_ics,
-            import_ics
+            import_ics,
+            open_options
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1266,5 +1983,155 @@ max_incremental_backlog = 1000.0
         let s: TideSettings = toml::from_str(text).expect("parse");
         assert_eq!(s.general_theme, "dark");
         assert_eq!(s.general_time_format, "24h");
+    }
+}
+
+#[cfg(test)]
+mod dc28_device_name_config_tests {
+    use super::*;
+
+    const EXISTING: &str = "sync_debounce_seconds = 10.0\nsweep_interval_minutes = 10.0\nmax_concurrent_sessions = 3.0\nmax_incremental_backlog = 1000.0\n\"general.theme\" = \"light\"\ndevice_name = \"Windows PC\"\n";
+
+    #[test]
+    fn v4_save_all_keeps_the_device_name_from_the_file() {
+        // Options window Save-all sends TideSettings, which has no
+        // device_name: the key must be carried over, not dropped.
+        let mut s = TideSettings::default();
+        s.general_theme = "dark".to_string();
+        let out = settings_text_keeping_device_name(Some(EXISTING), &s).expect("text");
+        let t: toml::Table = out.parse().expect("parse");
+        assert_eq!(t["device_name"].as_str(), Some("Windows PC"));
+        assert_eq!(t["general.theme"].as_str(), Some("dark"));
+        // and a file without a name gains none
+        let out = settings_text_keeping_device_name(None, &s).expect("text");
+        assert!(!out.contains("device_name"));
+    }
+
+    #[test]
+    fn v4_rename_changes_only_the_device_name_key() {
+        let out = config_text_with_device_name(Some(EXISTING), Some("Office \"laptop\"")).expect("text");
+        let t: toml::Table = out.parse().expect("parse");
+        assert_eq!(t["device_name"].as_str(), Some("Office \"laptop\""));
+        assert_eq!(t["general.theme"].as_str(), Some("light"));
+        assert_eq!(t["max_incremental_backlog"].as_float(), Some(1000.0));
+        let cleared = config_text_with_device_name(Some(&out), None).expect("text");
+        let t: toml::Table = cleared.parse().expect("parse");
+        assert!(t.get("device_name").is_none());
+        assert_eq!(t["general.theme"].as_str(), Some("light"));
+    }
+
+    #[test]
+    fn v4_rename_refuses_an_unreadable_file_instead_of_replacing_it() {
+        let err = config_text_with_device_name(Some("this is = = not toml"), Some("X")).unwrap_err();
+        assert!(!err.contains('X'), "the refusal must not echo the name");
+    }
+
+    #[test]
+    fn v4_settings_load_ignores_the_device_name_key() {
+        let s: TideSettings = toml::from_str(EXISTING).expect("unknown key ignored");
+        assert_eq!(s.general_theme, "light");
+        assert_eq!(device_name_in(Some(EXISTING)).as_deref(), Some("Windows PC"));
+        assert_eq!(device_name_in(Some("device_name = 5")), None);
+        assert_eq!(device_name_in(None), None);
+    }
+
+    /// Scratch dir under the crate's target/ (never /tmp).
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("dc28-test-{tag}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn v4_concurrent_writers_keep_both_keys_on_disk() {
+        // Rename and Save-all race on real threads, released together by a
+        // barrier, through the SAME functions the commands use. Without the
+        // shared lock one writer's read-modify-write can overwrite the
+        // other's key (lost update); with it, both keys always survive.
+        let dir = scratch_dir("race");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        const ROUNDS: usize = 200;
+        for round in 0..ROUNDS {
+            std::fs::remove_file(&path).ok();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let (p1, b1) = (path.clone(), barrier.clone());
+            let renamer = std::thread::spawn(move || {
+                b1.wait();
+                rename_device_name_file(
+                    &p1,
+                    "Laptop",
+                    |raw| {
+                        // widen the race window inside the critical section
+                        std::thread::yield_now();
+                        Ok(Some(raw.to_string()))
+                    },
+                    |_| {},
+                )
+                .unwrap();
+            });
+            let (p2, b2) = (path.clone(), barrier.clone());
+            let saver = std::thread::spawn(move || {
+                let mut s = TideSettings::default();
+                s.general_theme = "light".to_string();
+                b2.wait();
+                save_settings_file(&p2, &s).unwrap();
+            });
+            renamer.join().unwrap();
+            saver.join().unwrap();
+            let t: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+            assert_eq!(t.get("device_name").and_then(|v| v.as_str()), Some("Laptop"), "round {round}");
+            assert_eq!(t.get("general.theme").and_then(|v| v.as_str()), Some("light"), "round {round}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn v4_failed_rename_write_restores_the_old_name() {
+        let dir = scratch_dir("restore");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "device_name = \"Old\"\n").unwrap();
+        // make the temp-file write fail: a directory where the temp file goes
+        std::fs::create_dir_all(path.with_extension("toml.tmp")).unwrap();
+        let mut restored: Option<String> = None;
+        let r = rename_device_name_file(&path, "New", |raw| Ok(Some(raw.to_string())), |old| {
+            restored = old.map(str::to_string)
+        });
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(r.is_err());
+        assert_eq!(restored.as_deref(), Some("Old"));
+    }
+
+    #[test]
+    fn v3_suggestion_is_the_os_family_only() {
+        let s = os_family_suggestion();
+        if cfg!(target_os = "linux") {
+            assert_eq!(s, "Linux PC");
+        }
+        if cfg!(target_os = "windows") {
+            assert_eq!(s, "Windows PC");
+        }
+    }
+
+    #[test]
+    fn dc28_seams_registered() {
+        // three seams: set_peer_nickname in ALLOWED; both commands in
+        // generate_handler; set_device_name with snake_case args.
+        let src = include_str!("lib.rs");
+        assert!(src.contains("\"set_peer_nickname\","));
+        assert!(src.contains("            get_device_name,\n            set_device_name,"));
+        assert!(src.contains("#[tauri::command(rename_all = \"snake_case\")]\nasync fn set_device_name("));
+    }
+
+    #[test]
+    fn dc05b_pairing_offer_status_in_allowed() {
+        // DC-05 Appendix B.6: the displayer's UI polls this read-only op
+        // through the sync_op passthrough (no typed command, no input struct:
+        // it takes no arguments).
+        let src = include_str!("lib.rs");
+        let start = src.find("const ALLOWED: [&str; ").expect("ALLOWED list");
+        let list = &src[start..start + src[start..].find("];").expect("end of ALLOWED")];
+        assert!(list.contains("\"pairing_offer_status\","));
     }
 }

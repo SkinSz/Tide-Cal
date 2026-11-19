@@ -26,8 +26,6 @@ import {
 import {
   PairingSession,
   freshNonce,
-  encodePairingPayload,
-  decodePairingPayload,
   type PairingPayload,
 } from "../src/security/pairing.ts";
 import { sqlPeerStore } from "../src/network/pairing_manager.ts";
@@ -118,7 +116,7 @@ async function pairDevices(a: Device, b: Device): Promise<void> {
   });
 
   const payloadFor = (d: Device): PairingPayload => ({
-    v: 1,
+    v: 2,
     device_id: d.identity.deviceId,
     public_key: Buffer.from(d.identity.publicKey).toString("base64"),
     nonce: Buffer.from(freshNonce()).toString("base64"),
@@ -156,7 +154,7 @@ async function pairDevices(a: Device, b: Device): Promise<void> {
       sqlPeerStore(self.core.db as never).store({
         deviceId: remoteDeviceId,
         publicKey: Buffer.from(remote.public_key, "base64"),
-        displayName: remote.device_id.slice(0, 10),
+        announcedName: null,
         pairedAtMs: Date.now(),
       }),
     );

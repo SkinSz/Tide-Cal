@@ -21,9 +21,6 @@
       <button id="btn-next" title="Next">›</button>
       <h1 id="cal-label"></h1>
       <span class="spacer"></span>
-      <button id="btn-devices" title="Devices & sync">
-        <span class="devices-label">⇄ Devices</span>
-      </button>
       <button id="btn-conflicts" title="No unresolved conflicts">
         <span class="conflicts-label">⚠ Conflicts (0)</span>
       </button>
@@ -53,6 +50,13 @@
         </button>
         <button id="menu-export">Export .ics…</button>
       </div>
+      <!-- Owner request 2026-11-14: Devices moved here from the toolbar;
+           Options reachable from the window, not only from the tray. -->
+      <div class="menu-section">
+        <h3>Tide</h3>
+        <button id="btn-devices" title="Pairing, paired devices and sync">Devices &amp; sync…</button>
+        <button id="menu-options" title="Open the Options window">Options…</button>
+      </div>
     </nav>
 
     <main id="calendar-grid" aria-label="Calendar"></main>
@@ -72,7 +76,7 @@
         </label>
         <label class="check"><input type="checkbox" id="ev-allday" /> Whole day</label>
         <label class="check"><input type="checkbox" id="ev-repeat-on" /> Repeat</label>
-        <label class="check"><input type="checkbox" id="ev-remind-on" /> Remind me
+        <label class="check" id="ev-remind-row"><input type="checkbox" id="ev-remind-on" /> Remind me
           <select id="ev-remind-minutes">
             <option value="5">5 minutes before</option>
             <option value="10">10 minutes before</option>
@@ -82,6 +86,7 @@
             <option value="1440">1 day before</option>
           </select>
         </label>
+        <p id="ev-remind-note" class="muted" hidden></p>
         <div id="ev-time-row">
           <label>Start
             <span class="time-wrap">
@@ -176,7 +181,10 @@
       <div class="dlg-body devices-dlg">
         <h2>Devices &amp; Sync</h2>
         <div class="devices-self">
-          <span>This device: <code id="self-device-id">…</code></span>
+          <span class="devices-self-line">This device: <strong id="self-device-name">…</strong>
+            <button type="button" id="btn-rename-self">Rename</button>
+            <span class="muted">(id <span id="self-device-id">…</span>)</span></span>
+          <div id="self-name-editor"></div>
           <span class="muted">listening on port <span id="self-listen-port">…</span></span>
         </div>
         <div class="pairing-grid">
@@ -191,13 +199,18 @@
           </fieldset>
           <fieldset>
             <legend>Enter pairing code</legend>
-            <textarea id="pairing-code-in" rows="4" placeholder='{"v":1,"device_id":…}'></textarea>
+            <textarea id="pairing-code-in" rows="4" placeholder="Paste the pairing code from the other device."></textarea>
             <button type="button" id="btn-pairing-accept">Pair device</button>
           </fieldset>
         </div>
         <h3>Paired devices</h3>
         <div id="peers-list"></div>
+        <button type="button" id="btn-paired-devices">Manage paired devices…</button>
         <div id="devices-busy" hidden class="muted">Working…</div>
+        <div id="firewall-notice" hidden class="muted">
+          <span id="firewall-notice-text"></span>
+          <button type="button" id="firewall-retry" class="primary">Try again</button>
+        </div>
         <div id="devices-log"></div>
         <menu>
           <span class="spacer"></span>
@@ -232,6 +245,10 @@
           Read-only except the explicit actions below.
         </p>
         <div id="paired-devices-list"></div>
+        <section id="removed-devices-section" hidden>
+          <h3>Removed devices</h3>
+          <div id="removed-devices-list"></div>
+        </section>
         <menu>
           <span class="spacer"></span>
           <button type="button" id="paired-devices-close">Close</button>

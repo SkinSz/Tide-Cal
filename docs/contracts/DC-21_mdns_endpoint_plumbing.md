@@ -2,6 +2,9 @@
 # mDNS-to-Sidecar Endpoint Plumbing (Discovery Bridge)
 Status: APPROVED by project owner (2026-09-01) — implementation NOT
         yet authorized; awaiting owner go
+Implementation: AUTHORIZED by the owner 2026-09-02 and IMPLEMENTED
+        (f0008cb); endpoint resolution fixes on branch `windows`
+        (22c6d5a, 3a40ba7, 284f485). The wording above is historical.
 
 OWNER AMENDMENT (2026-09-01) — D3 security boundary (binding):
 live mDNS and last-known endpoints are ROUTING HINTS ONLY; neither

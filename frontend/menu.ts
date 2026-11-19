@@ -1,10 +1,20 @@
-// Tide: burger-menu drawer (owner request 2026-09-08). Slide-in navigation
-// holding the calendar-data I/O actions: Export (DC-18) and Import (DC-23),
-// both live.
+// Tide: burger-menu drawer (owner requests 2026-09-08, 2026-11-14). Slide-in
+// navigation: calendar-data I/O (Export DC-18, Import DC-23) and app entries
+// (Devices & sync, Options).
 import { initExport, exportCalendar } from "./export.ts";
 import { importCalendar } from "./import_dialog.ts";
 
 let open = false;
+
+async function openOptions(): Promise<void> {
+  if (!("__TAURI_INTERNALS__" in globalThis)) return; // plain browser
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("open_options");
+  } catch (err) {
+    console.warn("[tide] open options failed:", err);
+  }
+}
 
 function setOpen(next: boolean): void {
   open = next;
@@ -35,6 +45,15 @@ export function initMenu(): void {
   document.getElementById("menu-import")?.addEventListener("click", () => {
     setOpen(false);
     void importCalendar();
+  });
+
+  // Devices (owner 2026-11-14): devices.ts opens its dialog on this same
+  // button; the drawer just gets out of the way first.
+  document.getElementById("btn-devices")?.addEventListener("click", () => setOpen(false));
+  // Options: the same window the tray's "Options" entry opens (DC-20 §2).
+  document.getElementById("menu-options")?.addEventListener("click", () => {
+    setOpen(false);
+    void openOptions();
   });
 
   // Ensure export.ts's own (unused) toolbar wiring cannot break if the

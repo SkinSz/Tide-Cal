@@ -20,7 +20,10 @@ import {
   makeEntityMutator,
   createSyncEngine,
   type Device,
+  useSnapshots,
 } from "./pkg1_helpers.ts";
+
+useSnapshots(); // subject: snapshot exchange under crashes
 import type { SyncTransport, SyncMessage } from "../src/sync/sync_engine.ts";
 import { EventCore } from "../src/persistence/bridges/event_core.ts";
 import type Database from "better-sqlite3";
@@ -43,6 +46,7 @@ function makePeer(name: string): Device & { engine: ReturnType<typeof createSync
     selfDeviceId: d.identity.deviceId,
     mutateEntity: makeEntityMutator(),
     idleTimeoutMs: 300,
+    snapshots: true,
   });
   return { ...d, engine };
 }

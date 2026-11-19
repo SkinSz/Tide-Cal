@@ -39,7 +39,7 @@ export interface EventInput {
   recurrenceRule?: string;
 }
 
-const DEFAULT_CALENDAR_ID = "local";
+export const DEFAULT_CALENDAR_ID = "local";
 
 /**
  * Monotone hybrid-logical-clock ticker (ms resolution, presentation-only
@@ -333,6 +333,54 @@ export type OverridePatch = Partial<{
   tz_id: string;
 }>;
 
+/**
+ * Row removal for an event delete in FK order (overrides -> series -> event).
+ * Shared by the local delete (EventCore.deleteEvent) and the remote apply
+ * (sync_service) so both materialize a delete identically.
+ */
+export function deleteEventRows(
+  db: import("better-sqlite3").Database,
+  eventId: string,
+  seriesId?: string,
+): void {
+  if (seriesId !== undefined) {
+    db.prepare("DELETE FROM occurrence_overrides WHERE series_id = ?").run(seriesId);
+    db.prepare("DELETE FROM series WHERE series_id = ?").run(seriesId);
+  }
+  // DC-22: an event's reminders go with the event. A local consequence of
+  // applying the delete (this function runs for the local delete AND for a
+  // remote one); no separate reminder-delete change records are written.
+  db.prepare("DELETE FROM reminders WHERE entity_id = ?").run(eventId);
+  db.prepare("DELETE FROM events WHERE event_id = ?").run(eventId);
+}
+
+/**
+ * The one row write for a reminder member (DC-22): used by EventCore.setReminder
+ * and by applying a remote member_add / member_update. Upsert by member_id;
+ * `hlc` is the ORIGIN change's hlc (never "now"), which the late-configuration
+ * discard in the alarm engine depends on. A member id that already belongs to
+ * another event is left untouched.
+ */
+export function upsertReminderRow(
+  db: import("better-sqlite3").Database,
+  r: { memberId: string; eventId: string; minutesBefore: number; enabled: boolean; hlc: number },
+): void {
+  db.prepare(
+    `INSERT INTO reminders (member_id, entity_id, collection_path, minutes_before, enabled, updated_hlc)
+     VALUES (?, ?, 'reminders', ?, ?, ?)
+     ON CONFLICT(member_id) DO UPDATE SET
+       minutes_before = excluded.minutes_before,
+       enabled = excluded.enabled,
+       updated_hlc = excluded.updated_hlc
+     WHERE reminders.entity_id = excluded.entity_id`,
+  ).run(r.memberId, r.eventId, r.minutesBefore, r.enabled ? 1 : 0, r.hlc);
+}
+
+/** Delete one reminder member row (local clear / remote member_remove). */
+export function deleteReminderRow(db: import("better-sqlite3").Database, memberId: string): void {
+  db.prepare("DELETE FROM reminders WHERE member_id = ?").run(memberId);
+}
+
 /** occurrence_overrides row shape (the fields this bridge reads/writes). */
 interface OverrideRow {
   series_id: string;
@@ -351,6 +399,14 @@ export class EventCore {
   private readonly deviceId: string;
   private readonly hlc = new HlcTicker();
 
+  /**
+   * DC-27 V3: the ONE hybrid logical clock of this process, the same ticker
+   * that stamps local change records (revoked_at_hlc must come from it).
+   */
+  hlcNow(): number {
+    return this.hlc.now();
+  }
+
   constructor(dbPath: string, deviceId?: string) {
     this.dbPath = dbPath;
     this.db = openDatabase({ path: dbPath });
@@ -368,21 +424,45 @@ export class EventCore {
   // DC-22: reminder members (collection members; replicate per D5).
   // -------------------------------------------------------------------------
 
-  /** Read one event's reminder member, or null. */
+  /**
+   * Read the event's reminder the dialog shows, or null. An event can hold
+   * several reminders (two devices adding offline); the dialog shows the one
+   * with the LOWEST member_id, the same on every device.
+   */
   reminderFor(eventId: string): { minutesBefore: number; enabled: boolean } | null {
     const row = this.db
       .prepare<[string], { minutes_before: number; enabled: number | null }>(
-        "SELECT minutes_before, enabled FROM reminders WHERE entity_id = ?",
+        "SELECT minutes_before, enabled FROM reminders WHERE entity_id = ? ORDER BY member_id LIMIT 1",
       )
       .get(eventId);
     if (row === undefined) return null;
     return { minutesBefore: row.minutes_before, enabled: row.enabled !== 0 };
   }
 
+  /** How many reminders the event holds (the dialog warns when more than one). */
+  reminderCountFor(eventId: string): number {
+    return (
+      this.db
+        .prepare<[string], { n: number }>("SELECT COUNT(*) AS n FROM reminders WHERE entity_id = ?")
+        .get(eventId)?.n ?? 0
+    );
+  }
+
+  /** Member ids of the event's reminders, lowest first (the dialog rule's order). */
+  private reminderMemberIds(eventId: string): string[] {
+    return this.db
+      .prepare<[string], { member_id: string }>(
+        "SELECT member_id FROM reminders WHERE entity_id = ? ORDER BY member_id",
+      )
+      .all(eventId)
+      .map((r) => r.member_id);
+  }
+
   /**
-   * Create-or-update this event's reminder member (v1 UI: one member per
-   * event). Replicates as member_add / member_update (D5: disabled members
-   * are stored-but-inactive AND still replicate).
+   * Set this event's reminder (v1 UI: one reminder shown per event). Updates
+   * the lowest-member_id reminder (member_update) or creates one (member_add).
+   * Any EXTRA reminders (added concurrently on other devices) are removed as
+   * ordinary member_remove changes, so saving keeps exactly one everywhere.
    */
   setReminder(eventId: string, reminder: { minutesBefore: number; enabled: boolean }): void {
     if (!Number.isInteger(reminder.minutesBefore) || reminder.minutesBefore < 0) {
@@ -392,35 +472,11 @@ export class EventCore {
     if (this.getEventRow(eventId) === undefined) {
       throw new Error(`setReminder: event not found: ${eventId}`);
     }
-    const existing = this.db
-      .prepare<[string], { member_id: string }>(
-        "SELECT member_id FROM reminders WHERE entity_id = ?",
-      )
-      .get(eventId);
+    const ids = this.reminderMemberIds(eventId);
+    const value = { minutes_before: reminder.minutesBefore, enabled: reminder.enabled ? 1 : 0 };
+    const keep = ids[0];
+    const memberId = keep ?? `rem-${randomUUID()}`;
     const hlc = this.hlc.now();
-    if (existing !== undefined) {
-      createLocalChange(
-        this.db,
-        this.deviceId,
-        {
-          entity_id: eventId,
-          entity_type: "reminder",
-          field_path: `reminders.${existing.member_id}`,
-          operation: "member_update",
-          payload: {
-            value: { minutes_before: reminder.minutesBefore, enabled: reminder.enabled ? 1 : 0 },
-          },
-          hlc_now: () => hlc,
-        },
-        (db) => {
-          db.prepare(
-            "UPDATE reminders SET minutes_before = ?, enabled = ?, updated_hlc = ? WHERE member_id = ?",
-          ).run(reminder.minutesBefore, reminder.enabled ? 1 : 0, hlc, existing.member_id);
-        },
-      );
-      return;
-    }
-    const memberId = `rem-${randomUUID()}`;
     createLocalChange(
       this.db,
       this.deviceId,
@@ -428,29 +484,23 @@ export class EventCore {
         entity_id: eventId,
         entity_type: "reminder",
         field_path: `reminders.${memberId}`,
-        operation: "member_add",
-        payload: {
-          value: { minutes_before: reminder.minutesBefore, enabled: reminder.enabled ? 1 : 0 },
-        },
+        operation: keep !== undefined ? "member_update" : "member_add",
+        payload: { value },
         hlc_now: () => hlc,
       },
       (db) => {
-        db.prepare(
-          `INSERT INTO reminders (member_id, entity_id, collection_path, minutes_before, enabled, updated_hlc)
-           VALUES (?, ?, 'reminders', ?, ?, ?)`,
-        ).run(memberId, eventId, reminder.minutesBefore, reminder.enabled ? 1 : 0, hlc);
+        upsertReminderRow(db, { memberId, eventId, minutesBefore: reminder.minutesBefore, enabled: reminder.enabled, hlc });
       },
     );
+    for (const extra of ids.slice(1)) this.removeReminderMember(eventId, extra);
   }
 
-  /** Remove the event's reminder member (member_remove). Idempotent. */
+  /** Remove ALL of the event's reminders (member_remove each). Idempotent. */
   clearReminder(eventId: string): void {
-    const existing = this.db
-      .prepare<[string], { member_id: string }>(
-        "SELECT member_id FROM reminders WHERE entity_id = ?",
-      )
-      .get(eventId);
-    if (existing === undefined) return;
+    for (const memberId of this.reminderMemberIds(eventId)) this.removeReminderMember(eventId, memberId);
+  }
+
+  private removeReminderMember(eventId: string, memberId: string): void {
     const hlc = this.hlc.now();
     createLocalChange(
       this.db,
@@ -458,13 +508,13 @@ export class EventCore {
       {
         entity_id: eventId,
         entity_type: "reminder",
-        field_path: `reminders.${existing.member_id}`,
+        field_path: `reminders.${memberId}`,
         operation: "member_remove",
         payload: { value: null },
         hlc_now: () => hlc,
       },
       (db) => {
-        db.prepare("DELETE FROM reminders WHERE member_id = ?").run(existing.member_id);
+        deleteReminderRow(db, memberId);
       },
     );
   }
@@ -590,7 +640,8 @@ export class EventCore {
           entity_type: "series",
           field_path: "recurrence_rule",
           operation: "set",
-          payload: { value: rule },
+          // base_event_id lets a receiving device materialize the series row.
+          payload: { value: rule, base_event_id: event.id },
           hlc_now: () => seriesHlc,
         },
         (db) => {
@@ -665,7 +716,8 @@ export class EventCore {
           entity_type: "series",
           field_path: "recurrence_rule",
           operation: "set",
-          payload: { value: rule },
+          // base_event_id lets a receiving device materialize the series row.
+          payload: { value: rule, base_event_id: event.id },
           hlc_now: () => seriesHlc,
         },
         (db) => {
@@ -778,15 +830,7 @@ export class EventCore {
         // its overrides — deterministic, NOT a conflict, even vs concurrent
         // override edits. One series-level remove record carries the
         // structure; no per-override records, no resurrection path.
-        if (series) {
-          db.prepare("DELETE FROM occurrence_overrides WHERE series_id = ?").run(
-            series.series_id,
-          );
-          db.prepare("DELETE FROM series WHERE series_id = ?").run(
-            series.series_id,
-          );
-        }
-        db.prepare("DELETE FROM events WHERE event_id = ?").run(id);
+        deleteEventRows(db, id, series?.series_id);
       },
     );
     // D7 series-level tombstone (own entity per DC-01 §6 / DC-12 §4.2).

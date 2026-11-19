@@ -2,7 +2,7 @@ TIDE SOURCE-AVAILABLE NON-COMMERCIAL LICENSE
 Version 1.0
 
 Copyright © 2026 SkinS / Tide Project
-Commercial licensing: swy@uplink-incorporated.net
+Commercial licensing: skins@uplink-incorporated.net
 
 This software is made available under the terms of this License.
 
@@ -197,4 +197,4 @@ No additional rights are granted by implication, estoppel, or otherwise.
 For information regarding commercial licensing, contact:
 
 SkinS / Tide Project
-Commercial licensing: swy@uplink-incorporated.net
+Commercial licensing: skins@uplink-incorporated.net

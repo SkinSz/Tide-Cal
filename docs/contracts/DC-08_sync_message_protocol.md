@@ -4,6 +4,9 @@ Status: APPROVED by project owner (2026-08-25); AMENDED v2 by project
         owner (2026-09-02) — see Appendix A (session-end barrier,
         CHANGES_ACK semantics). Amendment supersedes §3.4 rule 3 and
         §5.4 where they conflict.
+AMENDED v3 by project owner (2026-11-14, via DC-27 Appendix B). See
+        Appendix B (additive "applied_upto" on the full-state carriers);
+        supersedes the §3.6 clock rule for producers with a held cutoff.
 Depends on: Architecture Spec v0.3 §20, §21, §22, §23, §24, §30, §31;
             DC-01; DC-02; DC-03; DC-04; DC-05; DC-06; DC-07
 Unblocks: sync engine implementation, revocation propagation (#8),
@@ -778,3 +781,39 @@ the responder-teardown race the barrier exists to prevent, for
 zero functional gain in the homogeneous fleet. Barrier semantics
 verified by: pkg5b/pkg7 test waves, three-device real-TCP harness
 (7/7), full suite 705/705 (commit bc1a3de).
+
+==================================================
+APPENDIX B — AMENDMENT v3: DECLARED APPLIED FRONTIER
+==================================================
+Status: APPROVED by project owner (2026-11-14), via DC-27 Appendix B
+option a). Rationale and evidence: DC-27 Appendix B (TD-041).
+
+B.1  WIRE (additive, §2.2). FULL_STATE_OFFER and FULL_STATE_SNAPSHOT
+     gain the field "applied_upto": the sender's per-producer
+     contiguous applied frontier, same shape as CHANGES_ACK (§3.4),
+     captured together with snapshot_clock:
+
+         {
+           "v": 1,
+           "type": "FULL_STATE_SNAPSHOT",
+           "snapshot_clock": { "d-phone": 200, "d-desktop": 12 },
+           "applied_upto":   { "d-phone": 198, "d-desktop": 12 },
+           "entities": [ ... ]
+         }
+
+     Every message of one snapshot stream carries the same value. A
+     sender always includes it. It is read from the applied frontier,
+     never from device_clock (snapshot_clock may cite causal context
+     that the sender never applied).
+B.2  RECEIVER. A receiver that holds a revocation cutoff (DC-05
+     Appendix A.2) evaluates the field per DC-09 Appendix A: it may
+     decline the offer (silent, as in §3.6) or not apply the snapshot.
+     A receiver that holds no cutoff ignores the field; older
+     receivers ignore it as an unknown field (§2.2).
+B.3  CLOCK RULE. The §3.6 rule "applied_upto := dominated-merge with
+     snapshot_clock" is unchanged except for a producer with a held
+     cutoff C: from a snapshot, its applied_upto never rises above C
+     nor above the sender's declared applied_upto for that producer
+     (0 when missing) (DC-09 Appendix A.3).
+B.4  OLDER SENDERS. A message without the field is valid. A receiver
+     that holds a cutoff treats it as tainted (DC-27 Appendix B.4).

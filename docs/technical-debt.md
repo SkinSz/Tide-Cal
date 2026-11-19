@@ -110,7 +110,7 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 - **ID:** TD-007
 - **Title:** Minor findings from combined independent verification (verdict: SAFE TO COMMIT)
 - **Priority:** 2/10 — LOW (hygiene)
-- **Status:** OPEN
+- **Status:** RESOLVED (2026-11-14): (1) the hard-block lookup is prepared once per engine (`makeHardBlockCheck`); (2) the misbehavior tracker measures every window/backoff/level age on the monotonic clock (`monotonicWallClock` = performance.timeOrigin + performance.now), so wall-clock steps in either direction neither extend nor shorten a penalty (an earlier rebase approach was rejected by blind review: a back-then-forward trip could end a throttle early); (3) `resolved_at_hlc` (and `received_at_hlc`) holding wall-clock ms is documented at `markQuarantineResolved`, deliberately without a migration; (4) the single `onHardBlock` slot ("last engine wins", never share a tracker across databases) is documented at the hook. Regression: `tests/td007_td019_hygiene.test.ts`.
 - **Findings (file:line per verifier):**
   1. `src/sync/sync_engine.ts` applyBatch: `isHardBlocked()` calls `db.prepare()` per record on every arrival — hoist to a per-engine prepared statement.
   2. `src/sync/misbehavior.ts`: Date.now-based windows lack monotonicity guards — a backward system-clock jump can extend a peer's throttle/suspend retention up to the jump magnitude (fails closed, self-heals). Consider monotonic guard or clamping.
@@ -193,7 +193,7 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 - **ID:** TD-013
 - **Title:** Three-device harness scenarios occasionally fail with EADDRINUSE on a port that nothing holds afterwards
 - **Priority:** 4/10 — MEDIUM (test-infrastructure flake, not protocol)
-- **Status:** OPEN (created 2026-09-01; observed twice independently)
+- **Status:** RESOLVED (2026-11-14): the default port band moved from 41900 (inside the Linux ephemeral range 32768-60999, so outbound or TIME_WAIT sockets could hold a band port; cause INFERRED, not reproduced) to 31900, below every common ephemeral range; the harness refuses a band that overlaps this host's range; `waitHealthy` now proves the listener with a real TCP connect (the echoed `listening_port` proved nothing) inside its existing bounded window, logging every failed attempt and any sidecar bind-failure line.
 - **Evidence:** During the c088023 verification run, harness scenario 2 failed once with EADDRINUSE on 41910 (sidecar sync listener could not bind; nothing held the port afterwards; scenario passed on rerun). A second occurrence observed in the independent-review re-run. Pattern: TIME_WAIT or interface-timing race between scenario teardown and next-scenario bind.
 - **Fix direction:** deterministic per-run port bases in RunContext, or a bounded bind-retry with explicit logging in the harness (never retry-until-green — outside the harness itself).
 - **Trigger:** Before the harness becomes the standing release gate for future sync work (it now is), make it deterministic.
@@ -244,7 +244,7 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 - **ID:** TD-018
 - **Title:** transport error mapped to clean EOF + swallowed pump error → a peer RST mid-session reports a converged session
 - **Priority:** 6/10 — MEDIUM-HIGH (observability/correctness-of-reporting, not data loss)
-- **Status:** OPEN (created 2026-09-01, independent adversarial review F1 (sync))
+- **Status:** RESOLVED (2026-09-02, commit 550bbd1, pkg9 independent review). The framing layer now distinguishes carrier failure from clean FIN: a failed carrier makes `receive()` reject with FramingError, the feed loop turns that into a sentinel frame that fails AEAD and ends the session with a loud SessionError, FIN stays a clean EOF, and pump failures are logged. Paired with TD-017 (DC-08 Appendix A v2). Regression: `tests/td018_carrier_failure.test.ts` (RST shape and FIN shape tested together).
 - **Finding:** `noise_transport.ts` feed loop's `finally` close (correct for FIN) plus `sync_runtime`'s error/end/close → receive()=null mapping plus the outbound pump's `void pump.catch(() => {})` mean a dead carrier surfaces as clean session end; pre-fix it surfaced as a loud SyncIdleTimeoutError. DC-05 §6.3 requires transport failure to be terminal (SessionError).
 - **Fix direction:** distinguish FIN from error at the framing layer (error → SessionError, not null-EOF) and propagate pump failure to the session result; regression test with an error-injected carrier. Careful not to re-break the stall fix (FIN must stay clean EOF).
 - **Trigger:** next sync-layer work session (pairs with TD-017 in one package).
@@ -253,7 +253,7 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 - **ID:** TD-019
 - **Title:** engine-level message stash leaks across sessions (F3); FrameQueue single-waiter slot + immortal outbound pump (F4); ACK sends possibly-stale applied_upto (F5)
 - **Priority:** 3/10 — LOW (all bounded; no data-loss attack found in review)
-- **Status:** OPEN (created 2026-09-01, independent adversarial review F3/F4/F5 (sync))
+- **Status:** PARTIAL (2026-11-14). F3 DONE: already fixed by the session-start stash reset (DC-08 Appendix A.3); regression test added. F5 DONE (documented, no code change): the ACK reads the durable frontier at send time; lagging barrier-phase applications is the accepted DC-08 A.2.4 trade and only under-reports. F4 OPEN, deliberately not changed: FrameQueue's single waiter slot is load-bearing, because the engine builds a new receive cache per protocol phase (`nextMessage(transport)` at each phase) and can leave an abandoned pending receive; FIFO waiters would hand the next frame to it and lose it (semantics pinned by a test, documented in `noise_transport.ts`). The parked outbound pump is believed to be reclaimed with its session handle (INFERRED, not measured). What is left: make the engine use ONE receive cache per session first; only then are FIFO waiters or ending the pump safe.
 - **Details:** stash is pre-existing, not introduced by c088023; pump leak is one closure per session; stale-ACK frontier is safe under max-merge. Fix opportunistically in the next sync package (TD-017/018 wave).
 - **Trigger:** with TD-017/TD-018.
 
@@ -409,3 +409,322 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 - 1. Reminders: NOT exported by design (DC-18 §3.5); VALARM mapping deferred to a future contract. Google itself is unreliable at VALARM import (double-import quirk) — worth remembering if VALARM export is ever added.
 - 2. VTIMEZONE horizon: exports carry two concrete transitions, no RRULE (handoff §4.6) — fine for mainstream consumers; revisit only if multi-year imports misbehave.
 - 3. Import planner determinism: foreign-UID Case C mints randomUUID() at PLAN time (handoff §4.5) — intentional per D2; move to applier only if pure-plan ever matters mechanically.
+
+## TD-028 — UI unresponsive while the Windows firewall UAC prompt is open
+- **ID:** TD-028
+- **Title:** Sync now blocks its caller (tray menu thread / async command worker) while the elevated firewall-rule creation waits for the UAC answer
+- **Priority:** 3/10 — LOW (once per machine; the prompt is modal anyway)
+- **Status:** CLOSED — not debt (owner, 2026-11-14): the UAC prompt runs on its own secure desktop, so the app being unresponsive while it is open has no user-visible cost.
+- **Fix direction:** run `ensure_firewall(app, true)` on the blocking pool from both entry points and continue the sync pass from its completion.
+
+## TD-029 — Per-user NSIS uninstaller likely cannot remove the firewall rules
+- **ID:** TD-029
+- **Title:** DC-24 §6.5 assumes an elevated uninstaller; Tide installs per user under AppData\Local, so `netsh delete rule` from the uninstaller probably fails silently
+- **Priority:** 2/10 — LOW (leftover rules are inert once the program path is gone)
+- **Status:** CLOSED (owner report 2026-11-14: no longer observed on the current installer).
+- **Verify:** uninstall on a test PC, then `netsh advfirewall firewall show rule name="Tide sync"`.
+
+## TD-030 — Conflict dialog shows raw data instead of readable values
+- **ID:** TD-030
+- **Title:** Conflict candidates render as JSON (`{"startMs":…,"endMs":…}`), field names as internal paths (`schedule`), devices as ids
+- **Priority:** 7/10 — HIGH (users cannot make an informed choice; owner report 2026-11-14)
+- **Status:** RESOLVED (2026-11-14, DC-14 Appendix A): conflicts show readable labels, locale- and clock-aware dates/times, only differing sub-fields, "Device <8 chars>" sides, side-named buttons, and raw data only in a collapsed "Technical details" section
+- **Relevant files:** `frontend/conflicts.ts` (`formatCandidateValue`, `describeConflict`, `describeCandidateSide`), `src/application/conflicts_ui.ts`
+
+## TD-031 — Conflicts badge count goes stale
+- **ID:** TD-031
+- **Title:** Badge count is read only at startup and after a resolution; a conflict created by a later sync shows "(0)" until restart
+- **Priority:** 7/10 — HIGH (conflicts go unnoticed; owner report 2026-11-14)
+- **Status:** RESOLVED (2026-11-14, DC-26): the badge re-reads after every calendar redraw (`tide:rendered`) and every sync that changed data (DC-26 TR-8)
+
+## TD-032 — Long device ids truncated with "…" in Devices / Sync views
+- **ID:** TD-032
+- **Title:** Device ids are cut off; the paired-devices list should show either the short id or a friendly name
+- **Priority:** 4/10 — MEDIUM
+- **Status:** RESOLVED (2026-11-14, DC-28 friendly device names): every Devices / Sync surface shows one label (local nickname, else the name the device announced at pairing, else "Device <8 hex short id>"), never a truncated id with "…". Shared rule: `src/domain/device_names.ts`; regression: `tests/dc28_surfaces_dom.test.ts` (TR-6 / TR-9, one DOM test per surface) and `tests/dc28_device_names.test.ts`.
+
+## TD-033 — Layout breaks in small windows
+- **ID:** TD-033
+- **Title:** Below a certain window size the layout stops scaling and scroll bars appear
+- **Priority:** 4/10 — MEDIUM
+- **Status:** MITIGATED (2026-11-14, owner: "whatever is easier for now"): main window minimum size = the 800×600 default (`tauri.conf.json` minWidth/minHeight), the size the layout is known to work at. A responsive layout remains possible later.
+
+## TD-034 — Sidecar stderr piped but never read
+- **ID:** TD-034
+- **Title:** The shell piped the sidecar's stderr without reading it: a full pipe could block the sidecar, and its error output never reached the log
+- **Priority:** 5/10 — MEDIUM (hang risk; hidden diagnostics)
+- **Status:** RESOLVED (commit e6e5495): `src-tauri/src/sidecar.rs` drains stderr on its own thread into the app log (target `sidecar`), lines capped at 2,048 bytes (rest counted, not kept); the log file is size-capped with numbered archives (`logfile.rs`). Regression: `sidecar::tests::stderr_flood_does_not_block_the_sidecar`.
+
+## TD-035 — mDNS browse restarted every 25 s
+- **ID:** TD-035
+- **Title:** The browse loop started a new mDNS browse every 25 s, resetting the query backoff and re-sending a burst of queries each cycle
+- **Priority:** 3/10 — LOW (network chatter against DC-11 §3.3 rate rules)
+- **Status:** RESOLVED (2026-11-14): one long-lived browse (`discovery.rs` `start_browse`), restarted only when it ends or fails to start (5 s backoff). The loop keeps the live view itself (resolved adds or updates, removed deletes) and re-pushes it every 25 s, so sidecar cache entries (120 s TTL) stay fresh exactly as the per-cycle re-browse used to do. Regression: `mdns_service::browse_loop_tests` (fake browse source); runtime probe `discovery::tests::persistent_browse_runtime_probe` (`--ignored`, two real daemons: present past the 120 s TTL, removed under the same name after withdraw). Owner decision 2026-11-14 (DC-11 Appendix A): plus an on-demand query round on Sync now and when a scheduled sync cannot reach a paired peer (sidecar `discovery_kick` notice), at most one per 60 s, and removals are forwarded to the sidecar. Runtime verification on the real Linux/Windows pair (TR-A5) is owed by the owner smoke test; until then verified on one host only.
+
+## TD-036 — Sync sessions accepted any handshake key, not only paired devices
+- **ID:** TD-036
+- **Title:** Inbound sessions (and Sync now to a typed address) ran the sync engine for ANY Noise key; a never-paired device on the network could read the whole calendar and inject changes
+- **Priority:** 10/10 — CRITICAL (confidentiality + integrity; found 2026-11-14 while drafting DC-27)
+- **Status:** RESOLVED (2026-11-14): `SyncManager.runEngineSession` refuses, before any record is served or applied, a session whose remote static key matches no `status='trusted'` peer; refusals logged with a per-kind 1/min throttle. PROVEN by `tests/inbound_trust_gate.test.ts` (fails 2/3 without the fix, passes with it). Blind review: SAFE WITH CONCERNS (minors applied). Completed by DC-27 (2026-11-14, uncommitted at time of writing): the gate now matches the handshake key against ALL peers rows (trusted and revoked), refuses a key whose row is revoked or whose id a stored valid revocation record names (DENY_REVOKED), and runs `canSynchronize` (device_id = hash(stored key), status) before any message; Unpair writes `status='revoked'`. Tests: `tests/inbound_trust_gate.test.ts` (unchanged) + `tests/dc27_unpair.test.ts` TR-1.
+
+## TD-037 — Conflict resolution always writes entity_type "event" / operation "set"
+- **ID:** TD-037
+- **Title:** `ConflictsViewModel.resolve` (src/application/conflicts_ui.ts) writes the winning value as an event "set" for every field kind; for reminders `effectiveOf(member_update)` may produce `{value:{value:…}}`, and overrides / `*` removals also get entity_type "event"
+- **Priority:** 5/10 — MEDIUM (data shape after resolving a non-event conflict; HYPOTHESIS, not reproduced)
+- **Status:** OPEN (blind review of DC-14 Appendix A, 2026-11-14)
+- **Verify:** create a reminder conflict between two devices, resolve it, inspect the reminder row and the emitted change record.
+
+## TD-038 — mDNS snapshot seeding is never populated
+- **ID:** TD-038
+- **Title:** DC-21 §3.2(b) snapshot replay after a sidecar restart sends nothing: `SidecarEventSink::record_observation` is a no-op and `BrowseService::record` has no caller, so `push_snapshot` always pushes an empty list
+- **Priority:** 2/10 — LOW (latent: the sidecar is spawned once per app run and the shell has no sidecar-restart path today, so nothing currently depends on the snapshot)
+- **Status:** OPEN (pre-existing; found by the DC-11 Appendix A blind review, 2026-11-14)
+- **Note when fixing:** the snapshot must not store "removed" events, because `applySnapshot` (endpoint_bridge.ts) forces kind "added" and would resurrect a removed peer.
+
+## TD-039 — Windows: settings live inside the data folder
+- **ID:** TD-039
+- **Title:** On Windows `app_config_dir` and `app_data_dir` both resolve to `%APPDATA%\<profile_id>` (`com.tide.app`), so `config.toml` sits in the same folder as the database and the identity key. The DC-27 Path B step "rename the data folder" therefore also resets the Options settings on Windows (Linux keeps them in `~/.config/<profile_id>`). DC-15 §4.1 / DC-24 still name the folder `%APPDATA%\tide`.
+- **Priority:** 3/10 — LOW (settings only; no calendar data at risk)
+- **Status:** OPEN (found while resolving DC-27 V6, 2026-11-14). Evidence: `src-tauri/src/lib.rs` `config_dir()` / data dir in `setup()`; Tauri 2.11.5 `path/desktop.rs` (`dirs::config_dir()` / `dirs::data_dir()`); dirs 6.0.0 `win.rs` (both `known_folder_roaming_app_data`).
+- **Workaround:** copy `config.toml` from the renamed folder into the new one after the first start.
+
+## TD-040 — Pairing scanner stores trust before the other side confirms
+- **ID:** TD-040
+- **Title:** `acceptPairingPayload` (src/network/pairing_manager.ts) stores the displayer as trusted before it receives `PAIRING_OK`. If the displayer refuses (DC-27 P10 `PAIRING_REFUSED`) or fails, the scanner keeps a one-sided trust row (DC-05 Case A).
+- **Priority:** 3/10 — LOW (Case A is refused at the other side's gate; for DC-27 the scanner is the removed device, which already trusted the displayer)
+- **Status:** OPEN (pre-existing ceremony order; observed during DC-27, 2026-11-14)
+
+## TD-041 — Full-state snapshots ignore the revoked-producer cutoff
+- **ID:** TD-041
+- **Title:** DC-27 §4.14 / DC-05 Appendix A.2 drop a revoked producer's change records above the cutoff in `applyBatch`, and pull ranges are clamped. A DC-09 FULL_STATE_SNAPSHOT is applied without that filter, so state the revoked device authored after the cutoff arrives by snapshot from any peer that applied it during the gossip window, also after that peer has learned the revocation. The receiver's applied_upto for the revoked device rises above the cutoff, and an above-cutoff delete removes the receiver's copy through the absence rule.
+- **Priority:** 3/10 — LOW (PROVEN at the `applySnapshot` seam and at the session engine's snapshot handler; snapshots are rare: Trigger A only fires on persistent gaps and `sweep()` has no production caller)
+- **Status:** RESOLVED (2026-11-14, DC-27 Appendix B option a), DC-08 Appendix B, DC-09 Appendix A). Full-state offers and snapshots declare the sender's applied frontier (`applied_upto`); a receiver that holds a cutoff declines the offer or snapshot when the declared value for the revoked device is above the cutoff, missing or malformed, and never raises its own applied_upto for the revoked device from a snapshot above the cutoff or above the sender's declared value. Cost of the rule: TD-046. Receivers without a cutoff are unchanged. The three repro tests in `tests/dc27_unpair.test.ts` are ordinary tests now, with the TR-16 tests and a no-retry-loop test next to them. Cost: a peer that applied the removed device above the cutoff no longer serves full state to devices holding the record; incremental sync is unaffected.
+
+## TD-042 — Revocation wire shape differs from DC-08 §3.7
+- **ID:** TD-042
+- **Title:** The engine sends `REVOCATION_RECORDS { records: [{ record, signature_hex }] }`; DC-08 §3.7 specifies `{ revocations: [{ record, signature (base64) }] }` (DC-27 S7 / O3). Both ends run the same code, so they interoperate.
+- **Priority:** 2/10 — LOW (contract/code drift; owned by DC-08)
+- **Status:** OPEN (decision needed: amend DC-08 to the implemented shape, or change the code)
+
+## TD-043 — The offering device does not show a refused re-pair
+- **ID:** TD-043
+- **Title:** When a removed device scans this device's pairing code, this device refuses (DC-27 P10) and the scanner shows the refusal text, but the offering device's UI shows nothing: the `pairing_offer` result is consumed by the sidecar and never surfaced (same for any other offer-side failure).
+- **Priority:** 2/10 — LOW (UX; nothing is stored)
+- **Status:** OPEN (pre-existing offer-result plumbing; observed during DC-27, 2026-11-14)
+
+## TD-044 — The urgent-push ACK does not reach the revoking device
+- **ID:** TD-044
+- **Title:** After Unpair, the urgent push session (revoking device dials the peer) delivers the record and the peer accepts it (it refuses the removed device from then on), but the peer's REVOCATIONS_ACK is lost: the peer logs "sync outbound pump failed (carrier error, session fails closed): socket closed". The Removed devices list therefore shows that peer as "waiting" until the next ordinary session in which the ACK arrives (the record is re-sent, DC-10 §3 at-least-once).
+- **Priority:** 4/10 — MEDIUM (display lag only; enforcement is not affected)
+- **Status:** OPEN (OBSERVED 3/3 runs in `tests/probes/three_device_harness.mjs --scenario=unpair_propagation`, 2026-11-14; the in-process TR-6 test does receive the ACK). HYPOTHESIS: the initiator leaves the DC-08 session-end barrier and closes before the responder's ACK (sent after the async signature check) arrives — same class as TD-020. A fix touches the DC-08 barrier and needs its own review.
+
+## TD-045 — Post-cutoff data that reached an unaware peer stays only there
+- **ID:** TD-045
+- **Title:** Changes the removed device made after the cutoff that reached a peer before it learned the revocation stay on that peer (DC-27 §4.4 keeps them), and edits of those entities by that peer are not applied on devices that rejected the original (no row to update). Those devices permanently differ for such entities.
+- **Priority:** 2/10 — LOW (bounded by the Spec §19 gossip window; accepted by DC-27 P12)
+- **Status:** OPEN for the incremental path (OBSERVED in `tests/dc27_unpair.test.ts` "TR-8 an unaware P edits the rejected above-cutoff event": no quarantine row, P's stream keeps advancing, L has no row for the entity). Since TD-041 was resolved, such data no longer spreads from that peer by full-state snapshot to devices holding the record. Snapshot direction OPEN, decided together with TD-052 (same cause; DC-27 Appendix B.7 is a PROPOSAL, not approved): state that a peer applied from the removed device above the cutoff may be removed by a later full-state apply from a peer that never applied it. This needs a clean sender whose snapshot_clock[W] is above the cutoff, i.e. one that has applied a change citing W above the cutoff. PROVEN: a clean L (applied_upto[W] 2 = cutoff, snapshot_clock[W] 3 after pulling P's event that cites W:3) sends a snapshot that the tainted P accepts (not declined), and the absence rule (DC-09 §5.2) tombstones P's copy of W's above-cutoff event (`tests/dc27_unpair.test.ts` "TD-045 (i) a clean peer's snapshot removes, on the tainted P, an event W created above the cutoff" and "TD-045 (i) engine: ..."). Mixed entities, PROVEN by the four "TD-045 (ii) mixed entity ..." tests: (A) an event created at or below the cutoff, W's title edit above it, a later P edit: never removed (L's snapshot holds the row); once L has applied P's edit, L's row replaces P's (W's title gone, P's description kept), before that P's row is unchanged. (B) an event W created above the cutoff, a later P edit: kept on P while L has not applied P's edit; once L has applied it, the event is removed on P and P's own edit goes with it. Open point: (B) after L applied P's edit removes a trusted device's change, which the owner's permission (above-cutoff state only) does not cover; it needs an owner decision. Boundary: the same mechanism also removes at-or-below-cutoff history (TD-052); the acceptance does not cover that.
+
+## TD-046 — A device whose peers are all tainted can never accept full state
+- **ID:** TD-046
+- **Title:** Under DC-27 Appendix B option a) (DC-09 Appendix A.2), a device that holds a revocation cutoff C for a removed device W declines full state from any peer whose declared applied_upto[W] is above C, or that sends no declaration (older build). applied_upto never goes down, so this taint is permanent. A device whose peers are all tainted or run an older build can never accept full state while it holds the cutoff; it falls back to incremental sync only, and a gap that only full state can close (compacted history) stays open.
+- **Priority:** 2/10 — LOW (INFERRED from the rule; latent while compaction has no production caller, since without compaction incremental sync can close every gap)
+- **Status:** OPEN (INFERRED 2026-11-14 from DC-09 Appendix A.2 and DC-06 §3.4 monotone applied_upto; accepted cost of DC-27 Appendix B option a), see B.4). Becomes relevant once compaction ships.
+
+## TD-047 — A multi-message snapshot is applied per message, not as one unit
+- **ID:** TD-047
+- **Title:** `applySnapshot` (src/sync/full_state.ts) runs once per FULL_STATE_SNAPSHOT message and commits each message in its own transaction. Its absence loop (deletion by omission, DC-09 §5.2) only sees the entities of that one message, so every local entity that travels in a different message of the same stream is treated as absent and tombstoned when its version is dominated. This contradicts DC-09 §5.1 and §7.2 and TR-7 (one atomic logical apply of the whole snapshot).
+- **Priority:** 6/10 — MEDIUM (data loss on the receiver for any snapshot larger than one message; snapshots are rare today: Trigger A only fires on persistent gaps and `sweep()` has no production caller)
+- **Status:** RESOLVED (2026-11-14). PROVEN before the fix: a 300-event stream in 2 messages to a fresh receiver left 45 events; the same result with the `full_state.ts` of commit e741d61, so it predated the TD-041 fix. Fix: the receiver stages every message of a stream in connection-scoped temporary tables (`SnapshotStream` in src/sync/full_state.ts) and applies the whole stream at `final` in one transaction: entity merges, the absence rule over all messages, inherited tombstones, applied_upto/device_clock and the pending/skipped clean-up. Each message is still judged under DC-09 Appendix A.2; the A.3 clamp uses the cutoffs held at commit, so a cutoff that arrives mid-stream governs the whole stream. A stream that ends before `final`, or whose messages disagree on snapshot_clock or applied_upto, writes nothing. Covered by `tests/td047_snapshot_stream.test.ts` and the TD-047 cases in `tests/dc27_unpair.test.ts`. Remaining gap: see TD-048.
+
+## TD-048 — A lone or repeated final snapshot message deletes the rest of the stream
+- **ID:** TD-048
+- **Title:** FULL_STATE_SNAPSHOT messages carry no stream id or message index (DC-08), so a receiver cannot tell a complete one-message snapshot from the `final` message of a longer stream arriving alone, repeated or replayed. It applies that message as a whole snapshot, and the absence rule (DC-09 §5.2) tombstones every entity that travelled in the stream's other messages. This breaks DC-08 TR-12 (redelivery of any legal message leaves the state unchanged).
+- **Priority:** 5/10 — MEDIUM (data loss; within a session the Noise transport's in-order nonces rule out third-party replay, so it needs a faulty or hostile paired peer or a future code path that delivers `final` alone)
+- **Status:** OPEN. PROVEN by an uncommitted review probe (2026-11-14): sender with 600 events in 3 messages; the receiver held 600 after the full stream and 89 after the same `final` message was delivered once more (same result when it is duplicated inside one session). Related observations from the same review: `receiveAndApplySnapshots` (src/sync/sync_engine.ts) reads from the transport without draining the stashed-message queue first (HYPOTHESIS: an earlier message sitting in the stash would be left out of the commit; no conforming sequence found); `SnapshotStream.discard()` keeps its head after a declined or malformed message (safe today, since the engine discards the object); staging has no size limit; a database closed mid-stream makes the clean-up in the session `finally` throw and hide the session's own error. Fix needs a wire change (stream id and message index or count, checked before commit) and a DC-08/DC-09 amendment.
+
+
+## TD-049 — Pairing scanner checks the session key against the other side's own payload, not the pasted code
+- **ID:** TD-049
+- **Title:** In `acceptPairingPayload` (src/network/pairing_manager.ts:403-405) the scanner runs DC-05 §6.1 V2 against the payload the connected party sent over the encrypted channel (`exchangePayloads(localPayload, remoteRaw)`, `verifyRemoteStatic`), not against the `public_key` of the pasted code, and `connectSync` is given no expected key. Trust is then stored for the PASTED id and key (line 411). DC-05 §6.1 V2 says the scanner verifies the session key against the QR payload `public_key` (the authoritative out-of-band binding). Related: neither side runs the received encrypted payload through `decodePairingPayload`, and the displayer (line 279) stores `remoteRaw.device_id` without checking that it is derived from `remoteRaw.public_key`.
+- **Priority:** 5/10 — MEDIUM (pairing ceremony binding; INFERRED impact: whoever answers at the pasted address can complete the ceremony with the scanner, which then stores trust in the pasted device's key; the safety-number comparison is still auto-confirmed, see the TODO(ui) in the same file)
+- **Status:** RESOLVED 2026-11-15 by DC-05 Appendix B (B.1, B.7), implemented in src/network/pairing_manager.ts (`acceptPairingPayload`) and src/security/pairing.ts (`decodePairingCode`, `decodeCeremonyPayload`). The scanner now checks the session key against the pasted code before sending any frame (S1), strictly decodes the received payload, and aborts unless its device_id and public_key equal the code's (S2/S3); both decoders check device_id = "d-" + hex(SHA-256(public_key)). Tests: `tests/dc05b_pairing_proof.test.ts` TR-B2, TR-B3, TR-B6, TR-B7. Remaining: the safety-number comparison is still auto-confirmed (deferred by Appendix B.8 / P12, owner-approved), and the scanner stores trust before it receives PAIRING_OK (TD-058).
+
+## TD-050 — A peer can announce a name that reads like another label
+- **ID:** TD-050
+- **Title:** DC-28 §4.8 allows any visible text, so a peer can announce "This device", "This device (local)" or "Device <another device's short id>". DC-28 P7 adds " (<short id>)" only when two entries in the SAME list collide (the conflict dialog includes this device, so a spoof there is disambiguated); in lists without this device (Paired Devices, Sync Errors), or across lists, such a name is shown as is, with only the muted "id <short id>" next to it in Paired Devices and Devices & sync.
+- **Priority:** 2/10 — LOW (display only, D1: names never affect identity or trust; the peer is already paired)
+- **Status:** OPEN (INFERRED from the DC-28 rules, 2026-11-14). Options: reserve the label forms "This device…" / "Device <8 hex>" in validateName for received names, or always show the short id next to announced names. Either is a DC-28 amendment.
+
+## TD-051 — The offering device sends its own name to whoever connects first
+- **ID:** TD-051
+- **Title:** In the pairing ceremony the displayer (the device showing the code) sends its encrypted payload first (DC-05 §5.2 order, `createPairingOffer` in src/network/pairing_manager.ts), before it knows who connected: the offer listener has no expected key. With DC-28 that payload carries the saved own name, so any device that reaches the open offer port while the code is shown receives the name, even without the code. The scanner side does not have this gap (it checks the session key against the pasted code before adding its name).
+- **Priority:** 2/10 — LOW (the name is display text the user chose to share when pairing, P3; the window is the open offer only; no identity or trust impact)
+- **Status:** RESOLVED 2026-11-15 by DC-05 Appendix B (B.2-B.6), implemented in src/network/pairing_manager.ts (`createPairingOffer`). The v2 code carries a one-time 16-byte secret; the displayer sends nothing, parses nothing and consults neither store until the scanner's first frame proves the secret (HMAC-SHA256 over the session's handshake hash, compared in constant time); a wrong or missing proof gets a silent close and one counter line. Tests: `tests/dc05b_pairing_proof.test.ts` TR-B1, TR-B4, TR-B8, TR-B9, TR-B10. Residual (accepted, Appendix B.9 R1/P14): a connector without the code still learns the displayer's Noise static key from the handshake itself.
+
+## TD-052 — A snapshot from a lagging sender deletes history it never held
+- **ID:** TD-052
+- **Title:** The absence rule (DC-09 §5.2) deletes a receiver's live entity that is absent from a full-state snapshot when the entity's version is dominated by the sender's snapshot_clock. snapshot_clock comes from the sender's device_clock, which takes in causal context (DC-27 Appendix B.1 e): a sender whose applied_upto[W] lags below an entity's seq, but which applied another producer's change that cites that seq, covers the entity without holding it. The receiver then tombstones legitimate history, including a removed device's changes at or below the revocation cutoff (against DC-27 §4.4 KEPT and TR-7). DC-09 Appendix A.2 accepts such a sender, since its declared applied_upto[W] is at or below the cutoff, and A.3 clamps applied_upto only. The apply also deletes when neither device holds any record (PROVEN at the apply level); whether a real session reaches that sender state is INFERRED, so the defect is INFERRED to be independent of revocation.
+- **Priority:** 6/10 — MEDIUM (data loss on the receiver; snapshots are rare today: Trigger A only fires on persistent gaps and `sweep()` has no production caller)
+- **Status:** OPEN. PROVEN 2026-11-14 by seven `test.fails` probes in `tests/dc27_unpair.test.ts` ("TD-045 (iii) KNOWN DATA LOSS (TD-052) ..."), with a passing control ("TD-045 (iii) control"). Setup: W writes W-1 (seq up to 2), S applies W through 2, W writes W-2 (seq 3); L, P and X apply W through 3; P creates an event whose clock cites W:3; L unpairs W (cutoff 3). S then lags (applied_upto[W] 2) while its snapshot_clock[W] is 3, in three ways: no record and an interrupted pull from P (P's records only), the same plus L's record (cutoff 3), or its own record (cutoff 2, so a real session with P does not apply W's seq 3). For each, a receiver holding the cutoff (L) and one holding none (X) accept the snapshot and lose W-2. Literal output, sender with a lower cutoff to L: `k1=2 k2(W-2)=3 cutoff=3 receiver=L receiver.cutoff=3 S.applied_upto[W]=2 S.declared[W]=2 S.snapshot_clock={"S":1,"W":3,"P":2,"L":1} receiver.version(W-2)={"W":3,"S":1} declined=false absenceTombstones=1 receiver titles after=["P-CITES-W","W-1"] tombstones(W-2)=1`. The other five direct-apply cases print the same values, except `receiver=X receiver.cutoff=none` for X. Through L's session engine (S relays its record first, L holds both, highest cutoff 3): `L cutoff=3 records on L=2 snapshotsDeclined=0 L titles after=["P-CITES-W","W-1"] tombstones(W-2)=1`. Control (S never applied P's records, snapshot_clock[W] 2): W-2 stays on both receivers. The clean evidence is receiver L (direct apply and session engine). The lower-cutoff sender to X case is apply-level only: in a real session S's record arrives before data, so X would hold cutoff 2 and W-2 would be above X's cutoff. Not established: whether a real session can deliver a snapshot from S while S still lags (the interrupted-pull state is set up through the change-apply path, not a dropped session). Fix needs a contract decision first (DC-09 §5.2 and §7.1; candidate: judge absence against the sender's applied frontier rather than device_clock). No code change made.
+
+## TD-054 — Lookalike names are not disambiguated
+- **ID:** TD-054
+- **Title:** DC-28 P7 (`disambiguateLabels` in src/domain/device_names.ts) compares labels as raw strings. Two names that render the same but differ in invisible or confusable characters (for example "Laptop" and "Laptop" + a trailing U+200D ZWJ, which §4.8 allows; or Latin/Cyrillic lookalikes) count as different labels, so neither gets " (<short id>)".
+- **Priority:** 2/10 — LOW (display only, D1; the peer must already be paired)
+- **Status:** OPEN (found by the DC-28 blind review, 2026-11-14). Options: compare a display skeleton (strip ZWJ/ZWNJ, case fold, Unicode confusables) when deciding duplicates. Needs a DC-28 amendment of P7.
+
+## TD-055 — Names that render blank pass the name rule
+- **ID:** TD-055
+- **Title:** §4.8 rejects controls and format characters, but names made only of characters that render as nothing or as blank space pass: U+3164 HANGUL FILLER, U+FFA0 HALFWIDTH HANGUL FILLER, U+2800 BRAILLE PATTERN BLANK, combining marks without a base, unassigned code points. Such a peer shows an empty-looking label. Paired Devices and Devices & sync show the muted "id <short id>" next to it, but the Sync Errors "From:" line and the conflict dialog's side label / Keep button do not.
+- **Priority:** 3/10 — LOW (display only; a paired peer can make itself hard to recognize on those two surfaces). Related: TD-050 (names that read like another label).
+- **Status:** OPEN (contract gap in DC-28 §4.8, found by the DC-28 blind review, 2026-11-14). Options: reject names with no visible base character, or show the short id beside every peer label on every surface. Either is a DC-28 amendment.
+
+## TD-056 — Any announced name that is a prefix of the sender's id is dropped
+- **ID:** TD-056
+- **Title:** DC-28 §4.5 drops a received name that is a prefix of the sender's device id (meant for the 12-character placeholder older builds send). `announcedNameFromPeer` applies it literally, so real but short names such as "d" or "d-7" are dropped too (the one-time migration uses the same rule).
+- **Priority:** 1/10 — LOW (such names are implausible; the user can set a nickname)
+- **Status:** OPEN (as specified by §4.5; found by the DC-28 blind review, 2026-11-14). Option: only drop prefixes of the placeholder length (12) or of at least "d-" + 8 hex.
+
+## TD-057 — The name field's "Room left" counts spaces that saving removes
+- **ID:** TD-057
+- **Title:** `remainingRoomText` (frontend/name_editor.ts) measures the NFC input as typed. Leading/trailing spaces and runs of spaces, which validateName trims and collapses on save, are counted, so the field can show less room (or "Too long") than the saved name will use.
+- **Priority:** 1/10 — LOW (cosmetic; Save still validates the normalized name)
+- **Status:** OPEN (found by the DC-28 blind review, 2026-11-14). Fix: measure the trimmed/collapsed form.
+
+## TD-058 — The pairing scanner stores trust before the other side confirms
+- **ID:** TD-058
+- **Title:** In `acceptPairingPayload` (src/network/pairing_manager.ts) the scanner writes its trust entry for the displayer and only then waits for PAIRING_OK. If the displayer then refuses (DC-27 A.2 "revoked"), fails its own checks (B.7 V2, store error) or the connection drops, the scanner keeps a trusted row for a device that did not store it back: one-sided trust (DC-05 TR-4: no session carries data, both sides deny; the row shows in Paired Devices).
+- **Priority:** 5/10 — MEDIUM (one-sided trust after a failed pairing, PROVEN on the built sidecar; no data flows over it and it is removable by Unpair, but the user sees a "paired" device that the other side does not trust)
+- **Status:** OPEN. PROVEN 2026-11-15 by the blind review of the DC-05 Appendix B change, on the built sidecar bundle, in two cases: (1) the displayer refuses with PAIRING_REFUSED "revoked" (DC-27 A.2) after the scanner's payload: the scanner shows the refusal text but keeps a trusted row for the displayer; (2) the displayer closes after the proof without PAIRING_OK (code used up, cancelled or expired mid-ceremony): the scanner shows the single "no longer valid" text and keeps a trusted row. Appendix B adds further failure paths after the scanner's trust write, each with the same effect: the displayer's strict payload decode (B.7), its session-key binding (V2), cancel or the 10-minute lifetime (P8) during the ceremony, and a store error on the displayer. First found by source reading during the same work; pre-existing, ordering unchanged because Appendix B P4 keeps the frame order. Fix options: store on the scanner only after PAIRING_OK (then a displayer that stored and sent OK can still be left one-sided if the scanner's own store fails), or roll the scanner's entry back on refusal. Either needs a DC-05 decision.
+
+## TD-059 — The pairing code text cannot be wiped from memory
+- **ID:** TD-059
+- **Title:** DC-05 Appendix B.2 asks to overwrite the one-time secret when the offer ends. The secret's Buffer is zeroed on both sides (VB-6), but the code is also a JavaScript string (the `qr_text` reply, the NDJSON line, the Rust reply, the webview textarea). Strings are immutable and are freed only by garbage collection, so "destroy" for those copies means dropping the references: the sidecar tracks the offer without its text, and the Devices dialog clears the shown code once the offer has ended.
+- **Priority:** 1/10 — LOW (local process memory only; the secret is dead once the offer ends, which the displayer enforces)
+- **Status:** OPEN (accepted residual of VB-6, 2026-11-15). No fix planned in the JavaScript runtime.
+
+## TD-060 — A connection that stalls inside the Noise handshake is never timed out
+- **ID:** TD-060
+- **Title:** `serveSync` (src/network/sync_runtime.ts) runs the Noise handshake with no time limit. A peer that opens TCP and never finishes the handshake keeps that socket open. On a pairing offer this is not counted as a bad proof (DC-05 Appendix B P6, as specified) and survives the end of the offer until the peer closes; the standing sync listener has the same behaviour.
+- **Priority:** 2/10 — LOW (denial of service, out of scope per DC-05 §8 N4; no data exposed)
+- **Status:** OPEN (OBSERVED by source reading, 2026-11-15; pre-existing). Fix option: a handshake deadline in `serveSync`; a sync-protocol decision (DC-05 §10 "session timeouts").
+
+## TD-061 — DC-27 A.2 and DC-28 §4.5 wording predates DC-05 Appendix B
+- **ID:** TD-061
+- **Title:** Two contract texts owned elsewhere still describe the pre-Appendix-B ceremony: DC-27 Appendix A.2 says the refusal is sent "before any check or trust write" (Appendix B P10, approved: after the proof and the strict decode, before binding; open item OB-1), and DC-28 §4.5 says "decodePairingPayload keeps accepting name" (Appendix B P2: a v2 code with "name" is refused; OB-2). The implementation follows Appendix B.
+- **Priority:** 1/10 — LOW (documentation consistency)
+- **Status:** OPEN (2026-11-15). Fix: a one-line note in each of DC-27 A.2 and DC-28 §4.5 pointing to DC-05 Appendix B.
+
+## TD-062 — A listener-port test writes to /tmp whatever TMPDIR says
+- **ID:** TD-062
+- **Title:** `freeDir()` in tests/ensure_listener_port.test.ts (line 29-30) builds its data folders as `path.join("/tmp", "tide-port-test-…")` instead of `os.tmpdir()`, so every full test run leaves `/tmp/tide-port-test-*` folders behind even when TMPDIR points elsewhere, and the folders are not removed afterwards.
+- **Priority:** 1/10 — LOW (test hygiene only; no product code involved)
+- **Status:** OPEN (OBSERVED 2026-11-15: two new folders after each full `npx vitest run` with TMPDIR set). Fix: use `os.tmpdir()` and remove the folder in the test's cleanup.
+
+## TD-070 — Concurrent edits to series, occurrence overrides and calendars are not detected as conflicts
+- **ID:** TD-070
+- **Title:** `detectAndRecordConflict` (src/persistence/database.ts) returns "apply" for every entity type except events, so two devices that edit the same series rule, the same occurrence override field or the same calendar field at the same time create no conflict record. Each device keeps whichever change it applied last, so devices can end with different values depending on the order the changes arrived in. Events do not have this problem. The same applies to reminders: two devices editing the same reminder at once keep the change that arrived last (a change that is causally older than one already stored is skipped, but concurrent edits are not detected). A reminder added while another device deletes the same event is a delete-versus-edit conflict on the event: the event stays on the device that added the reminder.
+- **Priority:** 6/10 — MEDIUM (data differs between devices without any warning; no loss of history, every change is stored and every device holds the same set of changes)
+- **Status:** OPEN. Known convergence defect: the calendar state of two devices holding the same changes should be identical. Scheduled for the conflict-engine work.
+
+## TD-071 — The unpairing cutoff can differ between devices
+- **ID:** TD-071
+- **Title:** When a device is unpaired, the unpairing device signs a record with a cutoff: the highest change number of the removed device that it had applied. Every other device uses the highest cutoff among the unpairing records it has accepted (`revokedCutoffs`, src/security/revocation_store.ts). A record is accepted only from a device that is directly paired with the receiver. Two devices can therefore hold different cutoffs for the same removed device, and a device that applied the removed device's changes before it learned the record keeps them. Devices can end up holding different data from a removed device.
+- **Priority:** 4/10 — MEDIUM-LOW (affects only data written by a removed device after the unpairing point; no effect on devices that never synced with it)
+- **Status:** OPEN. Known limitation of the unpairing design (DC-27, section 4.4 and Appendix B). To be revisited with the unpairing-warning work.
+
+## TD-072 — A device can advertise sequence numbers it cannot serve
+- **ID:** TD-072
+- **Title:** A device's advertised clock (`device_clock`) merges the clock entries cited by every change it receives or holds, not only the changes it has applied. A device that holds a change citing another device's sequence numbers therefore advertises numbers it cannot serve. A downstream device asks for them every session, gets an empty answer and counts a persistent gap. While full-state snapshots were on, that gap ended in needless full-state offers. With snapshots off (the default in this release) the effect is only needless requests: on a four-device chain, 16 range requests over 4 sessions, no offers, and nothing logged by the gap itself.
+- **Priority:** 3/10 — LOW (extra requests only; no data loss; no loop, each session asks at most twice per advertised range)
+- **Status:** OPEN. Reproduced on a four-device chain (8 offers in 4 sessions before snapshots were switched off, 0 after). Recorded, not fixed. Candidate fix: advertise only the applied frontier.
+
+## TD-073 — Reminder changes from other devices are stored but not written to the reminders table
+- **ID:** TD-073
+- **Title:** Reminder changes (member add, update, remove) received from another device are stored in the change history but not written to the `reminders` table: the change applier accepts and ignores that entity type, so reminders do not sync between devices. A later fix has to replay the reminder changes already stored in the history. A reminder also references its event (a second referenced object), so the same rule for a missing referenced object applies to it.
+- **Priority:** 6/10 — MEDIUM (a reminder set on one device never appears on the others)
+- **Status:** ADDRESSED: reminder changes are applied through the prerequisite rule, and `replayReminderHistory` (src/persistence/reminder_replay.ts) rebuilds rows from stored history at every start, in arrival order, with the same causal rule as live sync. A replayed change whose event is absent and whose prerequisite is missing or rejected cannot be decided; it stays in history, is logged by change id and retried at the next start (no visible notice).
+
+## TD-074 — Concurrent sync sessions can leave a stale hold counter or waiting notice
+- **ID:** TD-074
+- **Title:** If two sync sessions run at the same time and one of them applies a change that the other still counts as held, the held-session counter (`held_changes`) or the "waiting on a change" notice for that change can briefly stay behind. It is cleaned up at the end of the next session or at the next engine start.
+- **Priority:** 1/10 — LOW (transient; no effect on data)
+- **Status:** OPEN. Known limitation.
+
+## TD-075 — Rejection proofs live in the display list of quarantined records
+- **ID:** TD-075
+- **Title:** The prerequisite rule for a change whose target is missing needs to know whether a change it depends on was rejected. That proof is read from the quarantine table, which is also the list the user sees. Sync correctness should not depend on display rows. The retention cap now exempts the rows that serve as proof, and a row whose stored record cannot be read is no proof.
+- **Priority:** 3/10 — LOW (works today; fragile if display rows are changed or removed)
+- **Status:** OPEN. To revisit with the conflict-engine work.
+
+## TD-076 — A genuine create of a non-default calendar can be quarantined by an unrelated rejected change
+- **ID:** TD-076
+- **Title:** A create of a non-default calendar is quarantined when its clock covers an unrelated change from another device that this device rejected: the prerequisite rule treats the rejected change as a prerequisite of the create (`sync_service.ts`, calendar apply path, together with the rejection-proof lookup in `database.ts`). Not reachable today, because only the default calendar exists.
+- **Priority:** 2/10 — LOW (not reachable today)
+- **Status:** OPEN. To fix before multiple calendars ship.
+
+## TD-077 — When one (device, sequence number) exists with two contents, the first copy to arrive is stored
+- **ID:** TD-077
+- **Title:** A change is identified only by its origin device and sequence number. When two different copies of the same (device, sequence number) exist (for example after a device was restored from an older backup and reused the number), whichever copy arrives first is stored, and the other is reported as a duplicate-content warning. If the real copy is held and the other copy arrives first, the other copy is stored and the existing warning describes the stored copy; the real copy raises no new warning, because warnings of this kind are de-duplicated. Detection only; nothing is repaired. See TD-079.
+- **Priority:** 4/10 — MEDIUM (needs a restored device reusing sequence numbers)
+- **Status:** OPEN. To resolve together with TD-079.
+
+## TD-078 — The revalidation allow-list matches invalid-record reasons by text prefix
+- **ID:** TD-078
+- **Title:** The restart-time revalidation re-checks unresolved rows whose reason is "depends on quarantined change" or starts with the invalid-record prefix. A future reason that happens to start with the same prefix would be re-checked automatically. Fix: fixed reason codes instead of free-text reasons, ideally together with TD-075.
+- **Priority:** 2/10 — LOW (no such reason exists today)
+- **Status:** OPEN.
+
+## TD-079 — A device restored from an older backup reuses sequence numbers
+- **ID:** TD-079
+- **Title:** The next sequence number is taken from the local database only, so restoring an older backup rewinds it and the device can write new changes under numbers its peers already hold. Today this is detected and shown as a warning only (TD-077); devices can end up holding different content for the same change. Intended direction: a restored install gets a new device identity and the old identity is unpaired (as the architecture specification already requires for restores). Open question: how a restore is detected.
+- **Priority:** 6/10 — MEDIUM (silent divergence after a restore)
+- **Status:** OPEN.
+
+## TD-080 — Reminders can fire twice after a restart, and two labels are wrong
+- **ID:** TD-080
+- **Title:** The list of reminders already delivered lives in memory only. After a restart (or the sidecar being restarted) a reminder that already fired, whose event has not ended yet, fires again, labelled "missed". Two labels are also wrong: a reminder whose time falls in the first 30 seconds after the app started is labelled "missed" although the app was running (the first interval check still has no previous check), and a reminder whose time passed while the timer was paused is delivered late but labelled "on time". Nothing is skipped in any of these cases while the event has not ended. Reproduction: run the alarm check with a simulated clock, once with the fire time inside the first 30 seconds after start, once with a gap in the checks that spans the fire time, and once with a restart after the reminder fired.
+- **Priority:** 3/10 — LOW (duplicate or mislabelled notification; nothing lost)
+- **Status:** OPEN. Fix direction: persist the delivered keys (or the last check time) locally.
+
+## TD-081 — All-day reminders never fire
+- **ID:** TD-081
+- **Title:** An all-day reminder fires the day before at a time picked per event (DC-22 D2, section 5.4), stored in `events.all_day_reminder_time`. Nothing writes that column and it is not part of the change-record vocabulary, so an all-day event never gets a fire time and the reminder never fires. The event dialog hides "Remind me" for whole-day events; saving a whole-day event leaves any existing reminder unchanged. To build: a per-event time field in the dialog, a change record that carries it, and the fire rule in the alarm engine.
+- **Priority:** 4/10 — MEDIUM-LOW (feature missing; the option is hidden so users are not misled)
+- **Status:** OPEN.
+
+## TD-082 — A fresh worktree has no dist/sidecar.mjs and one test depends on another having built it
+- **ID:** TD-082
+- **Title:** tests/ensure_listener_port.test.ts needs dist/sidecar.mjs. In a fresh checkout or worktree the file does not exist until `npm run sidecar:build` runs, so the test fails or passes depending on whether another test built it first (test-order dependency).
+- **Priority:** 2/10 — LOW (test setup only)
+- **Status:** OPEN. Fix: build the sidecar in a test setup step or skip with a clear message.
+
+## TD-083 — Applying a full-state snapshot deletes events but not their reminders
+- **ID:** TD-083
+- **Title:** The snapshot apply path (src/sync/full_state.ts, the event delete statement) removes event rows without removing the reminder rows of those events. The local and remote change paths now remove them together with the event (`deleteEventRows`). Snapshots are off in this release.
+- **Priority:** 2/10 — LOW (snapshots are off; orphan rows are harmless to the alarm, which only reads live events)
+- **Status:** OPEN. Fix before snapshots are enabled.
+
+## TD-084 — A recurring event that cannot be expanded for the alarm is reported in the log only
+- **ID:** TD-084
+- **Title:** If a series cannot be expanded for the alarm timer, the timer now writes one log line per series (ids only, no calendar content) and falls back to the first occurrence. There is no visible notice: the user-facing warning list is built from change records (see TD-075), and a fake change record must not be created for it. A visible notice needs its own local warning list.
+- **Priority:** 2/10 — LOW (not reachable with a valid event today)
+- **Status:** OPEN.
+
+## TD-085 — A resolution on the conflict screen does not restore a deleted event
+- **ID:** TD-085
+- **Title:** Resolving a delete-versus-edit conflict with "keep the edit" writes a change record (field path `*`, operation set) but does not recreate the deleted event row on this device, and the record's value shape is not the full-event shape the change applier accepts for an absent event, so other devices do not recreate it either. The only path that recreates an absent event today is an incoming full-event change (field path `event`); it also rebuilds that event's reminders. The restore-versus-delete behaviour (which side wins, how a restored event and its reminders come back) needs its own decision and design together with the conflict-engine work.
+- **Priority:** 5/10 — MEDIUM (a user who chooses to keep an edit over a delete does not get the event back)
+- **Status:** OPEN. Same area as TD-070.
+
+## TD-086 — Reminder replay cost grows quadratically with the number of edits of one reminder
+- **ID:** TD-086
+- **Title:** The startup replay checks each stored reminder change against the other stored changes of the same reminder for causal staleness. For a reminder edited n times this is O(n²): about 0.3 s per start for 10,000 reminders with one change each, but about 1.5 s per start for a single reminder edited 2,000 times (measured on a desktop). Fix: index stored changes per reminder member, or keep the latest causal frontier per member.
+- **Priority:** 2/10 — LOW (needs a reminder edited thousands of times)
+- **Status:** OPEN.
+
+## TD-087 — Saving the event dialog before its reminder lookup finishes can clear reminders
+- **ID:** TD-087
+- **Title:** The dialog loads the event's reminder asynchronously; until the lookup returns (or if it fails), the "Remind me" checkbox shows the no-reminder state. Saving a timed event in that window clears the event's reminders without the several-reminders notice. Over local IPC the window is in the millisecond range. Fix: disable saving until the lookup has returned, or skip reminder changes when the lookup did not complete.
+- **Priority:** 2/10 — LOW (narrow timing window)
+- **Status:** OPEN.

@@ -24,6 +24,7 @@ import {
   type QuarantineRow,
 } from "../frontend/sync_errors.ts";
 import type { Database } from "better-sqlite3";
+import { seedEvent } from "./sync_seed_helpers.ts";
 
 const T0 = Date.UTC(2026, 8, 1, 9, 0, 0); // fixed epoch ms — deterministic
 const PRODUCER = "d-td005";
@@ -74,6 +75,7 @@ function quarantine(seq: number, valid = true): void {
 // ---------------------------------------------------------------------------
 describe("TD-005: resolution via revalidation", () => {
   test("applied formerly-quarantined record is marked resolved", () => {
+    seedEvent(db, "evt-td005");
     quarantine(1, true); // will become valid
     expect(countQuarantined(db)).toBe(1);
     const before = listQuarantine(db)[0]!;
@@ -133,6 +135,7 @@ describe("TD-005: still-invalid rows stay active", () => {
 // ---------------------------------------------------------------------------
 describe("TD-005: reconcile idempotency", () => {
   test("double-run marks nothing new and preserves the first reason", () => {
+    seedEvent(db, "evt-td005");
     quarantine(1, true);
     quarantine(2, false);
     revalidateQuarantine(db, makeEntityMutator()); // applies #1 only
@@ -156,6 +159,7 @@ describe("TD-005: reconcile idempotency", () => {
 // ---------------------------------------------------------------------------
 describe("TD-005: stats and badge shaping", () => {
   test("mixed counts are exact and the view splits active/resolved", () => {
+    seedEvent(db, "evt-td005");
     quarantine(1, true);
     quarantine(2, false);
     quarantine(3, true);
@@ -194,6 +198,7 @@ describe("TD-005: stats and badge shaping", () => {
 // ---------------------------------------------------------------------------
 describe("TD-005: resolution durability", () => {
   test("resolved flag + reason persist across close/reopen", () => {
+    seedEvent(db, "evt-td005");
     quarantine(1, true);
     revalidateQuarantine(db, makeEntityMutator());
     reconcileQuarantineResolutions(db);

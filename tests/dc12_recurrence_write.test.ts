@@ -79,6 +79,7 @@ describe("recurring-event creation (DC-12 §2.1)", () => {
     });
     expect(JSON.parse(rec[0]!.payload)).toEqual({
       value: "FREQ=WEEKLY;BYDAY=WE",
+      base_event_id: ev.id,
     });
     // No override rows yet.
     expect(series[0]!.overrides).toEqual([]);

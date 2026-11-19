@@ -174,6 +174,11 @@ export interface InboundSession {
   /** Ends the underlying connection (call after use finishes). */
   done(): void;
   /**
+   * Drops the connection at once, without flushing (DC-05 Appendix B.4:
+   * a connection without a valid proof is closed without any message).
+   */
+  destroy(): void;
+  /**
    * DC-21 D6: the endpoint this session DIALED (scheduler/connectSync path
    * only; undefined for inbound sessions). Recorded into the peers table as
    * the last-known endpoint ONLY after a successful authenticated session.
@@ -227,6 +232,7 @@ export function serveSync(
           ),
           json: makeJsonChannel(raw),
           done: doneOnce,
+          destroy: () => sock.destroy(),
         });
       } catch {
         // Fail-closed: any handshake error kills the socket, no plaintext path.
@@ -275,6 +281,7 @@ export async function connectSync(
       if (framing.flushing) setTimeout(() => sock.end(), 50);
       else sock.end();
     },
+    destroy: () => sock.destroy(),
   };
 }
 
@@ -285,6 +292,14 @@ export async function connectSync(
 export interface JsonChannel {
   send(obj: unknown): Promise<void>;
   receive(): Promise<unknown>;
+  /**
+   * DC-05 Appendix B.3/B.4: receive ONE small frame (the pairing proof).
+   * The ciphertext is capped at `maxCipherBytes` BEFORE decryption; an
+   * oversize, undecryptable or non-JSON frame and a closed channel all give
+   * { ok: false } without throwing and without any text derived from the
+   * frame (a JSON.parse error message can echo its input).
+   */
+  receiveBounded(maxCipherBytes: number): Promise<{ ok: true; value: unknown } | { ok: false }>;
 }
 
 /** Set to log channel lifecycle (debug). */
@@ -292,6 +307,19 @@ export const JSON_CHANNEL_DEBUG = false;
 function jdbg(m: string): void {
   if ((globalThis as { __TIDE_JDBG?: boolean }).__TIDE_JDBG)
     console.error("[json]", m);
+}
+
+/**
+ * VB-9 / TR-B10: the debug trace shows the SHAPE of a frame only (its
+ * top-level keys and serialized length), never a value. Pairing frames
+ * carry the proof and the code's identity; values stay out of the trace.
+ */
+export function describeFrame(obj: unknown, serializedLength: number): string {
+  const shape =
+    typeof obj === "object" && obj !== null && !Array.isArray(obj)
+      ? `keys=[${Object.keys(obj).join(",")}]`
+      : `type=${obj === null ? "null" : Array.isArray(obj) ? "array" : typeof obj}`;
+  return `${shape} len=${serializedLength}`;
 }
 
 /**
@@ -303,13 +331,18 @@ function makeJsonChannel(raw: RawSessionHandle): JsonChannel {
   const enc = new TextEncoder();
   const dec = new TextDecoder();
   let dead = false;
+  const kill = (): void => {
+    dead = true;
+    try { raw.sendCipher.free(); raw.receiveCipher.free(); } catch {}
+  };
   return {
     async send(obj: unknown): Promise<void> {
-      jdbg("send " + JSON.stringify(obj).slice(0, 60));
+      const text = JSON.stringify(obj);
+      jdbg("send " + describeFrame(obj, text.length));
       if (dead) throw new Error("json channel dead");
       const frame = raw.sendCipher.EncryptWithAd(
         new Uint8Array(0),
-        enc.encode(JSON.stringify(obj)),
+        enc.encode(text),
       );
       raw.outbound.push(frame);
     },
@@ -321,13 +354,39 @@ function makeJsonChannel(raw: RawSessionHandle): JsonChannel {
       try {
         plain = raw.receiveCipher.DecryptWithAd(new Uint8Array(0), frame);
       } catch (err) {
-        dead = true;
-        try { raw.sendCipher.free(); raw.receiveCipher.free(); } catch {}
+        kill();
         throw new Error(`json channel decrypt failed (fail-closed): ${String(err)}`);
       }
-      const obj = JSON.parse(dec.decode(plain)) as unknown;
-      jdbg("receive ok " + JSON.stringify(obj).slice(0, 60));
+      const text = dec.decode(plain);
+      const obj = JSON.parse(text) as unknown;
+      jdbg("receive ok " + describeFrame(obj, text.length));
       return obj;
+    },
+    async receiveBounded(maxCipherBytes: number): Promise<{ ok: true; value: unknown } | { ok: false }> {
+      if (dead) return { ok: false };
+      const frame = await raw.inbound.receive();
+      if (frame === null) { jdbg("receive -> null (closed)"); return { ok: false }; }
+      if (frame.length > maxCipherBytes) {
+        jdbg(`receive oversize len=${frame.length}`);
+        kill();
+        return { ok: false };
+      }
+      let text: string;
+      try {
+        text = dec.decode(raw.receiveCipher.DecryptWithAd(new Uint8Array(0), frame));
+      } catch {
+        jdbg("receive decrypt failed");
+        kill();
+        return { ok: false };
+      }
+      try {
+        const obj = JSON.parse(text) as unknown;
+        jdbg("receive ok " + describeFrame(obj, text.length));
+        return { ok: true, value: obj };
+      } catch {
+        jdbg(`receive not json len=${text.length}`);
+        return { ok: false };
+      }
     },
   };
 }
@@ -337,25 +396,24 @@ function makeJsonChannel(raw: RawSessionHandle): JsonChannel {
 // ---------------------------------------------------------------------------
 
 /**
- * Build this device's QR payload fields except the nonce — the nonce is
- * ceremony state and MUST come from freshNonce()/PairingSession ownership.
+ * Build this device's code fields except the nonce and the secret — both
+ * are per-offer state owned by the offer (DC-05 §5.1a, Appendix B.2).
  */
 export function makePairingPayload(
   identity: DeviceIdentity,
   port: number,
-  name?: string,
 ): {
-  v: 1;
+  v: 2;
   device_id: string;
   public_key: string;
   connect: { ip: string; port: number };
 } {
   return {
-    v: 1,
+    v: 2,
     device_id: identity.deviceId,
     public_key: Buffer.from(identity.publicKey).toString("base64"),
     connect: { ip: localIpHint(), port },
-    ...(name !== undefined ? { name } : {}),
+    // DC-28 P5: no "name" — the code travels through screens/clipboards.
   };
 }
 

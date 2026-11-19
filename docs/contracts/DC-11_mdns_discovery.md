@@ -1,6 +1,8 @@
 # TIDE DESIGN CONTRACT DC-11
 # mDNS/Bonjour Service Discovery
 Status: APPROVED by project owner (2026-08-25)
+AMENDED v2 by project owner (2026-11-14). See Appendix A; supersedes
+        §3.2 ("one browse cycle") where they conflict.
 
 OWNER Q&A AMENDMENT (2026-08-25): pairing of two brand-new clients does
 NOT depend on discovery — the QR ceremony (DC-05 §5) IS the initial
@@ -339,3 +341,59 @@ TR-8  Display-name opt-in: with "dn" opted in, the hint round-trips to
     (constrained by §7 and TR-1..TR-8)
   - Whether paired-peer manual/direct connect surfaces in UI .. separate
     UX decision; not required by this contract
+
+==================================================================
+APPENDIX A — v2 AMENDMENT (owner-approved 2026-11-14)
+==================================================================
+
+Problem: the shell restarted its browse every 25 s. Each new browse
+starts with a query burst, so the network saw a burst every 25 s,
+against §3.3 ("no proprietary aggressive beaconing").
+
+A.1  ONE LONG-LIVED BROWSE. The shell keeps a single browse running and
+     restarts it only when it ends or fails to start. Queries follow the
+     standard RFC 6762 schedule of the mDNS library (1 s, doubling, up
+     to 1 h). §3.2 "observed within one browse cycle" now means: a
+     service is observed when it announces, when the library re-queries
+     (new interface, schedule), or at the next on-demand round (A.2).
+A.2  ASK AGAIN WHEN IT MATTERS. An on-demand query round (re-issue the
+     browse on the same daemon, WITHOUT stopping it, so cache and live
+     view are kept and the query schedule restarts from 1 s) runs when:
+       (a) the user presses Sync now;
+       (b) a scheduled sync could not reach a paired peer (no endpoint
+           known, or the session failed); the sidecar signals this with
+           an id-less {"notice":"discovery_kick"} line (DC-26 §3.1
+           channel), carrying no device id.
+     At most ONE round per 60 s, whatever the number of triggers.
+     Trigger (b) takes effect once scheduler sessions are wired (DC-13
+     sweep currently unwired; every product sync today is a Sync now).
+     Because a round needs time to be answered, a Sync now press retries
+     each peer it could not reach ONCE, 3 s later, and only if that peer
+     now resolves to a different endpoint (an offline peer is not
+     dialled twice).
+     Reconciliation: after a round, a live entry the library does not
+     re-confirm within 3 s is treated as removed (A.3), so a removal
+     lost while the browse was re-issued cannot linger.
+A.3  REMOVALS ARE FORWARDED. When the library reports a service removed
+     (goodbye, record expiry, lost addresses), the shell forwards a
+     "removed" event (DC-21 §3.2(a)); the sidecar drops that endpoint
+     at once instead of waiting for its TTL.
+A.4  REFRESH. The shell keeps a transient copy of the library's current
+     view only to re-push it every 25 s, so still-present peers stay
+     fresh in the sidecar cache (§3.4 "refreshed by observation": the
+     view is the library's TTL-checked cache). The sidecar cache remains
+     the ONLY cache used for dialling (DC-21 §3.2/D2).
+A.5  TESTABLE REQUIREMENTS
+     TR-A1 Without triggers, the browse is started once and never
+           restarted on a timer.
+     TR-A2 A trigger re-issues the browse without stop_browse; further
+           triggers inside 60 s are ignored; the live view survives.
+     TR-A3 A removal of a known instance is forwarded exactly once; a
+           removal of an unknown instance is not forwarded.
+     TR-A4 The scheduler signals an unreachable peer for "no endpoint"
+           and for a failed session, never for a successful one.
+     TR-A6 After a round, an entry not re-confirmed is forwarded as
+           removed; a re-confirmed one is kept.
+     TR-A5 Owner, two machines: peer restart, sleep/resume and Wi-Fi
+           off/on each end in a working Sync now within one attempt.
+

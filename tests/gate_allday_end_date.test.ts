@@ -152,7 +152,7 @@ describe("T2: v8 data-repair migration fixes pre-fix all-day rows", () => {
     const row = reopened.db.prepare(
       "SELECT end_date, version FROM events, schema_version LIMIT 1",
     ).get() as { end_date: string; version: number };
-    expect(row.version).toBe(8);
+    expect(row.version).toBe(11); // v10 = DC-28 peers.announced_name
     expect(row.end_date).toBe("2026-10-01");
     reopened.db.close();
     void endMs;

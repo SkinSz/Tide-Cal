@@ -28,6 +28,18 @@
 
 * { box-sizing: border-box; }
 
+/* Owner request 2026-11-12 (#2): the UI scales with the window. All text
+   in the app is sized in rem, so a single root-font-size rule scales the
+   whole UI. The clamp keeps extremes sane: at ~800px window width it sits
+   at 14px (the old fixed 16px default minus a small margin so dense views
+   don't clip), grows to 20px on wide windows, never below 12px so the UI
+   stays legible on tiny windows. 1vw + 8px at 800px = 16px... tuned to
+   0.9vw + 7px so an 800px window ≈ 14.2px, a 1600px window ≈ 21px (clamped
+   to 20px). No JS, no re-render: pure CSS, applies live on resize. */
+html {
+  font-size: clamp(12px, 0.9vw + 7px, 20px);
+}
+
 body {
   margin: 0;
   background: var(--bg);
@@ -141,7 +153,8 @@ main { flex: 1; overflow: auto; padding: 8px; }
 #calendar-grid {
   display: grid;
   grid-template-columns: repeat(7, 1fr);
-  grid-auto-rows: minmax(96px, auto);
+  /* rem so the floor scales with the root font (UI-scales-with-window). */
+  grid-auto-rows: minmax(6rem, auto);
   gap: 4px;
   height: 100%;
 }
@@ -256,7 +269,25 @@ dialog menu .spacer { flex: 1 1 auto; }
   word-break: break-word;
 }
 .conflict-value.deleted { color: var(--muted); text-decoration: line-through; }
-.conflict-actions { display: flex; gap: 8px; margin-top: 8px; justify-content: flex-end; }
+.conflict-actions { display: flex; gap: 8px; margin-top: 8px; justify-content: flex-end; flex-wrap: wrap; }
+/* DC-14 Appendix A: readable presentation (versions side by side, raw data collapsed) */
+.conflict-header { margin: 0 0 6px; font-size: 0.9rem; }
+.conflict-sides { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }
+.conflict-sides .conflict-candidate { margin-top: 0; }
+.conflict-sides .conflict-candidate-head { display: block; }
+.conflict-line + .conflict-line { margin-top: 3px; }
+.conflict-when { margin-top: 6px; }
+.conflict-show-all {
+  background: none; border: none; padding: 0; margin-top: 6px;
+  color: var(--accent); font: inherit; font-size: 0.8rem; cursor: pointer;
+}
+.conflict-tech { margin-top: 12px; font-size: 0.78rem; }
+.conflict-tech summary { cursor: pointer; color: var(--muted); }
+.conflict-raw {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 8px; margin: 2px 0 6px; font-size: 0.75rem;
+  white-space: pre-wrap; word-break: break-word;
+}
 
 /* Event dialog: day + whole-day + time row */
 #ev-time-row { display: flex; gap: 10px; }
@@ -265,26 +296,34 @@ dialog menu .spacer { flex: 1 1 auto; }
 /* Week view: time-grid with duration-proportional blocks */
 #calendar-grid.week {
   /* ruler + 7 day columns (root default is 7 cols total -> Sunday clipped) */
-  grid-template-columns: 44px repeat(7, 1fr);
+  /* rem: the hour-label gutter scales with the root font too. */
+  grid-template-columns: 2.75rem repeat(7, 1fr);
   grid-template-rows: auto auto 1fr;
   height: 100%;
 }
 #calendar-grid.week .weekday-head { grid-row: 1; }
 .hour-corner { grid-column: 1; }
+/* Labels sit ON their hour line (top = h/24 %, translateY(-50%)) —
+   Outlook-style (owner request 2026-10-12). The 00:00 and 24:00 edge
+   labels would poke outside the ruler's box, so the ruler gets tiny
+   vertical padding and the labels shift with it (top = pad + h/24 of
+   the padded height ≈ unchanged for interior lines). */
 .hour-ruler {
   grid-row: 3;
   grid-column: 1;
   position: relative;
+  padding: 0.45em 0;
 }
-/* Labels centre on their hour line (top = h/24 %, translated up half). */
 .hour-label {
   position: absolute;
   right: 0;
   transform: translateY(-50%);
   font-size: 0.68rem;
+  line-height: 1;
   color: var(--muted);
   text-align: right;
   padding-right: 4px;
+  pointer-events: none;
 }
 #calendar-grid.week .day-col {
   grid-row: 3;
@@ -459,6 +498,13 @@ input[type="time"]::-webkit-time-picker-indicator { display: none; }
 .devices-dlg { min-width: 620px; }
 .devices-self { display: flex; gap: 16px; margin-bottom: 12px; font-size: 0.85rem; }
 .devices-self code { font-size: 0.8rem; color: var(--accent); }
+/* Friendly device names: own-name line + in-place rename editor */
+.devices-self { flex-wrap: wrap; align-items: center; }
+.devices-self-line button { margin-left: 6px; }
+#self-name-editor { flex-basis: 100%; }
+.name-editor { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 6px 0; }
+.name-editor-input { flex: 1 1 14em; min-width: 0; }
+.name-editor-help, .name-editor-error { flex-basis: 100%; font-size: 0.8rem; }
 .pairing-grid { display: flex; gap: 14px; }
 .pairing-grid fieldset {
   flex: 1;
@@ -515,6 +561,32 @@ input[type="time"]::-webkit-time-picker-indicator { display: none; }
 }
 .unblock-warning {
   width: 100%;
+  white-space: normal;
+}
+/* DC-27 §4.1: inline Unpair confirmation panel + Removed devices rows */
+.unpair-panel {
+  width: 100%;
+  white-space: normal;
+  border: 1px solid rgba(128, 128, 128, 0.4);
+  border-radius: 4px;
+  padding: 0.4rem 0.6rem;
+}
+.unpair-panel ul {
+  margin: 0.3rem 0;
+  padding-left: 1.2rem;
+}
+.unpair-panel-actions {
+  display: flex;
+  gap: 0.4rem;
+  justify-content: flex-end;
+}
+.unpair-error {
+  width: 100%;
+  white-space: normal;
+}
+.removed-device-row {
+  border-bottom: 1px solid rgba(128, 128, 128, 0.25);
+  padding: 0.4rem 0;
   white-space: normal;
 }
 .peer-state-row {

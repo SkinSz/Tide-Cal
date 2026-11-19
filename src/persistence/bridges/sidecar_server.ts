@@ -44,7 +44,7 @@ import {
   resolveEndpoint,
   type MdnsEvent,
 } from "../../network/endpoint_bridge.ts";
-import { instancePrefix } from "../../network/discovery.ts";
+import { instancePrefix, buildInstanceName, buildTxtRecord } from "../../network/discovery.ts";
 import { buildExportInput, exportToIcs } from "../../interop/ics_export.ts";
 import { parseIcs, planImport, applyImportPlan, buildExistingIndex } from "../../interop/ics_import.ts";
 import type { DeviceIdentity } from "../../security/identity.ts";
@@ -63,11 +63,9 @@ import {
   startSchedulerRuntime,
   makeSessionOpener,
 } from "../../application/scheduler_runtime.ts";
-import {
-  rebuildSchedule,
-  filterDelivered,
-  markDelivered,
-} from "../../application/reminder_engine.ts";
+import { replayReminderHistory } from "../reminder_replay.ts";
+import { markDelivered } from "../../application/reminder_engine.ts";
+import { computeDueReminders, formatTickProblem } from "../../application/reminder_tick.ts";
 import { deliverNotification } from "../../application/notification_delivery.ts";
 // Smoke-test fix (2026-09-03): reminders on series events fired against the
 // BASE row's stored instant only — a reminder set on any occurrence chip
@@ -76,19 +74,13 @@ import { deliverNotification } from "../../application/notification_delivery.ts"
 // the engine one synthetic event row PER OCCURRENCE in the reminder window
 // (id `<base>#<recurrence_id>`), so per-occurrence reminders work without
 // touching the replicated reminder member (still one per event, DC-22 D5).
-import { expandOccurrences } from "../../domain/recurrence_conflicts.ts";
+import {
+  deviceNameViews,
+  validateName,
+  type DeviceNameView,
+  type NameRule,
+} from "../../domain/device_names.ts";
 
-/** Local wall "YYYYMMDDTHHMMSS" -> epoch ms (same math as calendar.ts). */
-function msFromWallId(id: string): number {
-  const digits = id.replace(/\D/g, "");
-  const y = +digits.slice(0, 4);
-  const mo = +digits.slice(4, 6);
-  const dd = +digits.slice(6, 8);
-  const hh = +digits.slice(8, 10) || 0;
-  const mi = +digits.slice(10, 12) || 0;
-  const ss = +digits.slice(12, 14) || 0;
-  return new Date(y, mo - 1, dd, hh, mi, ss, 0).getTime();
-}
 import {
   listQuarantine,
   countQuarantined,
@@ -98,6 +90,7 @@ import {
   listPeerInvalidTally,
   // TD-005 remainder: per-item retry/delete + resolved-row retention cap.
   deleteQuarantineByUser,
+  dismissQuarantineWarning,
   pruneResolvedQuarantine,
 } from "../database.ts";
 // TD-005 remainder: per-item Retry shares the restart revalidation apply path.
@@ -108,6 +101,16 @@ import {
   ConflictsViewModel,
   type ResolutionOption,
 } from "../../application/conflicts_ui.ts";
+// DC-27: unpair (local revocation), persisted record/ACK store, trust gate.
+import {
+  isKnownRevoked,
+  makeDbRevocationChannel,
+  unpairLocal,
+  UnpairError,
+  listRemovedDevices,
+} from "../../security/revocation_store.ts";
+import { canSynchronize, shortDeviceId, type TrustStoreEntry } from "../../security/revocation.ts";
+import { PeerClosedBeforeHelloError } from "../../sync/sync_engine.ts";
 // TD-006 / DC-16: Tier-1 tracker (in-memory) + state surface for the UI.
 import {
   PeerMisbehaviorTracker,
@@ -120,9 +123,75 @@ type Json = Record<string, unknown>;
 export type Dispatcher = (op: string, args: Json) => unknown;
 
 /**
+ * DC-11 Appendix A.2(b): ask the shell for an on-demand mDNS query round (a
+ * paired peer was unreachable in a scheduler session). No payload: the
+ * shell rate-limits. Effective once scheduler sessions are wired (the DC-13
+ * sweep is UNWIRED today; Sync now kicks from the shell directly).
+ */
+export function discoveryKickNoticeLine(): string {
+  return JSON.stringify({ notice: "discovery_kick" });
+}
+
+/** DC-26 §3.1 wire format of the data notice (exported for TR-1/TR-3). */
+export function dataChangedNoticeLine(applied: number): string {
+  return JSON.stringify({ notice: "data_changed", source: "sync", applied });
+}
+
+/**
+ * DC-26 §3.1 decision seam (TR-1): exactly one notice when the session
+ * changed local data — applied >= 1 received change (conflict outcomes
+ * count as applied) or, since v2, deleted local rows via a full-state
+ * snapshot — none otherwise. A throwing sink never fails the session.
+ */
+export function notifyDataChanged(
+  stats: { receivedApplied: number; snapshotDeletions?: number },
+  sink: ((applied: number) => void) | undefined,
+): void {
+  const changed = stats.receivedApplied + (stats.snapshotDeletions ?? 0);
+  if (changed <= 0 || sink === undefined) return;
+  try {
+    sink(changed);
+  } catch {
+    /* a notice must never fail a completed session */
+  }
+}
+
+/**
+ * DC-27 §4.5: a session refused at the trust gate (after the handshake,
+ * before any sync message). The message is the §4.12 log line itself:
+ * decision + short id only (no keys, no full ids).
+ */
+export class SyncRefusedError extends Error {
+  constructor(
+    readonly decision: string,
+    deviceId?: string,
+  ) {
+    super(`sync refused: ${decision}${deviceId !== undefined ? " " + shortDeviceId(deviceId) : ""}`);
+    this.name = "SyncRefusedError";
+  }
+}
+
+/**
  * Sync runtime state for one sidecar process: identity + optional listener.
  * Data dir defaults to beside the DB (identity key must persist per install).
  */
+/**
+ * DC-28 §4.8: the user-facing refusal for an invalid name. Plain sentences,
+ * never the name itself (the shell logs failed calls).
+ */
+function nameRefusal(rule: Exclude<NameRule, "id_prefix">): string {
+  switch (rule) {
+    case "too_many_characters":
+      return "This name is too long. Use at most 32 characters.";
+    case "too_many_bytes":
+      return "This name is too long. Use fewer characters.";
+    case "not_string":
+      return "This name could not be read.";
+    default:
+      return "This name contains invisible or control characters. Remove them and try again.";
+  }
+}
+
 export class SyncManager {
   readonly identity;
   /**
@@ -132,6 +201,71 @@ export class SyncManager {
    */
   readonly misbehavior = new PeerMisbehaviorTracker();
   private host: { actualPort: number; close(): void } | null = null;
+  /**
+   * DC-26 §3.1: called once per engine session (any direction, any trigger)
+   * that applied at least one received change, AFTER the applying
+   * transactions committed. Wired to the stdout data notice in main();
+   * unset in tests unless a test installs a spy.
+   */
+  onDataChanged: ((applied: number) => void) | undefined;
+  /**
+   * DC-27 §4.6 urgent push (DC-10 §2.3): started once after a local unpair
+   * commits. Installed by makeSyncDispatcher (it owns endpoint resolution);
+   * tests may install a spy. Fire-and-forget: never awaited by the RPC.
+   */
+  urgentPush: (() => void) | undefined;
+  /** DC-27 §4.3: live engine sessions per remote device (to end on unpair). */
+  private readonly liveSessions = new Map<string, Set<InboundSession>>();
+  /**
+   * DC-27 P6/V8: peers whose LAST session attempt ended "closed after the
+   * handshake, before HELLO" (they refused us at their trust gate). In
+   * memory only: it is a hint, cleared by the next successful session.
+   */
+  private readonly refusedBy = new Set<string>();
+  /**
+   * DC-28 §4.2/§4.3: this device's own name, validated (§4.8), or null.
+   * Held in memory only; the shell owns its persistence (config.toml
+   * "device_name", P9) and pushes it at start and on every save. It leaves
+   * the device ONLY inside the encrypted pairing payload (P3), never in the
+   * pasted code (P5), mDNS (D2), sync messages (P6) or logs.
+   */
+  private ownName: string | null = null;
+
+  get ownDeviceName(): string | null {
+    return this.ownName;
+  }
+
+  /**
+   * Validate and hold the own name ("" / null clears it). Throws a plain
+   * sentence (no name text: the shell logs failed calls) when invalid.
+   */
+  setOwnName(raw: unknown): string | null {
+    const r = validateName(raw === null || raw === undefined ? "" : raw);
+    if (!r.ok) throw new Error(nameRefusal(r.rule));
+    this.ownName = r.name;
+    return this.ownName;
+  }
+
+  /**
+   * DC-28 §4.4/P1: set (or clear with "") the local nickname of a paired
+   * device. Stored in peers.display_name (DC-05 §3.1 user-assigned label);
+   * never sent anywhere. Returns the device's new §4.9 view.
+   */
+  setPeerNickname(deviceId: unknown, raw: unknown): DeviceNameView {
+    if (typeof deviceId !== "string" || deviceId.length === 0) {
+      throw new Error("device_id required");
+    }
+    const r = validateName(raw === null || raw === undefined ? "" : raw);
+    if (!r.ok) throw new Error(nameRefusal(r.rule));
+    const info = this.core.db
+      .prepare("UPDATE peers SET display_name = ? WHERE device_id = ? AND status = 'trusted'")
+      .run(r.name ?? "", deviceId);
+    if (info.changes === 0) throw new Error("This device is not paired.");
+    const row = this.core.db
+      .prepare("SELECT device_id, display_name, announced_name FROM peers WHERE device_id = ?")
+      .get(deviceId) as { device_id: string; display_name: string; announced_name: string | null };
+    return deviceNameViews([row], this.identity.deviceId)[0]!;
+  }
 
   constructor(
     private readonly core: EventCore,
@@ -222,14 +356,28 @@ export class SyncManager {
     cancel: () => void;
   } | null = null;
 
+  /**
+   * DC-05 Appendix B.6 (P7/P8): the status of the most recent offer, kept
+   * after it ends so the displayer's UI can show that the code is no longer
+   * valid. Holds the status function only, never the code text (B.2).
+   */
+  private latestOfferStatus: (() => string) | null = null;
+
   trackPairingOffer(offer: {
     result: Promise<unknown>;
     cancel: () => void;
+    status?: () => string;
   }): void {
     // One live offer at a time: a newer offer supersedes (and closes) the
     // previous listener.
     this.cancelPendingOffer("superseded by a newer pairing offer");
-    this.pendingOffer = offer;
+    this.pendingOffer = { result: offer.result, cancel: offer.cancel };
+    this.latestOfferStatus = offer.status ?? null;
+  }
+
+  /** "none" before any offer; otherwise the latest offer's status. */
+  pairingOfferStatus(): string {
+    return this.latestOfferStatus?.() ?? "none";
   }
 
   cancelPendingOffer(_reason: string): void {
@@ -245,12 +393,12 @@ export class SyncManager {
 
   /** True when `offer` is the currently tracked pending offer. */
   hasPendingOffer(offer: { cancel: () => void }): boolean {
-    return this.pendingOffer === offer;
+    return this.pendingOffer?.cancel === offer.cancel;
   }
 
   /** Drop the tracking entry without cancelling (ceremony completed). */
   untrackPairingOffer(offer: { cancel: () => void }): void {
-    if (this.pendingOffer === offer) this.pendingOffer = null;
+    if (this.pendingOffer?.cancel === offer.cancel) this.pendingOffer = null;
   }
 
   /**
@@ -262,7 +410,12 @@ export class SyncManager {
    * a paired peer — scheduler path). A mismatch throws BEFORE runSession, so
    * nothing is exchanged and nothing is persisted (DC-11 §4.6 silent drop).
    */
-  async runEngineSession(session: InboundSession, expectedDeviceId?: string): Promise<{
+  async runEngineSession(
+    session: InboundSession,
+    expectedDeviceId?: string,
+    /** True only for sessions a peer dialed to us (onInbound). */
+    inbound = false,
+  ): Promise<{
     sent: number;
     receivedApplied: number;
     receivedBuffered: number;
@@ -271,6 +424,12 @@ export class SyncManager {
   }> {
     const remoteKeyBuf = Buffer.from(session.raw.remoteStaticKey());
     try {
+      // DC-05 §3.3 / DC-27 §4.5 gate, on EVERY path (inbound, Sync now,
+      // scheduler): resolve the handshake key over ALL peers rows (trusted
+      // AND revoked) and run canSynchronize before any sync message, and
+      // before createSyncEngine (its constructor writes to the DB). Noise XX
+      // authenticates a key, not membership.
+      const trustedRemoteId = this.gateRemoteKey(remoteKeyBuf);
       if (expectedDeviceId !== undefined) {
         // D3: routing hints are NOT identity. Only the handshake result, checked
         // against the trust store, proves who is on the other end. This throw
@@ -289,23 +448,46 @@ export class SyncManager {
             ).toString("hex")
           : null;
         if (row === undefined || trustedX25519Hex !== remoteX25519Hex) {
+          // DC-27 P9: short id only, no key material in the message.
           throw new Error(
-            `DC-21 D3 identity mismatch: endpoint attributed to ${expectedDeviceId} ` +
-              `presented remote static key ${remoteX25519Hex.slice(0, 16)}… — ` +
-              `session aborted, endpoint NOT persisted (DC-11 §4.6 silent drop)`,
+            `DC-21 D3 identity mismatch: endpoint attributed to ${shortDeviceId(expectedDeviceId)} ` +
+              `presented a different handshake key — session aborted, endpoint NOT ` +
+              `persisted (DC-11 §4.6 silent drop)`,
           );
         }
       }
+      const revocations = makeDbRevocationChannel(this.core.db, {
+        selfDeviceId: this.identity.deviceId,
+        selfPublicKey: this.identity.publicKey,
+        hlcNow: () => this.core.hlcNow(),
+        onPeerRevoked: (id) => this.afterPeerRevoked(id),
+      });
       const engine = createSyncEngine({
         db: this.core.db,
         selfDeviceId: this.identity.deviceId,
         mutateEntity: makeEntityMutator(),
         misbehavior: this.misbehavior,
+        // DC-27 V2: the gate-resolved id keys revocation bookkeeping; DC-09
+        // trigger state is per engine (per session), so keying is unchanged
+        // across sessions.
+        peerDeviceId: trustedRemoteId,
+        revocations,
       });
       let stats;
+      this.trackSession(trustedRemoteId, session);
       try {
         stats = await engine.runSession(session.transport);
+        this.refusedBy.delete(trustedRemoteId);
+      } catch (err) {
+        // DC-27 V8/P6: closed after a completed handshake, before HELLO.
+        // Only a session WE dialed means "they refused us"; an inbound
+        // dialer that hangs up early refused nothing.
+        if (err instanceof PeerClosedBeforeHelloError && !inbound) {
+          this.refusedBy.add(trustedRemoteId);
+        }
+        throw err;
       } finally {
+        this.untrackSession(trustedRemoteId, session);
         // Pkg4 (QA M-3/BND-08): the socket must never dangle on a failed
         // session — a timed-out/stalled peer previously left this side's
         // connection open forever (session.done() was only reached on the
@@ -316,9 +498,8 @@ export class SyncManager {
       // DC-21 D6: record the endpoint only AFTER a successful authenticated
       // session with a KNOWN expected peer (scheduler path). Inbound sessions
       // (no expectedDeviceId) resolve identity from the trust store by key.
-      const remoteDeviceId =
-        expectedDeviceId ?? this.resolveDeviceIdByRemoteKey(remoteKeyBuf);
-      if (remoteDeviceId !== undefined && session.dialEndpoint !== undefined) {
+      const remoteDeviceId = trustedRemoteId;
+      if (session.dialEndpoint !== undefined && !stats.peerRevoked) {
         recordPeerEndpoint(
           this.core.db,
           remoteDeviceId,
@@ -327,9 +508,14 @@ export class SyncManager {
           Date.now(),
         );
       }
+      // DC-26 §3.1: one notice per session that changed local data. All
+      // three session paths (inbound, scheduler, Sync now) end here, and
+      // every apply transaction has committed by now. A conflict outcome
+      // counts as applied (applyRemoteChange), so new conflicts notify too.
+      notifyDataChanged(stats, this.onDataChanged);
       return {
         ...stats,
-        remote_device_id: remoteDeviceId ?? "unknown",
+        remote_device_id: remoteDeviceId,
       };
     } catch (err) {
       // pkg10 F3: session.done() is idempotent-safe — always run it when the
@@ -341,33 +527,171 @@ export class SyncManager {
   }
 
   /**
-   * DC-21 D3/D6: inbound sessions have no expectedDeviceId (the peer dialed
-   * us); resolve identity by matching the handshake's remote static key
-   * against the trust store. Unmatched keys return undefined — the session
-   * stats still return (the engine already ran; the data flow was
-   * authenticated by Noise against SOME paired key or rejected), but no
-   * endpoint is recorded.
+   * DC-27 §4.5 gate: match the handshake's remote static key against EVERY
+   * peers row (trusted and revoked) and evaluate DC-05 §3.3 canSynchronize
+   * with the matched row's stored public key as the claim (the Noise static
+   * is derived from it, DC-27 S10). Fails closed: any matching revoked row
+   * refuses, even if a trusted row also matches. Returns the device id.
    */
-  private resolveDeviceIdByRemoteKey(remoteKeyBuf: Buffer): string | undefined {
+  private gateRemoteKey(remoteKeyBuf: Buffer): string {
     const rows = this.core.db
-      .prepare("SELECT device_id, public_key FROM peers WHERE status = 'trusted'")
-      .all() as Array<{ device_id: string; public_key: Buffer }>;
+      .prepare("SELECT device_id, public_key, status FROM peers")
+      .all() as Array<{ device_id: string; public_key: Buffer; status: "trusted" | "revoked" }>;
     const remoteHex = remoteKeyBuf.toString("hex");
+    const matches: typeof rows = [];
     for (const row of rows) {
-      const x25519 = Buffer.from(
-        ed25519ToX25519PublicKey(new Uint8Array(row.public_key)),
-      );
-      if (x25519.toString("hex") === remoteHex) return row.device_id;
+      // One malformed stored key must not refuse every peer (review
+      // 2026-11-14): skip it; it can never match a handshake key anyway.
+      let x25519: Buffer;
+      try {
+        x25519 = Buffer.from(ed25519ToX25519PublicKey(new Uint8Array(row.public_key)));
+      } catch {
+        continue;
+      }
+      if (x25519.toString("hex") === remoteHex) matches.push(row);
     }
-    return undefined;
+    if (matches.length === 0) throw new SyncRefusedError("DENY_UNPAIRED");
+    // DC-05 §7.3: known-revoked by row status OR by a stored valid record
+    // naming the id (a device that learned the revocation by gossip).
+    const revoked = matches.find(
+      (m) => m.status === "revoked" || isKnownRevoked(this.core.db, m.device_id),
+    );
+    if (revoked !== undefined) throw new SyncRefusedError("DENY_REVOKED", revoked.device_id);
+    const m = matches[0]!;
+    // DC-05 §3.3 with the handshake as proof of possession: the remote
+    // X25519 static equals ed25519ToX25519(stored key) (checked above), and
+    // canSynchronize checks hash(stored key) == the row's device_id (DC-05
+    // §2.2) plus status. A row whose id does not derive from its own key is
+    // refused as DENY_KEY_MISMATCH.
+    const store = new Map<string, TrustStoreEntry>([
+      [m.device_id, { publicKey: new Uint8Array(m.public_key), status: m.status }],
+    ]);
+    const decision = canSynchronize(store, m.device_id, new Uint8Array(m.public_key));
+    if (decision !== "ALLOW") throw new SyncRefusedError(decision, m.device_id);
+    return m.device_id;
+  }
+
+  private trackSession(deviceId: string, session: InboundSession): void {
+    let set = this.liveSessions.get(deviceId);
+    if (set === undefined) {
+      set = new Set();
+      this.liveSessions.set(deviceId, set);
+    }
+    set.add(session);
+  }
+
+  private untrackSession(deviceId: string, session: InboundSession): void {
+    const set = this.liveSessions.get(deviceId);
+    set?.delete(session);
+    if (set !== undefined && set.size === 0) this.liveSessions.delete(deviceId);
+  }
+
+  /** Number of live engine sessions with `deviceId` (tests, diagnostics). */
+  liveSessionCount(deviceId: string): number {
+    return this.liveSessions.get(deviceId)?.size ?? 0;
+  }
+
+  /**
+   * DC-27 §4.3 / DC-08 §3.7: once a peer is revoked (locally or by an
+   * accepted record) its live sessions end. The engine itself also stops at
+   * its next message boundary (it sees the peer in the revoked cutoffs).
+   */
+  private afterPeerRevoked(deviceId: string): void {
+    this.misbehavior.forget(deviceId); // Tier-1 state dropped (DC-27 §4.3, DC-16 §2.4)
+    this.refusedBy.delete(deviceId);
+    for (const s of this.liveSessions.get(deviceId) ?? []) {
+      try {
+        s.done();
+      } catch {
+        /* already closed */
+      }
+    }
+  }
+
+  /**
+   * DC-27 §4.3: Unpair. Server-side confirmation (P2): refuses unless
+   * confirm === true. Signs with the identity key this process already
+   * holds (P7). Idempotent (§4.15): an already revoked peer is a no-op.
+   */
+  async unpairDevice(
+    deviceId: unknown,
+    confirm: unknown,
+    opts: { beforeCommit?: () => void } = {},
+  ): Promise<
+    | { ok: true; already: true }
+    | {
+        ok: true;
+        already: false;
+        triple: { revoked_device_id: string; revoked_at_hlc: number; revoked_by_device_id: string };
+        peers_to_tell: number;
+      }
+  > {
+    if (confirm !== true) throw new UnpairError("ERR_CONFIRM", "confirm:true required");
+    if (typeof deviceId !== "string" || deviceId.length === 0) {
+      throw new UnpairError("ERR_NOT_PAIRED", "device_id required");
+    }
+    const out = await unpairLocal(this.core.db, {
+      deviceId,
+      selfDeviceId: this.identity.deviceId,
+      privateKey: this.identity.privateKey,
+      hlcNow: () => this.core.hlcNow(),
+      beforeCommit: opts.beforeCommit,
+    });
+    if (out.already) {
+      console.error(`[tide] unpair: ${shortDeviceId(deviceId)} already revoked; no-op`);
+      return { ok: true, already: true };
+    }
+    this.afterPeerRevoked(deviceId);
+    const peersToTell = listTrustedPeers(this.core.db).length;
+    console.error(
+      `[tide] unpair: ${shortDeviceId(deviceId)} revoked; record stored; telling ${peersToTell} peers`,
+    );
+    try {
+      this.urgentPush?.();
+    } catch {
+      /* the push is best-effort; the record already rides the next session */
+    }
+    return { ok: true, already: false, triple: out.triple, peers_to_tell: peersToTell };
+  }
+
+  /** DC-27 P8: the Removed devices section. */
+  removedDevices(): ReturnType<typeof listRemovedDevices> {
+    return listRemovedDevices(this.core.db, this.identity.deviceId);
   }
 
   private onInbound(session: InboundSession): void {
-    // Inbound post-pairing sessions run an immediate sync session.
-    void this.runEngineSession(session).catch(() => {
-      /* fail-closed: logged by transport; session is dead */
+    // A peer dialed our sync listener: run one engine session (gated on the
+    // trust store inside runEngineSession).
+    void this.runEngineSession(session, undefined, true).catch((err: unknown) => {
+      // fail-closed: the session is dead. Logged with one throttle per
+      // KIND (one line per minute each), so a stranger hammering the port
+      // can neither bloat the log nor hide failures of paired peers.
+      const msg = err instanceof Error ? err.message : String(err);
+      const kind = err instanceof SyncRefusedError ? "refused" : "failed";
+      const t = this.inboundLogThrottle[kind];
+      const now = Date.now();
+      if (now - t.last >= 60_000) {
+        const extra = t.suppressed > 0 ? ` (+${t.suppressed} more since last report)` : "";
+        // Peer-influenced text: strip control characters (no log-line
+        // injection) and cap the length.
+        const clean = msg.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 300);
+        // DC-27 §4.12: a refusal's message IS the "sync refused: ..." line.
+        console.error(
+          kind === "refused"
+            ? `[tide] ${clean}${extra}`
+            : `[tide] inbound sync session ${kind}: ${clean}${extra}`,
+        );
+        t.last = now;
+        t.suppressed = 0;
+      } else {
+        t.suppressed++;
+      }
     });
   }
+  private readonly inboundLogThrottle = {
+    refused: { last: 0, suppressed: 0 },
+    failed: { last: 0, suppressed: 0 },
+  };
 
   // ------------------------------------------------------------------
   // TD-006 / DC-16 §4: peer-state visibility + explicit recovery actions
@@ -378,10 +702,11 @@ export class SyncManager {
    * Devices). Merge of: paired peers, live Tier-1 ladder state, Tier-2
    * durable hard blocks, and the §2.3 durable invalid tally (history).
    */
-  peerStateSnapshot(): Array<
+  peerStateSnapshot(onlyPaired = false): Array<
     PeerTier1State & {
       paired: boolean;
-      display_name: string | null;
+      /** DC-27 P6: our last session attempt was refused after the handshake. */
+      refused_us: boolean;
       paired_at: number | null;
       ladder_label: string;
       hard_block:
@@ -392,7 +717,7 @@ export class SyncManager {
           }
         | null;
       tally: { total_invalid: number; last_invalid_at: number } | null;
-    }
+    } & Omit<DeviceNameView, "device_id">
   > {
     const peers = listTrustedPeers(this.core.db);
     const blocks = new Map(listHardBlocks(this.core.db).map((b) => [b.producer_device_id, b]));
@@ -406,16 +731,26 @@ export class SyncManager {
       ...tally.keys(),
     ]);
     const out = [];
-    for (const id of Array.from(known).sort()) {
+    const ids = Array.from(known)
+      .sort()
+      .filter((id) => !onlyPaired || peers.some((p) => p.device_id === id));
+    // DC-28 §4.7/§4.9: labels computed here, disambiguated within THIS list (P7).
+    const names = deviceNameViews(
+      ids.map((id) => peers.find((p) => p.device_id === id) ?? { device_id: id }),
+      this.identity.deviceId,
+    );
+    for (const [i, id] of ids.entries()) {
       const paired = peers.some((p) => p.device_id === id);
       const peer = peers.find((p) => p.device_id === id);
+      const { device_id: _id, ...name } = names[i]!;
       const t1 = this.misbehavior.getState(id);
       const b = blocks.get(id) ?? null;
       const tl = tally.get(id) ?? null;
       out.push({
         ...t1,
         paired,
-        display_name: peer?.display_name ?? null,
+        refused_us: this.refusedBy.has(id),
+        ...name,
         paired_at: peer ? peer.paired_at * 1000 : null,
         ladder_label: LADDER_LABELS[t1.level],
         hard_block: b
@@ -675,7 +1010,9 @@ export function makeDispatcher(core: EventCore, sync?: SyncManager): Dispatcher 
       // Replicates as reminder member_add/update/remove (D5).
       case "get_reminder": {
         if (typeof args.event_id !== "string") fail("get_reminder: args.event_id required");
-        return core.reminderFor(args.event_id as string);
+        const rem = core.reminderFor(args.event_id as string);
+        // `count`: how many reminders the event holds (the dialog warns when > 1).
+        return rem === null ? null : { ...rem, count: core.reminderCountFor(args.event_id as string) };
       }
       case "set_reminder": {
         if (typeof args.event_id !== "string") fail("set_reminder: args.event_id required");
@@ -894,26 +1231,104 @@ export function withTimeout<T>(
 export function makeSyncDispatcher(
   sync: SyncManager,
   core: EventCore,
+  endpoints: {
+    // Live mDNS endpoint cache (DC-21 D2, sidecar-local); may be empty when
+    // mdns browse is disabled — the last-known fallback still applies.
+    endpointCache: EndpointCache;
+  },
 ): Dispatcher {
+  // DC-21 §4.3/D7: each TRUSTED peer's endpoint via the scheduler's chain
+  // (live mDNS cache first, then last-known). Revoked peers never appear.
+  const trustedEndpoints = (): Array<{
+    device_id: string;
+    endpoint: { host: string; port: number } | null;
+  }> => {
+    const peers = listTrustedPeers(core.db);
+    const byDevice = new Map(peers.map((p) => [p.device_id, p]));
+    return peers.map((p) => ({
+      device_id: p.device_id,
+      endpoint:
+        resolveEndpoint(
+          endpoints.endpointCache,
+          {
+            deviceIds: () => peers.map((x) => x.device_id),
+            lastKnown: (deviceId: string) => {
+              const row = byDevice.get(deviceId);
+              return row?.last_endpoint_host != null &&
+                row.last_endpoint_port != null &&
+                row.last_endpoint_seen != null
+                ? {
+                    host: row.last_endpoint_host,
+                    port: row.last_endpoint_port,
+                    seen: row.last_endpoint_seen,
+                  }
+                : null;
+            },
+          },
+          p.device_id,
+        )?.endpoint ?? null,
+    }));
+  };
+  // DC-27 §4.6 / DC-10 §2.3 urgent push (V7: run in the sidecar, not the
+  // shell): one session to every reachable trusted peer, sequentially,
+  // through the scheduler-style attributed path (D3 identity check + gate).
+  // Immediate, not debounced; every failure is caught and logged by short
+  // id. Unreachable peers get the record in their next ordinary session.
+  sync.urgentPush ??= () => {
+    void (async () => {
+      for (const t of trustedEndpoints()) {
+        if (t.endpoint === null) continue;
+        const { host, port } = t.endpoint;
+        try {
+          const session = await withTimeout(
+            connectSync(sync.identity.privateKey, host, port),
+            SYNC_CONNECT_TIMEOUT_MS,
+            "urgent push: connect timed out",
+          );
+          await sync.runEngineSession({ ...session, dialEndpoint: { host, port } }, t.device_id);
+        } catch (err) {
+          const code =
+            err instanceof SyncRefusedError ? err.decision
+            : err instanceof Error ? err.name : "error";
+          console.error(`[tide] unpair: urgent push to ${shortDeviceId(t.device_id)} failed (${code})`);
+        }
+      }
+    })().catch(() => {});
+  };
   return (op, args) => {
     switch (op) {
       case "device_info": {
         const peers = listTrustedPeers(core.db);
         return {
           device_id: sync.identity.deviceId,
-          paired_peers: peers.map((p) => ({
-            device_id: p.device_id,
-            display_name: p.display_name,
-            paired_at: p.paired_at * 1000,
+          // DC-21 §3.4: identity the shell needs to REGISTER this device on
+          // mDNS (instance_name must match the §3.3 prefilter the peer's
+          // browse cache applies; txt carries only pv [+ dn when opted in],
+          // DC-11 §2.3).
+          instance_name: buildInstanceName(sync.identity.deviceId),
+          txt: buildTxtRecord({}),
+          // DC-28 §4.9: { device_id, label, nickname, announced_name,
+          // short_id } per peer; label per §4.7, disambiguated in this list.
+          paired_peers: deviceNameViews(peers, sync.identity.deviceId).map((v, i) => ({
+            ...v,
+            paired_at: peers[i]!.paired_at * 1000,
           })),
           // DC-21 §3.4/D4: the shell registers mDNS on this port (and
           // re-registers goodbye-first on change).
           listening_port: sync.ensureListener(),
         };
       }
+      // DC-21 §4.3/D7 (bug #1b fix, owner decision B): the shell's manual
+      // "Sync now" resolves each paired peer's endpoint through the SAME
+      // priority chain the scheduler uses (live mDNS cache first, then
+      // last-known from the peers table). No localhost fallback exists at
+      // this layer — an unresolvable peer is reported, never guessed.
+      case "sync_endpoints": {
+        return { endpoints: trustedEndpoints() };
+      }
       case "pairing_offer": {
         // NOTE: synchronous snapshot of an async ceremony — the offer object
-        // keeps working after return; result arrives via pairing_status polls.
+        // keeps working after return; its state is read with pairing_offer_status.
         // The offer is TRACKED on the SyncManager: a newer offer supersedes
         // it, cancel_pairing_offer closes it, and stdin-EOF shutdown closes
         // it — an uncancelled offer would be a live pairing listener that
@@ -921,22 +1336,31 @@ export function makeSyncDispatcher(
         const offerPromise = createPairingOffer({
           identity: sync.identity,
           port: typeof args.port === "number" ? args.port : undefined,
-          name:
-            typeof args.name === "string" ? args.name : sync.identity.deviceId.slice(0, 12),
+          // DC-28 P3: only the SAVED own name is sent (saving = consent);
+          // a caller-supplied args.name is ignored, and the 12-character id
+          // placeholder default is gone (no name set -> no "name" key).
+          name: sync.ownDeviceName ?? undefined,
           store: sqlPeerStore(core.db),
         });
         void offerPromise
           .then((o) => {
-            sync.trackPairingOffer(o);
+            // Tracked WITHOUT the code text (DC-05 Appendix B.2).
+            const handle = { result: o.result, cancel: o.cancel, status: o.status };
+            sync.trackPairingOffer(handle);
             // Self-untrack when the ceremony completes either way (paired,
             // errored, or cancelled): nothing left to cancel afterwards.
             o.result.catch(() => {}).finally(() => {
-              if (sync.hasPendingOffer(o)) sync.untrackPairingOffer(o);
+              if (sync.hasPendingOffer(handle)) sync.untrackPairingOffer(handle);
             });
-            return o;
           })
           .catch(() => {});
         return offerPromise.then((o) => ({ qr_text: o.qrText }));
+      }
+      case "pairing_offer_status": {
+        // DC-05 Appendix B.6 (P7/P8): read-only; lets the displayer's UI
+        // replace an ended code with the single "no longer valid" text.
+        // Values: none | open | pairing | paired | ended | cancelled.
+        return { status: sync.pairingOfferStatus() };
       }
       case "cancel_pairing_offer": {
         // Explicit user cancellation of the pending offer (Devices dialog).
@@ -947,13 +1371,14 @@ export function makeSyncDispatcher(
       case "pairing_accept": {
         if (typeof args.qr_text !== "string")
           throw new Error("qr_text required");
+        // Errors: the DC-27 refusal text, or the single DC-05 P13 text for
+        // every refused code (classified in acceptPairingPayload).
         return acceptPairingPayload({
           identity: sync.identity,
-          qr_text_text: undefined,
           qrText: args.qr_text,
-          name: typeof args.name === "string" ? args.name : undefined,
+          name: sync.ownDeviceName ?? undefined, // DC-28 P3 (see pairing_offer)
           store: sqlPeerStore(core.db),
-        } as never).then((r) => ({
+        }).then((r) => ({
           peer_device_id: r.peerDeviceId,
           safety_number: r.safetyNumber,
         }));
@@ -1042,6 +1467,19 @@ export function makeSyncDispatcher(
         pruneResolvedQuarantine(core.db);
         return result;
       }
+      // Dismiss a duplicate-content warning: hides the warning row only.
+      // Never skips a change (no skipped_seqs row, no change state touched).
+      case "dismiss_quarantine_warning": {
+        if (
+          typeof args.quarantine_id !== "number" ||
+          !Number.isInteger(args.quarantine_id)
+        ) {
+          throw new Error("quarantine_id required");
+        }
+        const result = dismissQuarantineWarning(core.db, args.quarantine_id);
+        pruneResolvedQuarantine(core.db);
+        return result;
+      }
       // --- TD-006 / DC-16 §4: peer misbehavior visibility + recovery ------
       // Read-only per-peer state (Sync-Errors badge section + Paired Devices).
       case "peer_state": {
@@ -1052,7 +1490,7 @@ export function makeSyncDispatcher(
       case "list_paired_devices": {
         return {
           self_device_id: sync.identity.deviceId,
-          devices: sync.peerStateSnapshot().filter((p) => p.paired),
+          devices: sync.peerStateSnapshot(true),
         };
       }
       // §4.2 Tier-1: "Reset peer state" — one click, no confirmation.
@@ -1070,6 +1508,26 @@ export function makeSyncDispatcher(
           throw new Error("device_id required");
         }
         return { ok: true, cleared: sync.unblockPeer(args.device_id) };
+      }
+      // DC-27 §4.2/§4.3: Unpair. The sidecar refuses without confirm:true
+      // (P2) — the UI's two-step confirmation is not the only guard.
+      case "unpair_device": {
+        return sync.unpairDevice(args.device_id, args.confirm);
+      }
+      // DC-27 §4.11 / P8: Removed devices + per-peer "told" state.
+      case "list_removed_devices": {
+        return { removed: sync.removedDevices() };
+      }
+      // DC-28 §4.2/P9: the shell pushes the saved own name (at start and on
+      // every save) and persists the normalized value this returns. Not in
+      // the shell's sync_op allow-list: only the shell's own set/get device
+      // name commands call it.
+      case "set_device_name": {
+        return { device_name: sync.setOwnName(args.name) };
+      }
+      // DC-28 §4.4/P1: local nickname for a paired device ("" clears).
+      case "set_peer_nickname": {
+        return sync.setPeerNickname(args.device_id, args.nickname);
       }
       default:
         throw new Error(`unknown op: ${op}`);
@@ -1145,9 +1603,31 @@ function main(): void {
       dbPath.replace(/[/\\][^/\\]+$/, "") ?? ".",
   );
   const core = new EventCore(dbPath, syncIdentity.deviceId);
+  // DC-22 / TD-073: rebuild reminder rows from reminder changes already in
+  // history (idempotent; every start, before the first alarm check).
+  try {
+    const rr = replayReminderHistory(core.db);
+    if (rr.applied > 0 || rr.unresolved > 0) {
+      console.error(
+        `[tide] reminder replay: examined=${rr.examined} applied=${rr.applied} unresolved=${rr.unresolved}`,
+      );
+    }
+  } catch (err) {
+    console.error("[tide] reminder replay failed:", err instanceof Error ? err.message : String(err));
+  }
   const sync = new SyncManager(core, syncIdentity);
+  // DC-26 §3.1/§3.2: id-less NDJSON notice on the same stdout channel as RPC
+  // responses (one write per line, so lines never interleave). Count only:
+  // no titles, entity ids or device ids (TR-3).
+  sync.onDataChanged = (applied) => {
+    process.stdout.write(dataChangedNoticeLine(applied) + "\n");
+  };
   const dispatch = makeDispatcher(core);
-  const syncDispatch = makeSyncDispatcher(sync, core);
+  // DC-21 D2: ONE endpoint cache; declared before the sync dispatcher so the
+  // sync_endpoints op (bug #1b) resolves against the same cache the
+  // mdns_event/mdns_snapshot notifications feed.
+  const endpointCache = new EndpointCache();
+  const syncDispatch = makeSyncDispatcher(sync, core, { endpointCache });
   // DC-20: the scheduler runtime handle is registered when main() wires the
   // runtime (below); update_settings live-applies S1-S3 through it.
   let schedulerHandle: ReturnType<typeof startSchedulerRuntime> | null = null;
@@ -1176,17 +1656,20 @@ function main(): void {
         })()
       : op.startsWith("sync_") || op === "device_info" ||
     op === "pairing_offer" || op === "pairing_accept" ||
-    op === "cancel_pairing_offer" ||
+    op === "cancel_pairing_offer" || op === "pairing_offer_status" ||
     op === "list_quarantine" || op === "quarantine_stats" ||
     op === "retry_quarantine" || op === "delete_quarantine" ||
+    op === "dismiss_quarantine_warning" ||
     op === "peer_state" || op === "list_paired_devices" ||
-    op === "reset_peer_state" || op === "unblock_peer"
+    op === "reset_peer_state" || op === "unblock_peer" ||
+    op === "unpair_device" || op === "list_removed_devices" ||
+    // DC-28: own name (shell-only) + local nickname
+    op === "set_device_name" || op === "set_peer_nickname"
       ? syncDispatch(op, args)
       : dispatch(op, args);
-  // DC-21 §3.2/D2: the ONE endpoint cache (sidecar-side, in-memory, keyed by
-  // instance_name). Fed by `mdns_event` pushes from Rust; seeded once at
+  // DC-21 §3.2/D2: the ONE endpoint cache (declared above with the sync
+  // dispatcher). Fed by `mdns_event` pushes from Rust; seeded once at
   // startup by `mdns_snapshot`. Never persisted (§7 privacy).
-  const endpointCache = new EndpointCache();
   // DC-21 §3.3/D3 prefilter source: paired, trusted peer device ids.
   const pairedDeviceIds = (): string[] =>
     listTrustedPeers(core.db).map((p) => p.device_id);
@@ -1259,6 +1742,7 @@ function main(): void {
   // failures (§7.1/D11). Delivery is an EPHEMERAL LOCAL SIDE EFFECT (D9) —
   // nothing here ever enters the changelog.
   const deliveredReminderKeys = new Set<string>();
+  const reportedTickProblems = new Set<string>();
   // D1 on-time decision context (owner question 2026-09-04): epoch ms of the
   // previous tick, null until the second tick runs. rebuildSchedule uses it
   // to distinguish "fire moment passed while we were ticking" (on-time) from
@@ -1280,102 +1764,20 @@ function main(): void {
   };
   const reminderTick = (): void => {
     try {
-      // Real events schema: timed events carry utc_start_ms/utc_end_ms (the
-      // authoritative INSTANT — respects tz_id per DC-22 §5.1) plus wall
-      // strings for labels; all-day events carry start_date/end_date
-      // (midnight wall convention, local by definition).
-      const baseEvents = core.db
-        .prepare(
-          `SELECT e.event_id AS entity_id, e.title,
-                  e.utc_start_ms, e.utc_end_ms,
-                  COALESCE(e.start_wall, e.start_date || 'T00:00') AS start_wall,
-                  COALESCE(e.end_wall, e.end_date || 'T23:59')      AS end_wall,
-                  e.all_day, e.all_day_reminder_time
-           FROM events e`
-        )
-        .all() as never[];
-      // Smoke-test fix (2026-09-03): expand each timed series into per-
-      // occurrence synthetic rows so reminders fire for the OCCURRENCE the
-      // reminder is due on — not just the base's first instant. All-day
-      // series keep single-row semantics (D2: day-before fire, day-granular).
-      // Window: 25h back (missed horizon, D1) to 1y forward — deterministic
-      // and comfortably wider than any notify horizon. Overrides (moved/
-      // retitled occurrences) apply via the same chip math the calendar uses.
-      const events: never[] = [];
-      const seriesRows = core.db
-        .prepare(
-          `SELECT s.series_id, s.base_event_id, s.recurrence_rule
-           FROM series s`,
-        )
-        .all() as Array<{
-        series_id: string;
-        base_event_id: string;
-        recurrence_rule: string;
-      }>;
-      const seriesByBase = new Map(seriesRows.map((s) => [s.base_event_id, s]));
-      const now = Date.now();
-      const WIN_LO = `${new Date(now - 25 * 3_600_000).getFullYear()}0101T000000`;
-      for (const ev of baseEvents) {
-        const row = seriesByBase.get((ev as { entity_id: string }).entity_id);
-        const timed =
-          (ev as { all_day: number }).all_day !== 1 &&
-          (ev as { utc_start_ms: number | null }).utc_start_ms != null;
-        if (!row || !timed) {
-          events.push(ev);
-          continue;
-        }
-        let occIds: string[] = [];
-        try {
-          occIds = expandOccurrences(
-            {
-              series_id: row.series_id,
-              base_start_wall: (ev as { start_wall: string }).start_wall,
-              tz_id: "local",
-              recurrence_rule: row.recurrence_rule,
-            },
-            WIN_LO,
-            `${new Date(now).getFullYear() + 1}1231T235959`,
-          );
-        } catch {
-          events.push(ev); // expansion failure → base-row behavior (degraded)
-          continue;
-        }
-        if (occIds.length === 0) {
-          events.push(ev);
-          continue;
-        }
-        const durMs =
-          ((ev as { utc_end_ms: number }).utc_end_ms ?? 0) -
-          (ev as { utc_start_ms: number }).utc_start_ms;
-        for (const occId of occIds) {
-          const startMs = msFromWallId(occId);
-          events.push({
-            ...(ev as Record<string, unknown>),
-            entity_id: `${(ev as { entity_id: string }).entity_id}#${occId}`,
-            utc_start_ms: startMs,
-            utc_end_ms: startMs + Math.max(durMs, 0),
-          } as never);
-        }
-      }
-      const reminders = core.db
-        .prepare(
-          // DC-22 D5: disabled reminders (enabled = 0) are stored but INACTIVE
-          // — the schedule engine never schedules them (NULL/1 = active).
-          // updated_hlc feeds the late-configuration discard (reminder_engine).
-          "SELECT member_id, entity_id, minutes_before, updated_hlc AS updated_hlc_ms FROM reminders WHERE enabled IS NULL OR enabled = 1",
-        )
-        .all() as never[];
-      const schedule = rebuildSchedule(events, reminders, Date.now(), lastTickMs);
+      // The per-tick schedule logic lives in application/reminder_tick.ts
+      // (shared with the tests); dispatch and logging stay here.
       deliveredPrune();
-      // Smoke-test bug (2026-09-04, delegate investigation deleg_25c67eca):
-      // filterDelivered only removes already-delivered keys — FUTURE fires
-      // (fire_at_ms > now) passed straight through and were delivered on the
-      // next 30s tick, then marked delivered, so the reminder NEVER fired at
-      // its actual due time ("set 10min before, nothing at the time"). The
-      // tick must deliver only fires that are DUE NOW; future ones stay in
-      // the schedule and fire on a later tick.
-      const due = filterDelivered(schedule, deliveredReminderKeys).filter(
-        (f) => f.fire_at_ms <= Date.now(),
+      const due = computeDueReminders(
+        core.db,
+        Date.now(),
+        lastTickMs,
+        deliveredReminderKeys,
+        (p) => {
+          // Once per series per process (the tick runs every 30 s); ids only.
+          if (reportedTickProblems.has(p.seriesId)) return;
+          reportedTickProblems.add(p.seriesId);
+          console.error(formatTickProblem(p));
+        },
       );
       for (const fire of due) {
         // pkg10 F1: mark delivered ONLY on confirmed dispatch. A failed
@@ -1386,7 +1788,9 @@ function main(): void {
         // silent; one observability line per dispatch makes the pipeline
         // auditable from the dev log alone.
         console.log(
-          `[tide] reminder dispatch: key=${fire.key} missed=${fire.missed} title="${fire.title}"`,
+          // No title: logs persist on disk in release builds and travel in
+          // diagnostics; calendar content must never be written to them.
+          `[tide] reminder dispatch: key=${fire.key} missed=${fire.missed}`,
         );
         deliverNotification(fire, (ok) => {
           if (ok) {
@@ -1424,6 +1828,9 @@ function main(): void {
 
   const schedulerRuntime = startSchedulerRuntime({
     now: () => Date.now(),
+    onPeerUnreachable: () => {
+      process.stdout.write(discoveryKickNoticeLine() + "\n");
+    },
     listPeers: () => {
       // pkg10 review F6: ONE query per decision pass, not N+1.
       const peers = listTrustedPeers(core.db);

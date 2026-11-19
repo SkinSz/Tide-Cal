@@ -264,8 +264,8 @@ export function listSeries(): Promise<SeriesRow[]> {
 /** Read one event's reminder, or null (no reminder configured). */
 export function getReminder(
   eventId: string,
-): Promise<{ minutesBefore: number; enabled: boolean } | null> {
-  return invoke<{ minutesBefore: number; enabled: boolean } | null>("get_reminder", {
+): Promise<{ minutesBefore: number; enabled: boolean; count?: number } | null> {
+  return invoke<{ minutesBefore: number; enabled: boolean; count?: number } | null>("get_reminder", {
     event_id: eventId,
   });
 }

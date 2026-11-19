@@ -14,8 +14,11 @@
         "title": "Tide",
         "width": 800,
         "height": 600,
+        "minWidth": 800,
+        "minHeight": 600,
         "resizable": true,
-        "fullscreen": false
+        "fullscreen": false,
+        "dragDropEnabled": false
       }
     ],
     "security": {
@@ -26,13 +29,14 @@
     "active": true,
     "targets": [
       "rpm",
-      "deb"
+      "deb",
+      "nsis"
     ],
     "publisher": "SkinS / Tide Project",
     "copyright": "Copyright © 2026 SkinS / Tide Project",
     "category": "Productivity",
     "shortDescription": "Local-first calendar with encrypted sync",
-    "longDescription": "Tide is a local-first calendar application with end-to-end encrypted multi-device sync. Appointments, whole-day events and per-occurrence reminders live in an encrypted on-device database; pairing with other devices syncs changes over the local network or direct TCP with Noise-protocol encryption. Licensed under the Tide Source-Available Non-Commercial License: free for personal, educational and non-commercial use; commercial use requires a separate written license (swy@uplink-incorporated.net).",
+    "longDescription": "Tide is a local-first calendar application with end-to-end encrypted multi-device sync. Appointments, whole-day events and per-occurrence reminders are stored in a local on-device database; pairing with other devices syncs changes over the local network or direct TCP with Noise-protocol encryption. Licensed under the Tide Source-Available Non-Commercial License: free for personal, educational and non-commercial use; commercial use requires a separate written license (skins@uplink-incorporated.net).",
     "license": "LicenseRef-Tide-Source-Available-Non-Commercial",
     "licenseFile": "../LICENSE.md",
     "icon": [
@@ -47,6 +51,8 @@
       "resources/better-sqlite3/": "node_modules/better-sqlite3/",
       "resources/bindings/": "node_modules/bindings/",
       "resources/file-uri-to-path/": "node_modules/file-uri-to-path/",
+      "resources/noise-c.wasm/": "node_modules/noise-c.wasm/",
+      "resources/runtime-node/node.exe": "node.exe",
       "../LICENSE.md": "LICENSE"
     },
     "linux": {
@@ -65,6 +71,11 @@
     },
     "android": {
       "debugApplicationIdSuffix": ".debug"
+    },
+    "windows": {
+      "nsis": {
+        "installerHooks": "./windows/uninstaller.nsh"
+      }
     }
   },
   "mainBinaryName": "tide"

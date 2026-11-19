@@ -114,7 +114,7 @@ export async function pairDevices(a: Device, b: Device): Promise<void> {
     },
   });
   const payloadFor = (d: Device): PairingPayload => ({
-    v: 1,
+    v: 2,
     device_id: d.identity.deviceId,
     public_key: Buffer.from(d.identity.publicKey).toString("base64"),
     nonce: Buffer.from(freshNonce()).toString("base64"),
@@ -142,7 +142,7 @@ export async function pairDevices(a: Device, b: Device): Promise<void> {
       sqlPeerStore(self.db as never).store({
         deviceId: remoteDeviceId,
         publicKey: Buffer.from(remote.public_key, "base64"),
-        displayName: remote.device_id.slice(0, 10),
+        announcedName: null,
         pairedAtMs: Date.now(),
       }),
     );
@@ -218,7 +218,19 @@ export function msgPipePair(): [MsgPipe, MsgPipe] {
   return [wrap(x, []), wrap(y, [])];
 }
 
+/**
+ * Snapshots are off by default in the engine. A probe whose subject is
+ * snapshot / offer traffic calls useSnapshots() once (or passes
+ * `snapshots: true` per session). The default stays off.
+ */
+let snapshotsOptIn = false;
+export function useSnapshots(on = true): void {
+  snapshotsOptIn = on;
+}
+
 export interface SessionOpts {
+  /** opt this session's engines into full-state snapshots */
+  snapshots?: boolean;
   /** called per message before delivery; return false to drop it */
   filter?: (msg: unknown, dir: "from" | "to") => boolean;
   /** ignore errors from runSession instead of failing */
@@ -256,11 +268,13 @@ export async function sessionOnce(
     db: from.db,
     selfDeviceId: from.identity.deviceId,
     mutateEntity: makeEntityMutator(),
+    snapshots: opts.snapshots ?? snapshotsOptIn,
   });
   const engTo = createSyncEngine({
     db: to.db,
     selfDeviceId: to.identity.deviceId,
     mutateEntity: makeEntityMutator(),
+    snapshots: opts.snapshots ?? snapshotsOptIn,
   });
   let fromStats: Record<string, number> = {};
   let toStats: Record<string, number> = {};
@@ -309,6 +323,8 @@ export interface Fingerprint {
   events: unknown[];
   series: unknown[];
   occurrence_overrides: unknown[];
+  /** reminder members; updated_hlc excluded as local-only */
+  reminders: unknown[];
   digest: string;
 }
 
@@ -332,7 +348,10 @@ export function fingerprint(db: Database.Database): Fingerprint {
       "SELECT series_id,recurrence_id,cancelled,title,start_wall,end_wall,tz_id,utc_start_ms,utc_end_ms FROM occurrence_overrides ORDER BY series_id,recurrence_id",
     )
     .all();
-  const body = { calendars, events, series, occurrence_overrides: oo };
+  const reminders = db
+    .prepare("SELECT member_id,entity_id,minutes_before,enabled FROM reminders ORDER BY member_id")
+    .all();
+  const body = { calendars, events, series, occurrence_overrides: oo, reminders };
   return { ...body, digest: sha(body) };
 }
 

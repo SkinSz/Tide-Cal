@@ -348,11 +348,13 @@ describe("DC-09 TR-1 extended: compacted history triggers full-state recovery", 
       db: dbA,
       selfDeviceId: "d-A",
       peerDeviceId: "d-B",
+      snapshots: true,
     });
     const engB = createSyncEngine({
       db: dbB,
       selfDeviceId: "d-B",
       peerDeviceId: "d-A",
+      snapshots: true,
     });
 
     await Promise.all([engA.runSession(tA.transport), engB.runSession(tB.transport)]);

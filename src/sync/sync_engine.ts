@@ -15,11 +15,22 @@ import {
   emptyKnowledge,
 } from "../sync/knowledge_state.ts";
 import {
-  applyRemoteChange,
+  applyRemoteChangeDetailed,
+  reapplyQuarantinedInPlace,
+  recordWaitingNotice,
+  missingPrerequisiteOrigin,
+  DEPENDS_ON_QUARANTINED_REASON,
+  DUPLICATE_DIFFERENT_CONTENT_REASON,
+  WAITING_ON_CHANGE_REASON,
+  appliedFrontierOf,
+  bumpHeldSessions,
+  gcHeldChanges,
+  type ApplyOutcomeDetailed,
+  type EntityMutator,
   quarantineRecord,
   markSeqSkipped,
   isSeqSkipped,
-  isHardBlocked,
+  makeHardBlockCheck,
   hardBlockProducer,
   appendInvalidTally,
   reconcileQuarantineResolutions,
@@ -31,11 +42,20 @@ import {
 // ladder + Tier-2 durable hard block via hardBlockProducer).
 import {
   PeerMisbehaviorTracker,
+  monotonicWallClock,
   DEFAULT_MISBEHAVIOR_CONFIG,
 } from "./misbehavior.ts";
 import type { Database } from "better-sqlite3";
 // DC-09 full-state snapshot construction/application (M-7 trigger layer).
-import { applySnapshot, buildSnapshot, type Snapshot, type SnapshotEntry } from "./full_state.ts";
+import {
+  SnapshotStream,
+  buildSnapshot,
+  heldCutoffs,
+  readAppliedUpto,
+  refusesDeclaredFrontier,
+  type Snapshot,
+  type SnapshotEntry,
+} from "./full_state.ts";
 import {
   OfferDedup,
   TriggerStateTracker,
@@ -143,6 +163,8 @@ export type SyncMessage =
       type: "FULL_STATE_OFFER";
       snapshot_clock: VC;
       snapshot_size_hint_bytes?: number;
+      /** DC-08 Appendix B: the sender's applied frontier (absent on older peers). */
+      applied_upto?: VC;
       /** DC-09 §3.2: set on user-initiated offers (diagnostics only). */
       user_initiated?: boolean;
       /**
@@ -165,6 +187,8 @@ export type SyncMessage =
       v: 1;
       type: "FULL_STATE_SNAPSHOT";
       snapshot_clock: VC;
+      /** DC-08 Appendix B: the sender's applied frontier (absent on older peers). */
+      applied_upto?: VC;
       entities: SnapshotEntry[];
       tombstones?: Snapshot["tombstones"];
       /** Engine extension: marks the last message of the snapshot stream. */
@@ -193,6 +217,37 @@ export interface RevocationChannel {
   acceptedTriples(): RevocationTriple[];
   /** §2.5: mark the peer's ack claims; stops re-sending to them. */
   recordAck(fromPeer: string, triples: RevocationTriple[]): void;
+  /**
+   * DC-05 Appendix A.2 (DC-27 P12): per known-revoked producer, the highest
+   * history cutoff held. Changes with seq > cutoff are dropped on arrival
+   * and never requested. Optional: channels without it reject nothing.
+   */
+  revokedCutoffs?(): Map<string, number>;
+}
+
+/**
+ * DC-08 §3.7 / TR-7 (DC-27 TR-10): a VALID revocation naming the CURRENT
+ * peer was accepted. The session stops: no further requests, batches or
+ * ACKs (not even the REVOCATIONS_ACK for the record itself).
+ */
+export class PeerRevokedCutoff extends Error {
+  constructor() {
+    super("session ended: the peer was revoked during this session");
+    this.name = "PeerRevokedCutoff";
+  }
+}
+
+/**
+ * DC-27 V8: the peer closed the channel before sending HELLO. Thrown only
+ * after the transport (TCP + Noise handshake) was established, so a caller
+ * can tell "closed after handshake" (e.g. the peer refused us at its trust
+ * gate) from "unreachable" (connect/handshake failure).
+ */
+export class PeerClosedBeforeHelloError extends Error {
+  constructor() {
+    super("protocol violation: expected HELLO, got closed");
+    this.name = "PeerClosedBeforeHelloError";
+  }
 }
 
 export interface SyncTransport {
@@ -216,7 +271,7 @@ export interface SyncEngineDeps {
   selfDeviceId: string;
   knowledge?: import("../sync/knowledge_state.ts").KnowledgeState;
   /** Entity mutation for an applied change (domain layer hook). */
-  mutateEntity?: (db: Database, record: ChangeRecord) => void;
+  mutateEntity?: EntityMutator;
   maxBatchRecords?: number;
   /**
    * DC-09 §3 trigger bookkeeping (streaks persist across sessions when
@@ -245,6 +300,15 @@ export interface SyncEngineDeps {
    * large transfers. Tests inject small values (e.g. 300) for speed.
    */
   idleTimeoutMs?: number;
+  /**
+   * Full-state snapshots (offers, streams, applying them). Default OFF in
+   * this release: a device never offers one, declines every incoming offer
+   * and drops unsolicited snapshot messages. A gap that cannot be served is
+   * simply requested again in the next session. Tests that exercise
+   * snapshot traffic opt in with `snapshots: true`. The snapshot library
+   * functions themselves are unaffected.
+   */
+  snapshots?: boolean;
 }
 
 export interface SyncEngine {
@@ -256,6 +320,23 @@ export interface SessionStats {
   receivedApplied: number;
   receivedBuffered: number;
   receivedDuplicate: number;
+  /**
+   * Changes whose target entity does not exist here yet (edit before create).
+   * Not stored, read position not advanced; retried by the next pull.
+   */
+  receivedNotApplicableYet?: number;
+  /**
+   * Changes whose target (row) is gone while every prerequisite is in (e.g. an
+   * edit of a deleted event, DC-27 TR-8): stored in history, read position
+   * advances, no row write.
+   */
+  receivedTargetGone?: number;
+  /**
+   * A change (origin device, seq) arrived again with content that differs
+   * from the stored copy (possible restore from an older backup). Detection
+   * only: the stored copy is kept and a quarantine row records the arrival.
+   */
+  receivedDuplicateDifferentContent?: number;
   /** TD-001: records durably quarantined (outcome class is exclusive). */
   receivedQuarantined: number;
   /**
@@ -265,6 +346,25 @@ export interface SessionStats {
    * here (they cost nothing and are visible via the hard_blocks row).
    */
   receivedDroppedIntake: number;
+  /**
+   * DC-26 v2 (owner 2026-11-14, review MINOR-3): local rows a received
+   * FULL_STATE snapshot deleted (absence rule + inherited tombstones).
+   * Counted apart from receivedApplied so its meaning stays unchanged.
+   */
+  snapshotDeletions?: number;
+  /**
+   * DC-27 §4.14: changes dropped because their producer is known-revoked
+   * and their seq is above the held cutoff (no quarantine row, no skip row).
+   */
+  receivedRejectedRevoked?: number;
+  /**
+   * DC-09 Appendix A.2: full-state offers and snapshot messages declined
+   * because the sender's declared applied frontier is missing, malformed or
+   * above a held revocation cutoff. Silent; not a misbehavior signal.
+   */
+  snapshotsDeclined?: number;
+  /** DC-27 TR-10: true when the session ended by the mid-session cutoff. */
+  peerRevoked?: boolean;
   /**
    * Pkg6 (item 8): true when this session's HELLO carried the DC-02 §4.1
    * "impossible under honest operation" anomaly — the peer advertised a
@@ -294,12 +394,28 @@ interface KnowledgeHolder {
   };
 }
 
+/**
+ * A change held (not applicable yet: a prerequisite from another device has
+ * not arrived) at the END of this many sessions gets a visible "waiting on a
+ * change from device X" item in the Sync Errors list. The count is stored in
+ * the database (held_changes), so it survives a restart. The item never skips
+ * the seq: the change keeps being held and re-requested.
+ */
+export const HELD_SESSIONS_BEFORE_NOTICE = 3;
+
 export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
   const knowledge = deps.knowledge ?? loadKnowledgeFromDb(deps.db);
-  // TD-001 (6): restart-time revalidation — every durable quarantine row is
-  // re-checked against current state; now-valid records apply idempotently
-  // (skip row removed, frontier may advance); still-invalid ones remain
-  // quarantined with their skip row. Validation is NOT weakened.
+  // TD-001 (6): restart-time revalidation. ONLY unresolved rows whose reason
+  // is explicitly retryable are re-checked (allow-list, see
+  // revalidateQuarantine): now-valid records apply idempotently (skip row
+  // removed, frontier may advance); still-invalid ones remain quarantined
+  // with their skip row. Validation is NOT weakened.
+  // Keep this an allow-list. Do NOT turn it into "all rows except ...":
+  // re-running a duplicate-content warning applies its OTHER copy (the real
+  // change is then replaced or skipped), and re-running a row the user
+  // resolved undoes "Skip this change on this device". Any new quarantine
+  // reason is therefore NOT re-checked unless it is added to the allow-list
+  // deliberately.
   revalidateQuarantine(deps.db, deps.mutateEntity, knowledge);
   // TD-005 hook (one line, per integration note): after a revalidation pass
   // that applied formerly-quarantined records, mark those rows resolved.
@@ -324,10 +440,20 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
   // instantly from any ladder level and survives restarts.
   const misbehavior =
     deps.misbehavior ??
-    new PeerMisbehaviorTracker(DEFAULT_MISBEHAVIOR_CONFIG, Date.now);
+    new PeerMisbehaviorTracker(DEFAULT_MISBEHAVIOR_CONFIG, monotonicWallClock);
   // The durable Tier-2 write ALWAYS goes through this engine's database,
   // including for an injected tracker (hook is attached, not replaced).
+  //
+  // TD-007 (4), documented constraint: the hook is a single slot, so every
+  // engine built on a SHARED tracker re-points it at its own database (last
+  // engine wins). The product builds one engine per session, all on the one
+  // sidecar database, so every assignment is equivalent. A tracker shared by
+  // engines on DIFFERENT databases would write hard blocks into whichever
+  // database bound last: never share one tracker across databases.
   misbehavior.onHardBlock = (p) => hardBlockProducer(deps.db, p);
+  // TD-007 (1): the intake gate runs per arriving record; prepare its
+  // durable hard-block lookup once per engine, not once per record.
+  const isHardBlocked = makeHardBlockCheck(deps.db);
   // Pkg6 (QA-1 F-6): drain zombie pending rows left by an aborted session
   // (frontier already past them) BEFORE the engine's knowledge is first used.
   gcZombiePending();
@@ -523,7 +649,26 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     }
   }
 
+  /** Changes held in the current session that were not applied later in it. */
+  const sessionHeld = new Map<string, ChangeRecord>();
+  const heldKey = (r: ChangeRecord): string => `${r.device_id}#${r.local_seq}`;
+  function noteHeldAtSessionEnd(): void {
+    gcHeldChanges(deps.db);
+    for (const record of sessionHeld.values()) {
+      const n = bumpHeldSessions(deps.db, record.device_id, record.local_seq);
+      if (n >= HELD_SESSIONS_BEFORE_NOTICE) {
+        recordWaitingNotice(
+          deps.db,
+          record,
+          missingPrerequisiteOrigin(deps.db, record) ?? record.device_id,
+        );
+      }
+    }
+    sessionHeld.clear();
+  }
+
   async function runSession(transport: SyncTransport): Promise<SessionStats> {
+    sessionHeld.clear();
     const stats: SessionStats = {
       sent: 0,
       receivedApplied: 0,
@@ -532,6 +677,30 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
       receivedQuarantined: 0,
       receivedDroppedIntake: 0,
     };
+    try {
+      return await runSessionInner(transport, stats);
+    } catch (err) {
+      if (!(err instanceof PeerRevokedCutoff)) throw err;
+      // DC-08 §3.7: close the session cleanly; nothing further is sent.
+      try {
+        transport.close?.();
+      } catch {
+        /* close must never mask the session's own outcome */
+      }
+      stats.peerRevoked = true;
+      return stats;
+    } finally {
+      // DC-09 §7.2 (TD-047): a stream the session did not finish writes
+      // nothing; drop its staged rows.
+      dropSnapshotStream();
+      noteHeldAtSessionEnd();
+    }
+  }
+
+  async function runSessionInner(
+    transport: SyncTransport,
+    stats: SessionStats,
+  ): Promise<SessionStats> {
     // DC-09 §3.5: offers_made_this_session is in-memory only; a new session
     // gets fresh dedup state.
     sessionDedup = new OfferDedup();
@@ -541,6 +710,8 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     // session-end terminator before the real peer ACK arrives (closing the
     // transport on a phantom ACK). Same root as TD-019 F3; fixed here.
     stashed.length = 0;
+    // DC-09 Appendix A.2: a declined snapshot stream stays declined.
+    snapshotStreamDeclined = false;
     // Pkg5b: truthful self-frontier seeding BEFORE the pull loop (see doc).
     seedSelfAppliedFrontier();
     // Pkg6 (QA-1 F-6): same GC for long-lived engine instances — a frontier
@@ -582,7 +753,9 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     // local by definition, and requesting them back left the range
     // permanently unservable-by-advancement, firing Trigger A on every
     // session between converged peers (see neededRanges doc).
-    let ranges = neededRanges(holder.knowledge, peerHello.device_clock, deps.selfDeviceId);
+    let ranges = clampRevoked(
+      neededRanges(holder.knowledge, peerHello.device_clock, deps.selfDeviceId),
+    );
     let gapRetries = 0;
     // M-5: absolute cap on total pull iterations. A peer that keeps changing
     // its advertised ranges must not extend the loop forever; gapRetries
@@ -598,11 +771,23 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
       stats.sent++;
       const batch = await expectBatchOrPeerRequest(nextMessage(transport), transport, stats);
       if (batch === null) break; // peer sent a request instead; serve loop follows
+      const notYetBefore = stats.receivedNotApplicableYet ?? 0;
       applyBatch(batch.changes, stats);
       const before = JSON.stringify(ranges);
-      ranges =
+      ranges = clampRevoked(
         batch.remaining_ranges ??
-        neededRanges(holder.knowledge, peerHello.device_clock, deps.selfDeviceId);
+          neededRanges(holder.knowledge, peerHello.device_clock, deps.selfDeviceId),
+      );
+      if (
+        JSON.stringify(ranges) === before &&
+        (stats.receivedNotApplicableYet ?? 0) > notYetBefore
+      ) {
+        // No progress because a change is not applicable yet (its entity's
+        // creating change has not arrived). That is NOT an unservable gap
+        // (DC-09 Trigger A): do not count a gap round and do not offer a
+        // snapshot. The read position is held; the next pull retries.
+        break;
+      }
       if (JSON.stringify(ranges) === before) {
         gapRetries++; // unservable gap (compacted on peer): DC-09 Trigger A
         triggers.recordGapRound(peerKey);
@@ -614,7 +799,9 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
 
     // --- DC-09 §3 Trigger A: persistent unservable gaps -> FULL_STATE_OFFER
     // (the once-per-session-per-direction dedup of §3.5 applies) ---
-    if (gapRetries > 0 && triggers.shouldOfferTriggerA(peerKey)) {
+    // Snapshots are off by default in this release: no offer is made, the
+    // unserved range is requested again next session.
+    if (deps.snapshots === true && gapRetries > 0 && triggers.shouldOfferTriggerA(peerKey)) {
       const key = offerSessionKey(deps.selfDeviceId, peerKey, "OUTGOING");
       if (sessionDedup.shouldOffer(key, "GAP_ROUNDS")) {
         sessionDedup.markOffered(key);
@@ -634,6 +821,16 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     // runs' lifetimes: a responder with nothing to pull can no longer tear
     // down the shared session inside the initiator's HELLO/pull setup
     // window, because it still owes the session its post-ACK serve phase.
+    //
+    // TD-019 F5, documented (no code change): applied_upto is read from the
+    // durable table at send time, so it is exact for everything applied so
+    // far. It CAN lag what this side applies later in the same session (the
+    // barrier serve phase below). That lag is the deliberate trade of DC-08
+    // Appendix A.2.4 (barrier-phase applications are acknowledged by the
+    // next session's ACK). It is safe: the frontier only ever under-reports
+    // committed state, never over-reports it, and the peer max-merges it
+    // (INVARIANT 14), so a lagging value can only delay compaction unlock,
+    // never cause data loss. A second ACK would break A.2.1 (one per session).
     const ack: SyncMessage = {
       v: 1,
       type: "CHANGES_ACK",
@@ -857,6 +1054,20 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
   }
 
   const stashed: SyncMessage[] = [];
+  /**
+   * DC-09 Appendix A.2: the current snapshot stream was declined (or
+   * malformed); its remaining messages up to `final` are not applied either.
+   * Still needed with atomic apply: without it the tail of a declined stream
+   * would be staged as a new stream and committed on its own at `final`.
+   */
+  let snapshotStreamDeclined = false;
+  /** DC-09 §5.1 (TD-047): the snapshot stream being staged in this session. */
+  let snapshotStream: SnapshotStream | undefined;
+
+  function dropSnapshotStream(): void {
+    snapshotStream?.discard();
+    snapshotStream = undefined;
+  }
 
   function drainStashed(): SyncMessage | null {
     return stashed.shift() ?? null;
@@ -942,12 +1153,26 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     const ch = revocations();
     if (ch === undefined) return;
     const peer = deps.peerDeviceId ?? "unknown";
-    for (const wire of msg.records) {
-      await ch.acceptInbound(
+    let namesPeer = false;
+    for (const wire of Array.isArray(msg.records) ? msg.records : []) {
+      if (wire === null || typeof wire !== "object" || typeof wire.signature_hex !== "string") {
+        continue; // malformed wire entry: nothing to verify
+      }
+      const accepted = await ch.acceptInbound(
         { record: wire.record, signature: sigFromHex(wire.signature_hex) },
         peer,
       );
+      if (
+        accepted &&
+        deps.peerDeviceId !== undefined &&
+        (wire.record as { revoked_device_id?: unknown } | null)?.revoked_device_id ===
+          deps.peerDeviceId
+      ) {
+        namesPeer = true;
+      }
     }
+    // DC-08 §3.7 / TR-7: one abort path for all three receive loops.
+    if (namesPeer) throw new PeerRevokedCutoff();
     await transport.send({
       v: 1,
       type: "REVOCATIONS_ACK",
@@ -979,6 +1204,7 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
       v: 1,
       type: "FULL_STATE_OFFER",
       snapshot_clock: getDeviceClockDb(),
+      applied_upto: readAppliedUpto(deps.db), // DC-08 Appendix B
       sender_device_id: deps.selfDeviceId,
       ...(userInitiated ? { user_initiated: true } : {}),
       ...(reason ? { reason } : {}),
@@ -995,10 +1221,16 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     transport: SyncTransport,
     stats: SessionStats,
   ): Promise<void> {
+    assertPeerNotRevoked();
     const chunks: Snapshot[] = [];
     buildSnapshot(deps.db, (s) => chunks.push(s));
     if (chunks.length === 0) {
-      chunks.push({ snapshot_clock: getDeviceClockDb(), entities: [], tombstones: [] });
+      chunks.push({
+        snapshot_clock: getDeviceClockDb(),
+        applied_upto: readAppliedUpto(deps.db),
+        entities: [],
+        tombstones: [],
+      });
     }
     for (let i = 0; i < chunks.length; i++) {
       const chunkMsg = chunks[i]!;
@@ -1006,6 +1238,7 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
         v: 1,
         type: "FULL_STATE_SNAPSHOT",
         snapshot_clock: chunkMsg.snapshot_clock,
+        applied_upto: chunkMsg.applied_upto, // DC-08 Appendix B
         entities: chunkMsg.entities,
         tombstones: chunkMsg.tombstones,
         final: i === chunks.length - 1,
@@ -1014,21 +1247,52 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     }
   }
 
-  /** DC-09 §5: apply a received snapshot through the transactional pipeline. */
+  /**
+   * DC-09 §5.1 / §7.2 (TD-047): stage each FULL_STATE_SNAPSHOT message of a
+   * stream; at `final` apply the whole stream as one unit (one transaction).
+   */
   function applyIncomingSnapshot(
     msg: Extract<SyncMessage, { type: "FULL_STATE_SNAPSHOT" }>,
     stats: SessionStats,
   ): void {
-    const result = applySnapshot(
-      deps.db,
-      {
-        snapshot_clock: msg.snapshot_clock,
-        entities: msg.entities,
-        tombstones: msg.tombstones ?? [],
-      },
-      holder.knowledge,
-    );
+    assertPeerNotRevoked();
+    // Snapshots are off by default in this release: an unsolicited snapshot
+    // message is dropped, not applied.
+    if (deps.snapshots !== true) {
+      stats.snapshotsDeclined = (stats.snapshotsDeclined ?? 0) + 1;
+      console.warn("[tide][sync] full-state snapshot message dropped: snapshots are off in this version");
+      return;
+    }
+    // DC-09 Appendix A.2: once one message of a stream is declined, the
+    // rest of that stream (up to `final`) is declined too.
+    if (snapshotStreamDeclined) {
+      stats.snapshotsDeclined = (stats.snapshotsDeclined ?? 0) + 1;
+      if (msg.final) snapshotStreamDeclined = false;
+      return;
+    }
+    snapshotStream ??= new SnapshotStream(deps.db);
+    const outcome = snapshotStream.add({
+      snapshot_clock: msg.snapshot_clock,
+      applied_upto: msg.applied_upto,
+      entities: msg.entities,
+      tombstones: msg.tombstones ?? [],
+    });
+    if (outcome !== "staged") {
+      // add() discarded everything staged so far: nothing is written.
+      snapshotStream = undefined;
+      if (outcome === "declined") {
+        stats.snapshotsDeclined = (stats.snapshotsDeclined ?? 0) + 1;
+      }
+      snapshotStreamDeclined = msg.final !== true;
+      return;
+    }
+    if (msg.final !== true) return;
+    const stream = snapshotStream;
+    snapshotStream = undefined;
+    const result = stream.commit(holder.knowledge);
     stats.receivedApplied += result.appliedEntities;
+    stats.snapshotDeletions =
+      (stats.snapshotDeletions ?? 0) + result.absenceTombstones + result.inheritedTombstones;
   }
 
   /** Send FULL_STATE_ACCEPT and consume the winner's snapshot stream. */
@@ -1038,6 +1302,12 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     transport: SyncTransport,
     stats: SessionStats,
   ): Promise<void> {
+    // DC-09 Appendix A.2: a receiver holding a cutoff declines (silently,
+    // §7.4: no ACCEPT) an offer whose declared frontier is tainted/missing.
+    if (refusesDeclaredFrontier(offer.applied_upto, heldCutoffs(deps.db))) {
+      stats.snapshotsDeclined = (stats.snapshotsDeclined ?? 0) + 1;
+      return;
+    }
     await transport.send({
       v: 1,
       type: "FULL_STATE_ACCEPT",
@@ -1112,6 +1382,12 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     transport: SyncTransport,
     stats: SessionStats,
   ): Promise<void> {
+    // Snapshots are off by default in this release: decline every offer the
+    // way DC-09 Appendix A.2 declines one (counted, no ACCEPT sent).
+    if (deps.snapshots !== true) {
+      stats.snapshotsDeclined = (stats.snapshotsDeclined ?? 0) + 1;
+      return;
+    }
     // Pkg1 (QA C-1): a Trigger A (GAP_ROUNDS) offer is a request for OUR
     // full state, not a competing data offer. Answer with our own offer so
     // the gapped sender accepts and receives it — running the §7.3 race
@@ -1169,7 +1445,48 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     return null;
   }
 
+  /** DC-27 §4.14: current cutoffs (re-read per call: mid-session acceptance). */
+  function currentCutoffs(): Map<string, number> {
+    return deps.revocations?.revokedCutoffs?.() ?? new Map();
+  }
+
+  /**
+   * DC-27 V5: never REQUEST a revoked producer's seqs above the cutoff. They
+   * would be dropped on arrival, the range would never shrink, and the pull
+   * loop would count persistent gap rounds (DC-09 Trigger A) every session.
+   */
+  function clampRevoked(
+    ranges: Array<{ device_id: string; lo: number; hi: number }>,
+  ): Array<{ device_id: string; lo: number; hi: number }> {
+    const cutoffs = currentCutoffs();
+    if (cutoffs.size === 0) return ranges;
+    const out: Array<{ device_id: string; lo: number; hi: number }> = [];
+    for (const r of ranges) {
+      const c = cutoffs.get(r.device_id);
+      if (c === undefined) {
+        out.push(r);
+        continue;
+      }
+      const hi = Math.min(r.hi, c);
+      if (r.lo <= hi) out.push({ device_id: r.device_id, lo: r.lo, hi });
+    }
+    return out;
+  }
+
+  /**
+   * DC-08 §3.7 / DC-27 §4.3: once the CURRENT peer is known-revoked (local
+   * unpair, or a record accepted in any session), nothing more is applied
+   * from it or served to it: the session ends at this message boundary.
+   */
+  function assertPeerNotRevoked(cutoffs: Map<string, number> = currentCutoffs()): void {
+    if (deps.peerDeviceId !== undefined && cutoffs.has(deps.peerDeviceId)) {
+      throw new PeerRevokedCutoff();
+    }
+  }
+
   function applyBatch(changes: ChangeRecord[], stats: SessionStats): void {
+    const cutoffs = currentCutoffs();
+    assertPeerNotRevoked(cutoffs);
     for (const raw of changes) {
       // TD-006 / DC-16 §2.1: per-PRODUCER key from the batch envelope's
       // record itself (cheap field read — no JSON parse / validation yet).
@@ -1185,7 +1502,20 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
       // cost; nothing is quarantined, skipped, or listed while blocked.
       // Requests FROM the peer are still answered (serveRequests is
       // untouched; this gate is receive-of-data only).
-      if (isHardBlocked(deps.db, producer)) continue;
+      if (isHardBlocked(producer)) continue;
+
+      // --- DC-05 §7.3 as amended (Appendix A.2, DC-27 P12): a change of a
+      // known-revoked producer above the highest held cutoff is dropped on
+      // arrival: no quarantine row, no skip row, no clock merge, no ladder
+      // feed. Other producers' streams are untouched (V5).
+      const revokedCutoff = cutoffs.get(producer);
+      if (revokedCutoff !== undefined) {
+        const seq = (raw as { local_seq?: unknown } | null)?.local_seq;
+        if (typeof seq === "number" && Number.isInteger(seq) && seq > revokedCutoff) {
+          stats.receivedRejectedRevoked = (stats.receivedRejectedRevoked ?? 0) + 1;
+          continue;
+        }
+      }
 
       // --- TD-006 Tier 1 Level 2/3 (in-memory): throttle/suspend intake
       // drop. No quarantine rows, no skip entries, no per-packet UI
@@ -1235,7 +1565,7 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
         // inspectable; the session keeps going (never blocking).
         quarantineRecord(deps.db, {
           reason:
-            "invalid_change_record:" +
+            INVALID_RECORD_REASON_PREFIX +
             (e instanceof Error ? e.message.slice(0, 120) : String(e).slice(0, 120)),
           senderDeviceId: deps.selfDeviceId,
           rawRecord: raw,
@@ -1270,15 +1600,57 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
         appendInvalidTally(deps.db, producer); // §2.3 durable tally (informative only)
         continue;
       }
-      const outcome = applyRemoteChange(
+      const outcome = applyRemoteChangeDetailed(
         deps.db,
         record,
         holder.knowledge,
         deps.mutateEntity,
       );
+      if (outcome === "applied" || outcome === "target_gone" || outcome === "quarantined") {
+        sessionHeld.delete(heldKey(record));
+      }
       if (outcome === "applied") stats.receivedApplied++;
       else if (outcome === "buffered") stats.receivedBuffered++;
-      else stats.receivedDuplicate++;
+      else if (outcome === "quarantined") {
+        // The change's target is gone and a prerequisite was quarantined here.
+        // Counted with the quarantined class; deliberately NOT fed to the
+        // misbehavior ladder (not the peer's fault).
+        stats.receivedQuarantined++;
+        console.warn(
+          `[tide][sync] change ${record.device_id}#${record.local_seq} ` +
+            `(${record.entity_type} ${record.entity_id}) quarantined: a change it depends on was quarantined here`,
+        );
+      } else if (outcome === "target_gone") {
+        // Target gone, every prerequisite in: counted as done (history + read
+        // position advance, no row write).
+        stats.receivedTargetGone =
+          (stats.receivedTargetGone ?? 0) + 1;
+        console.warn(
+          `[tide][sync] change ${record.device_id}#${record.local_seq} ` +
+            `(${record.entity_type} ${record.entity_id} ${record.field_path}) ` +
+            `counted as done: its target no longer exists here`,
+        );
+      } else if (outcome === "duplicate_different_content") {
+        stats.receivedDuplicate++;
+        stats.receivedDuplicateDifferentContent =
+          (stats.receivedDuplicateDifferentContent ?? 0) + 1;
+        console.warn(
+          `[tide][sync] WARNING: change ${record.device_id}#${record.local_seq} ` +
+            `arrived again with DIFFERENT content than the stored copy; ` +
+            `stored copy kept, incoming copy recorded in the quarantine list`,
+        );
+      } else if (outcome === "not_applicable") {
+        // The change cannot be applied yet: a change it depends on has not
+        // arrived. Nothing was stored and the read position did not move, so
+        // the next pull re-requests it. Counted and logged (stderr only).
+        stats.receivedNotApplicableYet = (stats.receivedNotApplicableYet ?? 0) + 1;
+        sessionHeld.set(heldKey(record), record);
+        console.warn(
+          `[tide][sync] change ${record.device_id}#${record.local_seq} ` +
+            `(${record.entity_type} ${record.entity_id} ${record.field_path}) ` +
+            `not applicable yet: a change it depends on has not arrived; read position held`,
+        );
+      } else stats.receivedDuplicate++;
       // TD-006: a non-rejected outcome is a normal arrival — feeds the
       // window's ratio denominator (and can drive clean-window recovery).
       misbehavior.recordOk(producer);
@@ -1288,6 +1660,7 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
   function fetchRanges(
     ranges: Array<{ device_id: string; lo: number; hi: number }>,
   ): ChangeRecord[] {
+    assertPeerNotRevoked();
     const out: ChangeRecord[] = [];
     const stmt = deps.db.prepare(`
       SELECT change_id, device_id, local_seq, entity_id, entity_type,
@@ -1340,6 +1713,7 @@ async function expectType<T extends SyncMessage["type"]>(
   type: T,
 ): Promise<Extract<SyncMessage, { type: T }>> {
   const msg = await nextMessage();
+  if (msg === null && type === "HELLO") throw new PeerClosedBeforeHelloError();
   if (msg === null || msg.type !== type || (msg as { v?: number }).v !== 1) {
     throw new Error(`protocol violation: expected ${type}, got ${msg?.type ?? "closed"}`);
   }
@@ -1416,8 +1790,9 @@ type SingleRevalidation =
 function revalidateOneQuarantineRaw(
   db: Database,
   rawRecord: string,
-  mutate?: (db: Database, record: ChangeRecord) => void,
+  mutate?: EntityMutator,
   knowledge?: NonNullable<SyncEngineDeps["knowledge"]>,
+  reason?: string,
 ): SingleRevalidation {
   let record: ChangeRecord;
   try {
@@ -1425,8 +1800,20 @@ function revalidateOneQuarantineRaw(
   } catch {
     return { outcome: "invalid" }; // still invalid: quarantine + skip unchanged
   }
+  // A change quarantined because a prerequisite was rejected: the read
+  // position already passed it, so re-run the readiness rule for real
+  // instead of letting the arrival path call it a duplicate.
+  if (
+    reason === DEPENDS_ON_QUARANTINED_REASON &&
+    appliedFrontierOf(db, record.device_id) >= record.local_seq
+  ) {
+    const r = reapplyQuarantinedInPlace(db, record, mutate);
+    if (r === "applied") return { outcome: "applied" };
+    if (r === "duplicate") return { outcome: "duplicate" };
+    return { outcome: "failed" }; // still blocked: the row stays active
+  }
   try {
-    let outcome: SingleRevalidation["outcome"] | undefined;
+    let outcome: ApplyOutcomeDetailed | undefined;
     // Atomic per row: the skip-row removal and the apply share one
     // transaction (applyRemoteChange's inner transaction nests safely).
     db.transaction(() => {
@@ -1434,11 +1821,22 @@ function revalidateOneQuarantineRaw(
         "DELETE FROM skipped_seqs WHERE producer_device_id = ? AND local_seq = ?",
       ).run(record.device_id, record.local_seq);
       const k = knowledge ?? loadKnowledgeFromDb(db);
-      const res = applyRemoteChange(db, record, k, mutate);
+      const res = applyRemoteChangeDetailed(db, record, k, mutate);
       outcome = res;
     })();
-    if (outcome === "applied") return { outcome: "applied" };
+    if (outcome === "applied" || outcome === "target_gone") {
+      return { outcome: "applied" };
+    }
     if (outcome === "buffered") return { outcome: "buffered" };
+    if (outcome === "not_applicable" || outcome === "quarantined") {
+      // Still blocked: the row stays active. A "waiting" notice never skips
+      // the seq (the change keeps being held and re-requested); every other
+      // row keeps its skip row.
+      if (reason !== WAITING_ON_CHANGE_REASON) {
+        markSeqSkipped(db, record.device_id, record.local_seq);
+      }
+      return { outcome: "failed" };
+    }
     // duplicate (already have it): the skip row is legitimately gone.
     return { outcome: "duplicate" };
   } catch {
@@ -1451,23 +1849,34 @@ function revalidateOneQuarantineRaw(
 export function retryQuarantineRecord(
   db: Database,
   quarantineId: number,
-  mutate?: (db: Database, record: ChangeRecord) => void,
+  mutate?: EntityMutator,
 ):
   | { outcome: "applied" | "duplicate" | "buffered"; resolved: boolean }
   | { outcome: "invalid" | "failed"; resolved: false }
   | { outcome: "already_resolved" | "not_found"; resolved: false } {
   const row = db
     .prepare(
-      "SELECT raw_record, resolved_at_hlc FROM quarantine WHERE quarantine_id = ?",
+      "SELECT raw_record, resolved_at_hlc, quarantine_reason FROM quarantine WHERE quarantine_id = ?",
     )
     .get(quarantineId) as
-    | { raw_record: string; resolved_at_hlc: number | null }
+    | { raw_record: string; resolved_at_hlc: number | null; quarantine_reason: string }
     | undefined;
   if (!row) return { outcome: "not_found", resolved: false };
   if (row.resolved_at_hlc !== null) {
     return { outcome: "already_resolved", resolved: false }; // idempotent
   }
-  const res = revalidateOneQuarantineRaw(db, row.raw_record, mutate);
+  if (row.quarantine_reason === DUPLICATE_DIFFERENT_CONTENT_REASON) {
+    // A duplicate-content warning has nothing to re-check or apply: the stored
+    // copy is kept. Retry is a no-op that says so (it can only be dismissed).
+    return { outcome: "failed", resolved: false };
+  }
+  const res = revalidateOneQuarantineRaw(
+    db,
+    row.raw_record,
+    mutate,
+    undefined,
+    row.quarantine_reason,
+  );
   if (res.outcome === "invalid" || res.outcome === "failed") {
     return { outcome: res.outcome, resolved: false };
   }
@@ -1479,8 +1888,15 @@ export function retryQuarantineRecord(
 }
 
 /**
- * TD-001 (6): restart-time revalidation pass. Iterates EVERY quarantine row
- * and re-runs validateChangeRecord + the full apply path against current
+ * Quarantine reasons of an unparsable or invalid record start with this
+ * prefix (followed by a detail). Together with DEPENDS_ON_QUARANTINED_REASON
+ * it is the whole list of rows the session-start re-check may re-run.
+ */
+export const INVALID_RECORD_REASON_PREFIX = "invalid_change_record:";
+
+/**
+ * TD-001 (6): restart-time revalidation pass. Iterates every UNRESOLVED
+ * retryable quarantine row (allow-list, see the query) and re-runs validateChangeRecord + the full apply path against current
  * durable state. Now-valid records apply idempotently (dedupe by changes
  * UNIQUE), their skipped_seqs row is removed, and if the stalled seq becomes
  * nextExpected the frontier advances honestly. Still-invalid records remain
@@ -1489,12 +1905,24 @@ export function retryQuarantineRecord(
  */
 export function revalidateQuarantine(
   db: Database,
-  mutate?: (db: Database, record: ChangeRecord) => void,
+  mutate?: EntityMutator,
   knowledge?: NonNullable<SyncEngineDeps["knowledge"]>,
 ): RevalidationResult {
   const rows = db
-    .prepare("SELECT raw_record FROM quarantine ORDER BY quarantine_id")
-    .all() as Array<{ raw_record: string }>;
+    // ALLOW-LIST: only unresolved rows with an explicitly retryable reason are
+    // re-run. Warnings, waiting notices, resolved rows (skipped, dismissed,
+    // applied) and any other or future row type are never re-checked.
+    .prepare(
+      `SELECT raw_record, quarantine_reason FROM quarantine
+       WHERE resolved_at_hlc IS NULL
+         AND (quarantine_reason = ? OR substr(quarantine_reason, 1, ?) = ?)
+       ORDER BY quarantine_id`,
+    )
+    .all(
+      DEPENDS_ON_QUARANTINED_REASON,
+      INVALID_RECORD_REASON_PREFIX.length,
+      INVALID_RECORD_REASON_PREFIX,
+    ) as Array<{ raw_record: string; quarantine_reason: string }>;
   const result: RevalidationResult = {
     examined: 0,
     revalidated: 0,
@@ -1505,7 +1933,13 @@ export function revalidateQuarantine(
     // TD-005 remainder: single-record logic extracted and shared with the
     // per-item Retry action (retryQuarantineRecord) — one apply path, both
     // entry points.
-    const res = revalidateOneQuarantineRaw(db, row.raw_record, mutate, knowledge);
+    const res = revalidateOneQuarantineRaw(
+      db,
+      row.raw_record,
+      mutate,
+      knowledge,
+      row.quarantine_reason,
+    );
     if (res.outcome === "applied") result.revalidated++;
     else if (res.outcome === "invalid" || res.outcome === "failed") {
       result.stillInvalid++; // remain quarantined with their skip row

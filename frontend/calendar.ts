@@ -3,6 +3,7 @@ import type { CalendarEvent } from "./store.ts";
 import { listEvents, listSeries, updateEvent, deleteEvent, type SeriesRow } from "./store.ts";
 import { recurrenceBadge, type SeriesInfo } from "./recurrence.ts";
 import { expandOccurrences } from "../src/domain/recurrence_conflicts.ts";
+import { msFromWallId, baseStartWall } from "../src/domain/wall_time.ts";
 import { formatTimeLabel, getTimeFormat } from "./theme.ts";
 
 export type ViewMode = "month" | "week";
@@ -177,27 +178,6 @@ function wallIdFromMs(ms: number): string {
   );
 }
 
-/** Epoch ms from a 'YYYYMMDD[THHMMSS]' wall-clock id (local time). */
-function msFromWallId(id: string): number {
-  const digits = id.replace(/\D/g, "");
-  const y = +digits.slice(0, 4);
-  const mo = +digits.slice(4, 6);
-  const dd = +digits.slice(6, 8);
-  const hh = +digits.slice(8, 10) || 0;
-  const mi = +digits.slice(10, 12) || 0;
-  const ss = +digits.slice(12, 14) || 0;
-  return new Date(y, mo - 1, dd, hh, mi, ss, 0).getTime();
-}
-
-/** 'YYYY-MM-DDTHH:MM' naive wall clock from epoch ms (SeriesState form). */
-function baseStartWall(ms: number): string {
-  const d = new Date(ms);
-  return (
-    `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}` +
-    `T${pad2(d.getHours())}:${pad2(d.getMinutes())}`
-  );
-}
-
 /** Per-chip occurrence metadata consumed by decorateRecurrence (✎ marker). */
 export interface OccurrenceMeta {
   recurrenceId: string;
@@ -325,6 +305,13 @@ function eventChip(
   const chip = document.createElement("div");
   chip.className = allDayStyle ? "chip chip-allday" : "chip";
   chip.dataset.eventId = ev.id;
+  // DC-26 §3.3 (review MAJOR-1): a redraw keeps the selection when the
+  // selected appointment (same event, same occurrence) is still shown.
+  if (selectedEvent && selectionKey(selectedEvent) === selectionKey(ev)) {
+    chip.classList.add("chip-selected");
+    selectedEvent = ev; // fresh data after a sync
+    selectionSeen = true;
+  }
   chip.textContent = allDayStyle ? ev.title : `${fmtTime(ev.startMs)} ${ev.title}`;
   chip.title = ev.title;
   // Every occurrence chip carries the 🔁 glyph + tooltip (occurrence metadata
@@ -367,6 +354,18 @@ function eventChip(
 // ---------------------------------------------------------------------------
 
 let selectedEvent: CalendarEvent | null = null;
+/** Set during render() when the selected appointment was drawn again. */
+let selectionSeen = false;
+
+/** Identity of a chip for selection: event id + occurrence (series). */
+function selectionKey(ev: CalendarEvent): string {
+  return `${ev.id}|${occurrenceOf(ev)?.recurrenceId ?? ""}`;
+}
+
+/** DC-26 (review MINOR-2): true while a chip is being dragged. */
+export function isDragging(): boolean {
+  return dragEvent !== null;
+}
 
 function deleteSelected(chip: HTMLElement): void {
   const ev = selectedEvent;
@@ -669,6 +668,28 @@ export async function render(): Promise<void> {
   const root = document.getElementById("calendar-grid");
   if (!root) return;
   const seq = ++renderSeq;
+  // Fetch BEFORE clearing (review MINOR-4): the old grid stays on screen
+  // while data loads, so a background refresh never flashes an empty grid
+  // or resets the scroll position.
+  const cells = mode === "month" ? monthGrid() : weekCells();
+  const rangeStart = cells[0]!.date;
+  const rangeEnd = addDays(cells[cells.length - 1]!.date, 1);
+  const [baseEvents, series] = await Promise.all([
+    eventsForRange(rangeStart, rangeEnd),
+    seriesByBaseEvent(),
+  ]);
+  // Re-check: async gap may mean the user navigated meanwhile.
+  if (seq !== renderSeq) {
+    return;
+  }
+  seriesLookup = series;
+  // DC-12: expand recurring series into per-occurrence chips (cancelled
+  // occurrences dropped, edited occurrences carry their override fields).
+  const events = expandSeriesEvents(baseEvents, seriesRowsCache, rangeStart, rangeEnd);
+  const scrollBox = root.closest("main");
+  const scrollTop = scrollBox?.scrollTop ?? 0;
+  selectionSeen = false;
+
   root.replaceChildren();
   root.classList.toggle("week", mode === "week");
 
@@ -685,22 +706,6 @@ export async function render(): Promise<void> {
     root.appendChild(h);
   }
 
-  const cells = mode === "month" ? monthGrid() : weekCells();
-  const rangeStart = cells[0]!.date;
-  const rangeEnd = addDays(cells[cells.length - 1]!.date, 1);
-  const [baseEvents, series] = await Promise.all([
-    eventsForRange(rangeStart, rangeEnd),
-    seriesByBaseEvent(),
-  ]);
-  seriesLookup = series;
-  // DC-12: expand recurring series into per-occurrence chips (cancelled
-  // occurrences dropped, edited occurrences carry their override fields).
-  const events = expandSeriesEvents(baseEvents, seriesRowsCache, rangeStart, rangeEnd);
-  // Re-check: async gap may mean the user navigated meanwhile.
-  if (seq !== renderSeq) {
-    return;
-  }
-
   if (mode === "week") {
     renderHourRuler(root);
     for (const cell of cells) {
@@ -715,6 +720,14 @@ export async function render(): Promise<void> {
     }
   }
   document.getElementById("cal-label")!.textContent = label();
+  // The selected appointment no longer exists (or is out of view): clear
+  // the selection so Delete can't act on a stale event (DC-26 §3.3).
+  if (!selectionSeen) selectedEvent = null;
+  if (scrollBox) scrollBox.scrollTop = scrollTop;
+  // TD-031 / DC-26 TR-8: listeners (conflicts badge) re-read their state
+  // on every completed redraw, so a conflict created by a sync or any
+  // other path is visible without a restart.
+  document.dispatchEvent(new CustomEvent("tide:rendered"));
 }
 
 // --- Week view: time-grid ---------------------------------------------------
@@ -736,21 +749,25 @@ function pad(n: number): string {
 function renderHourRuler(root: HTMLElement): void {
   const ruler = document.createElement("div");
   ruler.className = "hour-ruler";
-  // Owner layout (2026-08-31, refined): 24 slots, one label per bar —
-  // 01:00 centred in the FIRST bar, 24:00 in the last, right after 23:00.
-  // Slot-centred (not on the line) so the ruler starts at the top edge.
-  for (let h = 1; h <= 24; h++) {
+  // Owner layout v3 (2026-10-12, W2 follow-up): labels sit ON their hour
+  // line (Outlook-style) — h:00 centred at top = h/24 — instead of
+  // centred in the slot above. The old slot-centred placement made the
+  // "02:00" label float over the 01:00–02:00 band, so dblclicking "02:00"
+  // opened 01:00–02:00 and the "01:00" label landed in band 0 (midnight →
+  // 09:00 default). Labels ON the line remove the ambiguity.
+  for (let h = 0; h <= 24; h++) {
     const lbl = document.createElement("div");
     lbl.className = "hour-label";
     lbl.textContent = fmtRulerLabel(h);
-    lbl.style.top = `${((h - 0.5) / 24) * 100}%`;
+    lbl.style.top = `${(h / 24) * 100}%`;
     ruler.appendChild(lbl);
   }
   root.appendChild(ruler);
 }
 
-/** Ruler label for the h:00 line; h=24 is the day boundary (00:00/24:00). */
+/** Ruler label for the h:00 line; h=0 is 00:00, h=24 is the day boundary. */
 function fmtRulerLabel(h: number): string {
+  if (h === 0) return getTimeFormat() === "12h" ? "12:00 AM" : "00:00";
   if (h === 24) return getTimeFormat() === "12h" ? "12:00 AM" : "24:00";
   return fmtHour(h);
 }

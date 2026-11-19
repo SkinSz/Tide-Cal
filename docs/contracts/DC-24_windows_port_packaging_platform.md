@@ -301,8 +301,14 @@ if no rule set exists for the app, set/create one accordingly. Design:
         Windows (mDNS sockets bind 5353 inbound).
       * "Tide sync"   : inbound TCP, local port 47471
         (SYNC_DEFAULT_PORT — the literal is imported from the shared
-        constant, never re-hardcoded), program = tide.exe — required
+        constant, never re-hardcoded), program = the bundled node.exe
+        (the sidecar process that owns the sync listener) — required
         for direct-TCP sync sessions (DC-05/DC-08).
+    Amendment 2026-11-14 (owner-approved): "Tide sync" was originally
+    scoped to tide.exe, written before the Node runtime was bundled
+    (§4.4). Windows Firewall matches the process that owns the socket,
+    so a tide.exe-scoped sync rule can never admit sync traffic. Each
+    rule is now scoped to the process that actually binds its port.
     Outbound traffic needs NO rules on default-configured Windows
     (default outbound = allow); we do NOT create outbound rules, and
     we do NOT modify any existing (default) rules.
@@ -313,7 +319,9 @@ if no rule set exists for the app, set/create one accordingly. Design:
     (runas / ShellExecute "runas"), which triggers the standard UAC
     prompt. Rules are created ONCE per machine (idempotent: check
     first, create only when absent), not per launch.
-  - The elevation prompt names netsh under our invocation; the
+  - The elevation prompt names Windows PowerShell, which runs netsh
+    (amended 2026-11-14: the elevated child is PowerShell with an
+    encoded command, so no quoting layer can alter the netsh lines); the
     user-facing dialog text (in-app, before the UAC prompt) explains:
     "Tide needs Windows Firewall rules so other paired devices can
     discover this computer and sync with it."

@@ -14,7 +14,7 @@
 //
 // Usage:
 //   node tests/probes/three_device_harness.mjs [--scenario=NAME|all]
-//        [--port-base=41900] [--keep] [--inject-failure] [--report-dir=DIR]
+//        [--port-base=31900] [--keep] [--inject-failure] [--report-dir=DIR]
 //        [--seed=N]
 //
 // Exit code 0 = all requested scenarios PASS, 1 = any FAIL.
@@ -36,7 +36,14 @@ const SIDECAR = path.join(REPO_ROOT, "dist", "sidecar.mjs");
 const HARNESS_VERSION = "3dev-harness-1.0";
 
 // --- determinism controls ---------------------------------------------------
-const DEFAULT_PORT_BASE = 41900; // reserved band 41900-41999 (proposal)
+// TD-013: the band sits BELOW every common OS ephemeral (outbound) port
+// range (Linux default 32768-60999, Windows/macOS 49152-65535). The old band
+// 41900-41999 lay inside the Linux range, so a sidecar's own outbound sync
+// or pairing socket (or one in TIME_WAIT) could occupy a port a later
+// scenario then had to listen on: transient EADDRINUSE that nothing held a
+// moment later. Ports stay deterministic per run: scenario i uses
+// PORT_BASE + 10*i + device index.
+const DEFAULT_PORT_BASE = 31900; // reserved band 31900-31999
 const BIND_VERIFY_TIMEOUT_MS = 10000; // fail fast if a bind lost a port race
 const RPC_TIMEOUT_MS = 15000; // per-op deadline (covers sidecar scheduling)
 const SYNC_RPC_TIMEOUT_MS = 22000; // sync_now: >= engine idle bound (15s) + margin
@@ -190,12 +197,33 @@ async function assertPortFree(port, label) {
   if (!ok) throw new Error(`port ${port} for ${label} already in use — refusing to race (fast-fail)`);
 }
 
+/** One TCP connect to the device's sync listener; resolves true if accepted. */
+function listenerAccepts(port) {
+  return new Promise((resolve) => {
+    const sock = net.connect({ host: "127.0.0.1", port });
+    sock.once("connect", () => {
+      sock.destroy(); // handshake never starts: the sidecar just drops it
+      resolve(true);
+    });
+    sock.once("error", () => resolve(false));
+  });
+}
+
+const BIND_FAILURE_MARK = "sync listener failed to start";
+
 async function waitHealthy(dev) {
-  // device_info forces listener startup; verify the advertised port matches
-  // ours so a lost bind race fails the run immediately.
+  // device_info forces listener startup. Its listening_port only echoes the
+  // REQUESTED port (the bind is async and a failure is merely logged), so a
+  // matching number proves nothing (TD-013). Proof of a bound listener is a
+  // real TCP accept on that port. If the bind failed, the next device_info
+  // makes the sidecar try again: this loop is that bounded bind-retry
+  // (BIND_VERIFY_TIMEOUT_MS), and every failed attempt is logged.
   const deadline = Date.now() + BIND_VERIFY_TIMEOUT_MS;
   let lastErr;
+  let attempt = 0;
+  let bindFailuresSeen = 0;
   while (Date.now() < deadline) {
+    attempt++;
     try {
       const info = await dev.rpc("device_info", {}, 4000);
       dev.deviceId = info.device_id;
@@ -204,13 +232,42 @@ async function waitHealthy(dev) {
           `${dev.name}: listener on ${info.listening_port}, expected ${dev.port} (bind lost race?)`,
         );
       }
-      return info;
+      if (await listenerAccepts(dev.port)) {
+        if (attempt > 1) log(`  [bind] ${dev.name}: port ${dev.port} accepting after ${attempt} attempts`);
+        return info;
+      }
+      const failures = dev.stderrTail.filter((l) => l.includes(BIND_FAILURE_MARK));
+      const fresh = failures.slice(bindFailuresSeen);
+      bindFailuresSeen = failures.length;
+      throw new Error(
+        `${dev.name}: nothing accepting on port ${dev.port}` +
+          (fresh.length > 0 ? ` (sidecar: ${fresh[fresh.length - 1]})` : ""),
+      );
     } catch (e) {
       lastErr = e;
+      log(`  [bind] ${dev.name}: attempt ${attempt} not ready: ${e.message ?? e}`);
       await new Promise((r) => setTimeout(r, 150));
     }
   }
-  throw new Error(`${dev.name}: device_info failed within ${BIND_VERIFY_TIMEOUT_MS}ms: ${lastErr}`);
+  throw new Error(`${dev.name}: listener not verified within ${BIND_VERIFY_TIMEOUT_MS}ms: ${lastErr}`);
+}
+
+/**
+ * TD-013: refuse (loudly) a port band that overlaps this host's ephemeral
+ * range; outbound sockets could take a band port at any moment.
+ */
+function ephemeralRange() {
+  try {
+    const [lo, hi] = fs
+      .readFileSync("/proc/sys/net/ipv4/ip_local_port_range", "utf8")
+      .trim()
+      .split(/\s+/)
+      .map(Number);
+    if (Number.isInteger(lo) && Number.isInteger(hi)) return { lo, hi, source: "linux" };
+  } catch {
+    /* not Linux */
+  }
+  return { lo: 49152, hi: 65535, source: "IANA default" };
 }
 
 // --- pairing (real DC-05 over real Noise_XX TCP) -----------------------------
@@ -704,6 +761,92 @@ SCENARIOS.stall_repro = async (rec, portBase) => {
   }
 };
 
+SCENARIOS.unpair_propagation = async (rec, portBase) => {
+  // DC-27 TR-6 / TR-11 / P6 on the BUILT bundle: A unpairs B; the urgent
+  // push tells C (endpoint known from an mDNS event, as in production); B is
+  // then refused by A and by C; A and C keep B's earlier event; B cannot
+  // re-pair under its old id.
+  const [a, b, c] = await spawnAndPair(rec, portBase, 3);
+  rec.pairing.push(await pair(b, c)); // full mesh: C must trust B for the refusal to matter
+  const expected = new ExpectedState();
+  rec.stages = [];
+  await mkEvent(b, expected, "from-B-before", 1, 9);
+  rec.sync_sessions = [];
+  rec.sync_sessions.push(await syncAttempt(b, a, false));
+  rec.sync_sessions.push(await syncAttempt(b, c, false));
+  rec.sync_sessions.push(await syncAttempt(c, a, false));
+  // C's endpoint reaches A the way the shell delivers it (mdns_event notification).
+  const cInfo = await c.rpc("device_info");
+  a.proc.stdin.write(
+    JSON.stringify({
+      id: null,
+      notification: "mdns_event",
+      args: {
+        kind: "added", instance_name: cInfo.instance_name, host: "127.0.0.1", port: c.port,
+        interface: "lo", observed_at: Date.now(), ttl_ms: 120000,
+      },
+    }) + "\n",
+  );
+  await pace();
+  let noConfirm = null;
+  try {
+    await a.rpc("unpair_device", { device_id: b.deviceId });
+  } catch (e) {
+    noConfirm = String(e.message ?? e);
+  }
+  rec.stages.push(`unpair without confirm: ${noConfirm}`);
+  if (!noConfirm || !noConfirm.includes("ERR_CONFIRM")) throw new Error("unpair_device ran without confirm:true");
+  const res = await a.rpc("unpair_device", { device_id: b.deviceId, confirm: true });
+  rec.unpair_result = { already: res.already, peers_to_tell: res.peers_to_tell };
+  if (res.already !== false || res.peers_to_tell !== 1) throw new Error(`unexpected unpair result ${JSON.stringify(rec.unpair_result)}`);
+  // urgent push: C learns the record without any manual A<->C sync. Proof:
+  // C refuses B. (Wait for A's push session to finish first.)
+  const toldNow = async () => {
+    const r = await a.rpc("list_removed_devices");
+    return r.removed.length === 1 && r.removed[0].told.length === 1 && r.removed[0].told[0].done === true;
+  };
+  await pace(1500);
+  await mkEvent(b, new ExpectedState(), "from-B-after", 1, 11);
+  const toC = await syncAttempt(b, c);
+  const toA = await syncAttempt(b, a);
+  rec.sync_sessions.push(toA, toC);
+  const refused = (s) => typeof s.error === "string" && s.error.includes("expected HELLO, got closed");
+  if (!refused(toA) || !refused(toC)) throw new Error(`B was not refused: A=${toA.error ?? "ok"} C=${toC.error ?? "ok"}`);
+  // "told" = C's ACK reached A (DC-10 §3 at-least-once: a lost ACK is
+  // repaired by the next ordinary session, which re-sends the record).
+  const toldAfterPush = await toldNow();
+  rec.stages.push(`A shows C told after the urgent push: ${toldAfterPush}`);
+  let toldAfterNext = toldAfterPush;
+  if (!toldAfterPush) {
+    rec.sync_sessions.push(await syncAttempt(c, a, false));
+    await pace();
+    toldAfterNext = await toldNow();
+    rec.stages.push(`A shows C told after one more C->A session: ${toldAfterNext}`);
+  }
+  if (!toldAfterNext) throw new Error("C's ACK never reached A");
+  const bDevices = await b.rpc("list_paired_devices");
+  const hint = (bDevices.devices ?? []).find((d) => d.device_id === a.deviceId)?.refused_us === true;
+  rec.stages.push(`P6 hint on B for A: ${hint}`);
+  const aDevices = await a.rpc("list_paired_devices");
+  if ((aDevices.devices ?? []).some((d) => d.device_id === b.deviceId)) throw new Error("B still listed on A");
+  // same-id re-pair refused (P10)
+  let repair = null;
+  try {
+    const offer = await a.rpc("pairing_offer", { name: a.name });
+    await b.rpc("pairing_accept", { qr_text: offer.qr_text, name: b.name });
+  } catch (e) {
+    repair = String(e.message ?? e);
+  }
+  rec.stages.push(`same-id re-pair: ${repair}`);
+  const repairRefused = repair !== null && repair.includes("This device was unpaired earlier. To pair it again, start it fresh first.");
+  a._lastListEvents = await readEvents(a);
+  c._lastListEvents = await readEvents(c);
+  rec.expected_events = expected.array();
+  rec.result = verifyDevices([a, c], expected);
+  rec.pass = rec.result.ok && hint && repairRefused;
+  if (!rec.pass) rec.error = rec.result.detail.join(" | ") || `hint=${hint} repairRefused=${repairRefused}`;
+};
+
 // --- report formatting -------------------------------------------------------
 function markdownDigest(run) {
   const L = [];
@@ -821,6 +964,15 @@ async function main() {
 
   // Fast failure for port races: verify the whole band up-front.
   const maxOffset = requested.length * 10 + 4;
+  const eph = ephemeralRange();
+  if (PORT_BASE <= eph.hi && PORT_BASE + maxOffset - 1 >= eph.lo) {
+    console.error(
+      `port band ${PORT_BASE}-${PORT_BASE + maxOffset - 1} overlaps the ephemeral range ` +
+        `${eph.lo}-${eph.hi} (${eph.source}); outbound sockets can steal band ports ` +
+        `(TD-013). Choose --port-base below ${eph.lo}.`,
+    );
+    process.exit(2);
+  }
   for (let i = 0; i < maxOffset; i++) {
     await assertPortFree(PORT_BASE + i, `port band +${i}`);
   }

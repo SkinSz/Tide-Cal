@@ -38,7 +38,10 @@ import {
   createSyncEngine,
   type Device,
   type MsgPipe,
+  useSnapshots,
 } from "./pkg1_helpers.ts";
+
+useSnapshots(); // subject: Trigger A / snapshot conflicts
 import { applyRemoteChange, loadKnowledgeFromDb } from "../src/persistence/database.ts";
 import { neededRanges, emptyKnowledge } from "../src/sync/knowledge_state.ts";
 import { buildSnapshot, applySnapshot } from "../src/sync/full_state.ts";
@@ -178,11 +181,13 @@ async function sessionBoth(
     db: from.db,
     selfDeviceId: from.identity.deviceId,
     mutateEntity: makeEntityMutator(),
+    snapshots: true,
   });
   const engTo = createSyncEngine({
     db: to.db,
     selfDeviceId: to.identity.deviceId,
     mutateEntity: makeEntityMutator(),
+    snapshots: true,
   });
   const runF = engFrom.runSession(pFrom as never).catch(() => {});
   const runT = engTo.runSession(pTo as never).then(

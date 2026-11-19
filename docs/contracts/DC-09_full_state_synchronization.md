@@ -6,10 +6,21 @@ per owner decision it is a USER-ADJUSTABLE SETTING: the value is exposed in
 the program settings (bounds below) rather than being a hard-coded constant.
 All other triggers/constants unchanged.
 
+OPERATING CONSTRAINT (v0.2): full-state snapshots are switched off (the sync
+engine never offers one, declines incoming offers and drops unsolicited
+snapshot messages), and change-log truncation (DC-06 compaction) stays off.
+The two belong together: without snapshots, a device that falls behind can
+only catch up from untruncated change logs. Switching EITHER on requires an
+explicit project owner decision.
+
 OWNER AMENDMENT 2 (2026-08-25): DC-13 approved with tuned defaults —
 debounce 10s (was 5), sweep interval 10 min (was 15). Rationale: keep data
 fresher without meaningful network cost; see DC-13 §3.5 for the updated
 normative values and bounds.
+
+AMENDED by project owner (2026-11-14, via DC-27 Appendix B). See
+Appendix A (receiver rule for producers with a revocation cutoff);
+supersedes §5.1, §5.4 and TR-8 for those producers.
 Depends on: Architecture Spec v0.3 §11, §12, §30 (#7), §31; DC-02 §4; DC-06 §2.5,
 §3.4; DC-07 (transactional apply); DC-08 §3.6, §5, §6.3
 Unblocks: GUARANTEED_FULL_RESYNC(P) evaluation (DC-06 §2.5); recovery from
@@ -578,3 +589,43 @@ TR-12 IDEMPOTENT RETRY: re-running the entire offer/accept/apply after a
   not an implementation choice.
 - Resume tokens for partially-transferred snapshots -> explicitly rejected
   for v1 (§7.2); revisit only with a dedicated revision of this contract.
+
+==================================================
+APPENDIX A — AMENDMENT: SNAPSHOTS AND THE REVOCATION CUTOFF
+==================================================
+Status: APPROVED by project owner (2026-11-14), via DC-27 Appendix B
+option a). Rationale and evidence: DC-27 Appendix B (TD-041). Wire
+field: DC-08 Appendix B. "C" is the highest cutoff held for producer
+W (DC-05 Appendix A.2); "declared" is the sender's applied_upto.
+
+A.1  SCOPE. Applies only on a receiver that holds at least one cutoff.
+     A receiver without a cutoff behaves exactly as §5. Incremental
+     sync is unchanged.
+A.2  REFUSE (supersedes §5.1 for these receivers). For every W with a
+     held cutoff, the receiver declines the offer (no ACCEPT, §7.4)
+     and does not apply a snapshot, as a whole, when:
+       - the declaration is missing or not an object, or
+       - declared[W] is present and not a non-negative integer, or
+       - declared[W] > C.
+     A producer missing from the declaration counts as 0 (DC-02 §2.4,
+     §5). Once one
+     message of a snapshot stream is declined, the rest of the stream
+     is declined. Declining is silent and is not a misbehavior signal.
+A.3  CLAMP (supersedes §5.4 and TR-8 for W). On an applied snapshot:
+         applied_upto[W] := max(applied_upto[W],
+                                min(snapshot_clock[W], C, declared[W]))
+     with declared[W] = 0 when W is missing from the declaration. A
+     clean sender may have applied W below C (declared W:1, C = 3);
+     the receiver then keeps W's seqs above declared[W] needed and
+     pulls them incrementally. The pending and skipped bookkeeping
+     that §5.4 clears up to the new frontier uses the same clamped
+     value. device_clock is merged as in §5.4.
+A.4  RETRIES. Offers stay bounded by the existing limits of §3.5: at
+     most one automatic offer per offer_session_key per session for
+     one trigger instance, a new offer in the same session only on a
+     new trigger instance, and Trigger B bypassing dedup. A declined
+     offer is never retried for the same trigger instance (§7.4); the
+     triggers re-evaluate in the next session.
+A.5  TESTS. DC-27 TR-16 (Appendix B.5), plus: a session with a
+     persistent Trigger A gap toward a tainted peer ends normally with
+     one offer and no ACCEPT, in each of two consecutive sessions.

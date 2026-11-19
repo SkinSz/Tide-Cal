@@ -32,14 +32,18 @@ for entry in "${SIZES[@]}"; do
 done
 
 # .desktop for dev sessions (StartupWMClass matches the binary stem so the
-# running dev window associates with the entry).
+# running dev window associates with the entry). It starts scripts/dev.sh,
+# which rebuilds from the current source first, never the last-built binary
+# directly (a stale binary and backend copy would run otherwise).
 DESKTOP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 mkdir -p "$DESKTOP_DIR"
 cat > "$DESKTOP_DIR/$BUNDLE_ID.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Tide (dev)
-Exec=$PWD/src-tauri/target/debug/app
+Exec=$PWD/scripts/dev.sh
+Path=$PWD
+Terminal=true
 Icon=$BUNDLE_ID
 StartupWMClass=$BIN_STEM
 Categories=Office;Calendar;

@@ -3,6 +3,7 @@
 // tracker, fixed ids/seqs, no sleeps (transport polls resolve on queue
 // emptiness like tests/regression_td001.test.ts).
 import { describe, expect, test, beforeEach, afterEach } from "vitest";
+import { EndpointCache } from "../src/network/endpoint_bridge.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -50,6 +51,7 @@ import {
 } from "../frontend/paired_devices.ts";
 import type { ChangeRecord, VectorClock } from "../src/sync/change_record.ts";
 import type { Database } from "better-sqlite3";
+import { seedEvent } from "./sync_seed_helpers.ts";
 
 const T0 = Date.UTC(2026, 8, 1, 9, 0, 0);
 const BAD = "d-bad";
@@ -431,6 +433,7 @@ describe("TD-006 engine integration", () => {
   });
 
   test("suspension (Level 3) drops intake for the session; a restart (fresh tracker) re-opens it", async () => {
+    seedEvent(db, "evt-td006");
     // Pre-arm the tracker to Level 3 with a deterministic fake clock (the
     // engine path only CONSUMES the gate; escalation timings are unit-tested
     // above without real-time dependence).
@@ -529,7 +532,7 @@ describe("TD-006 dispatcher ops (peer_state / reset / unblock / list_paired_devi
     const core = new EventCore(join(dir, "core.db"), SELF);
     const identity = loadOrCreateIdentity(dir);
     const sync = new SyncManager(core, identity, dir);
-    return { core, sync, dispatch: makeSyncDispatcher(sync, core) };
+    return { core, sync, dispatch: makeSyncDispatcher(sync, core, { endpointCache: new EndpointCache() }) };
   }
 
   function seedPeer(database: Database): void {
@@ -588,7 +591,9 @@ describe("TD-006 dispatcher ops (peer_state / reset / unblock / list_paired_devi
     const devices = line.result.devices as PeerStateRow[];
     expect(devices).toHaveLength(1);
     expect(devices[0]!.device_id).toBe(BAD);
-    expect(devices[0]!.display_name).toBe("Laptop");
+    // DC-28: display_name is the local nickname; the sidecar computes label.
+    expect(devices[0]!.nickname).toBe("Laptop");
+    expect(devices[0]!.label).toBe("Laptop");
     expect(devices[0]!.paired).toBe(true);
     expect(devices[0]!.hard_block).not.toBeNull();
     expect(devices[0]!.hard_block!.trigger_count).toBe(1);
@@ -614,7 +619,12 @@ describe("TD-006 UI shaping (pure layers)", () => {
     window_ratio: 700 / 900,
     dropped_while_throttled: 1234,
     paired: true,
-    display_name: null,
+    // DC-28 §4.9: the sidecar always sends a label ("Device <short id>"
+    // when the device has no name; a legacy id shape uses its first 8).
+    label: "Device x519dead",
+    short_id: "x519dead",
+    nickname: null,
+    announced_name: null,
     paired_at: 1700000000000,
     ladder_label: "throttle",
     hard_block: null,
@@ -624,7 +634,7 @@ describe("TD-006 UI shaping (pure layers)", () => {
   test("Sync-Errors per-peer state: Level 0 peers are silent, notable peers show verbatim numbers", () => {
     const [view] = shapePeerStates([row]);
     expect(view!.notable).toBe(true);
-    expect(view!.display).toBe("x519deadbeef0123…"); // truncated id
+    expect(view!.display).toBe("Device x519dead"); // DC-28 short id, no "…"
     expect(view!.summary).toContain("level 2 (throttle)");
     expect(view!.summary).toContain("700 invalid / 900 received (78%)");
     expect(view!.summary).toContain("1234 dropped while throttled");
@@ -661,10 +671,10 @@ describe("TD-006 UI shaping (pure layers)", () => {
       },
     ]);
     const v = devices[0]!;
-    // Redesign 2026-08-27: unlabeled devices now show the truncated id
-    // (honest) instead of a generic invented placeholder.
-    expect(v.display).toBe("x519deadbeef0123…");
-    expect(v.truncated_id).toBe("x519deadbeef0123…");
+    // DC-28 §4.7 (supersedes the 2026-08-27 truncated id): an unnamed
+    // device shows "Device <short id>", a complete token without "…".
+    expect(v.display).toBe("Device x519dead");
+    expect(v.short_id).toBe("x519dead");
     expect(v.hard_blocked).toBe(true);
     expect(v.hard_block_summary).toContain("2 trigger(s)");
     // Two-step confirm state machine: idle -> confirm -> execute.

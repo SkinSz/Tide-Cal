@@ -2,6 +2,9 @@
 # iCalendar (.ics) Export — Interoperability Boundary Semantics
 Status: APPROVED by project owner (2026-08-29). Implementation NOT yet
         authorized to start — this approval covers the design only.
+Implementation: AUTHORIZED by the owner 2026-09-08 and IMPLEMENTED
+        (4b5e6a8); shipped in v0.1.1. The design-only wording above is
+        historical.
 
 Depends on: Architecture Spec v0.3 §6 (Calendar Domain), §26 (External
             Calendar Formats); DC-01; DC-07 (SQLite schema, v5)

@@ -194,3 +194,33 @@ describe("startSchedulerRuntime factory", () => {
     expect(opened).toHaveLength(0);
   });
 });
+
+describe("SchedulerRuntime: DC-11 A.2 unreachable-peer hook", () => {
+  it("fires for a peer with no endpoint and for a failed session, never for a success", async () => {
+    let kicks = 0;
+    let fail = false;
+    const peers: RuntimePeer[] = [
+      { deviceId: "peer-a", endpoint: { host: "127.0.0.1", port: 41001 } },
+      { deviceId: "peer-c", endpoint: null },
+    ];
+    const runtime = new SchedulerRuntime({
+      scheduler: new Scheduler({ now: () => 1_000_000 }),
+      now: () => 1_000_000,
+      listPeers: () => peers,
+      openSession: async () => {
+        if (fail) throw new Error("connect failed");
+        return true;
+      },
+      onPeerUnreachable: () => kicks++,
+      log: () => {},
+    });
+    runtime.manualSyncNow();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(kicks).toBe(1); // peer-c only (no endpoint); peer-a succeeded
+    peers.splice(1, 1);
+    fail = true;
+    runtime.manualSyncNow();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(kicks).toBe(2); // peer-a's session failed
+  });
+});

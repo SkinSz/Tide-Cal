@@ -335,9 +335,33 @@ function occurrenceScope(): boolean {
   );
 }
 
+/** Reminders held by the event being edited (0 for a new event); drives the notice. */
+let reminderCount = 0;
+
+/**
+ * Shown whenever the event holds more than one reminder and the reminder
+ * option is offered (not whole-day), so it is on screen before any save that
+ * removes reminders. "Remind me" ticked: saving keeps the shown one and
+ * removes the others. Unticked: saving removes all of them.
+ */
+function syncReminderNote(): void {
+  const note = field<HTMLParagraphElement>("ev-remind-note");
+  if (reminderCount > 1 && !wholeDay()) {
+    note.textContent = field<HTMLInputElement>("ev-remind-on").checked
+      ? `This event has ${reminderCount} reminders. Saving keeps only this one.`
+      : `Saving removes all ${reminderCount} reminders.`;
+    note.hidden = false;
+  } else {
+    note.hidden = true;
+  }
+}
+
 function syncTimeVisibility(): void {
   const row = field<HTMLDivElement>("ev-time-row");
   row.style.display = wholeDay() ? "none" : "";
+  // Reminders are not offered for whole-day events (they would never fire).
+  field<HTMLLabelElement>("ev-remind-row").style.display = wholeDay() ? "none" : "";
+  syncReminderNote();
   syncAmPmToggles();
 }
 
@@ -463,6 +487,18 @@ function closeTimeMenus(): void {
 
 function openFor(date: Date, existing?: CalendarEvent): void {
   const d = new Date(date);
+  // Owner bug report 2026-10-12: dblclick on an hour band pre-seeds the
+  // dialog with that band's start — but openFor unconditionally reset to
+  // 09:00, discarding the hour the calendar sent in `date`. Fix: keep the
+  // passed wall-clock time; the 09:00 default applies ONLY when no explicit
+  // time was signaled (btn-new passes a bare selected date at 00:00:00).
+  // Sentinel: hour-band dblclicks always carry a whole-hour time (minute,
+  // second, ms = 0) with hour != 0 marker? No — cleaner: an explicit flag
+  // would thread through two event hops, so instead: honor the passed time
+  // whenever it is NOT midnight (btn-new's selectedDate is midnight;
+  // hour-band times are h:00 with h >= 0). Midnight dblclicks on band 0 are
+  // pre-seeded to 00:00 naturally — indistinguishable and correct either way.
+  const explicitTime = d.getHours() !== 0 || d.getMinutes() !== 0;
   clearInlineError();
   dialogEvent = existing;
   currentSeries = null;
@@ -489,11 +525,21 @@ function openFor(date: Date, existing?: CalendarEvent): void {
       ? toTimeInput(existing.endMs)
       : "23:59";
   } else {
-    d.setHours(9, 0, 0, 0);
-    field<HTMLInputElement>("ev-date").value = toDateInput(d.getTime());
-    field<HTMLInputElement>("ev-allday").checked = false;
-    field<HTMLInputElement>("ev-start-t").value = "09:00";
-    field<HTMLInputElement>("ev-end-t").value = "10:00";
+    if (explicitTime) {
+      // Hour-band dblclick (calendar.ts tide:neweventat): the band IS the
+      // start. End = start + 1h (the band's own convention).
+      field<HTMLInputElement>("ev-date").value = toDateInput(d.getTime());
+      field<HTMLInputElement>("ev-allday").checked = false;
+      field<HTMLInputElement>("ev-start-t").value = toTimeInput(d.getTime());
+      const end = new Date(d.getTime() + 60 * 60 * 1000);
+      field<HTMLInputElement>("ev-end-t").value = toTimeInput(end.getTime());
+    } else {
+      d.setHours(9, 0, 0, 0);
+      field<HTMLInputElement>("ev-date").value = toDateInput(d.getTime());
+      field<HTMLInputElement>("ev-allday").checked = false;
+      field<HTMLInputElement>("ev-start-t").value = "09:00";
+      field<HTMLInputElement>("ev-end-t").value = "10:00";
+    }
   }
 
   (dlg().querySelector("#dialog-title") as HTMLElement).textContent = existing
@@ -518,6 +564,8 @@ function openFor(date: Date, existing?: CalendarEvent): void {
   // Save writes whatever the checkbox shows at click time).
   field<HTMLInputElement>("ev-remind-on").checked = false;
   field<HTMLSelectElement>("ev-remind-minutes").value = "15";
+  reminderCount = 0;
+  syncReminderNote();
   if (existing) {
     void getReminder(existing.id)
       .then((rem) => {
@@ -525,6 +573,10 @@ function openFor(date: Date, existing?: CalendarEvent): void {
           field<HTMLInputElement>("ev-remind-on").checked = true;
           field<HTMLSelectElement>("ev-remind-minutes").value = String(rem.minutesBefore);
         }
+        // Several reminders (added on different devices): the dialog shows the
+        // first by a fixed rule (same on every device) and says so before saving.
+        reminderCount = rem?.count ?? (rem ? 1 : 0);
+        syncReminderNote();
       })
       .catch((e) => console.warn("[tide] reminder lookup unavailable:", e));
   }
@@ -611,6 +663,7 @@ export function initDialog(): void {
   });
 
   field("ev-allday").addEventListener("change", syncTimeVisibility);
+  field("ev-remind-on").addEventListener("change", syncReminderNote);
 
   // DC-12 rule builder: freq select, interval, weekday toggles.
   field("ev-repeat").addEventListener("change", syncRepeatVisibility);
@@ -847,14 +900,18 @@ export function initDialog(): void {
               await updateSeriesRule(currentSeries.seriesId, rule);
             }
           }
-          // DC-22: reminder member follows the checkbox (update path).
-          if (field<HTMLInputElement>("ev-remind-on").checked) {
-            await setReminder(
-              id,
-              Number(field<HTMLSelectElement>("ev-remind-minutes").value),
-            );
-          } else {
-            await clearReminder(id);
+          // DC-22: reminder member follows the checkbox (update path). The option
+          // is hidden for whole-day events; saving one leaves any existing
+          // reminder untouched and writes no reminder change.
+          if (!wholeDay()) {
+            if (field<HTMLInputElement>("ev-remind-on").checked) {
+              await setReminder(
+                id,
+                Number(field<HTMLSelectElement>("ev-remind-minutes").value),
+              );
+            } else {
+              await clearReminder(id);
+            }
           }
         } else {
           // New event: optional create-time RRULE makes it a series (DC-12 §2.1).
@@ -863,7 +920,7 @@ export function initDialog(): void {
             rule ? { ...input, recurrenceRule: rule } : input,
           );
           // DC-22: reminder member follows the checkbox (create path).
-          if (field<HTMLInputElement>("ev-remind-on").checked) {
+          if (!wholeDay() && field<HTMLInputElement>("ev-remind-on").checked) {
             await setReminder(
               saved.id,
               Number(field<HTMLSelectElement>("ev-remind-minutes").value),

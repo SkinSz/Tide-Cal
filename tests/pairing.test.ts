@@ -1,5 +1,7 @@
-// Tide DC-05 §5/§6.1 tests: QR payload codec, safety number, pairing session.
-// Covers TR-9 (QR tampering), TR-5/TR-6 (MITM simulation), TR-10 (nonce freshness).
+// Tide DC-05 §5/§6.1 tests: pairing code codec (v2, Appendix B), safety
+// number, pairing session. Covers TR-9 (code tampering), TR-5/TR-6 (MITM
+// simulation), TR-10 (nonce freshness); the Appendix B code rules (TR-B5,
+// TR-B6) are in tests/dc05b_pairing_proof.test.ts.
 
 import { createHash } from "node:crypto";
 import { describe, expect, test } from "vitest";
@@ -13,62 +15,60 @@ import {
   PairingError,
   PairingSession,
   createNonceStore,
-  decodePairingPayload,
-  encodePairingPayload,
+  decodeCeremonyPayload,
+  decodePairingCode,
+  encodePairingCode,
   freshNonce,
   isKnownNonce,
   recordNonce,
   safetyNumber,
 } from "../src/security/pairing.ts";
 
+/** A valid v2 code as an object (Appendix B.2). */
 function validPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   const id = generateIdentity();
   return {
-    v: 1,
+    v: 2,
     device_id: id.deviceId,
     public_key: Buffer.from(id.publicKey).toString("base64"),
     nonce: freshNonce(),
+    secret: freshNonce(), // 16 bytes, canonical base64
+    connect: { ip: "192.168.1.20", port: 48710 },
     ...overrides,
   };
 }
 
-describe("DC-05 §5.1 QR payload round-trip", () => {
-  test("full payload (connect + name) survives encode -> decode", () => {
-    const p = validPayload({
-      connect: { ip: "192.168.1.20", port: 48710 },
-      name: "Alice's Laptop",
-    });
-    const decoded = decodePairingPayload(encodePairingPayload(p as never));
-    expect(decoded.v).toBe(1);
+/** A ceremony payload (Appendix B.7) from its JSON text. */
+const cp = (text: string) => decodeCeremonyPayload(JSON.parse(text));
+
+describe("DC-05 §5.1 / B.2 pairing code round-trip", () => {
+  test("full code survives encode -> decode", () => {
+    const p = validPayload();
+    const decoded = decodePairingCode(encodePairingCode(p as never));
+    expect(decoded.v).toBe(2);
     expect(decoded.device_id).toBe(p.device_id);
     expect(decoded.public_key).toBe(p.public_key);
     expect(decoded.nonce).toBe(p.nonce);
+    expect(decoded.secret).toBe(p.secret);
     expect(decoded.connect).toEqual({ ip: "192.168.1.20", port: 48710 });
-    expect(decoded.name).toBe("Alice's Laptop");
-  });
-
-  test("minimal payload (no connect/name) decodes with undefined optionals", () => {
-    const p = validPayload();
-    const decoded = decodePairingPayload(JSON.stringify(p));
-    expect(decoded.connect).toBeUndefined();
-    expect(decoded.name).toBeUndefined();
   });
 
   test("canonical encoding: key order independent of input property order", () => {
-    const a = encodePairingPayload(validPayload() as never);
+    const a = encodePairingCode(validPayload() as never);
     const reordered = JSON.parse(a);
     const b = JSON.stringify(Object.fromEntries(Object.entries(reordered).reverse()));
     // Both orderings must produce the identical canonical string on re-encode.
-    expect(decodePairingPayload(b)).toEqual(decodePairingPayload(a));
-    expect(encodePairingPayload(decodePairingPayload(b))).toBe(a);
+    expect(decodePairingCode(b)).toEqual(decodePairingCode(a));
+    expect(encodePairingCode(decodePairingCode(b))).toBe(a);
+    expect(Object.keys(JSON.parse(a))).toEqual(["v", "device_id", "public_key", "nonce", "secret", "connect"]);
   });
 });
 
-describe("DC-05 TR-9 malformed/tampered payloads rejected", () => {
+describe("DC-05 TR-9 malformed/tampered codes rejected", () => {
   function expectCode(raw: string | Record<string, unknown>, code: string) {
     let err: unknown;
     try {
-      decodePairingPayload(typeof raw === "string" ? raw : JSON.stringify(raw));
+      decodePairingCode(typeof raw === "string" ? raw : JSON.stringify(raw));
     } catch (e) {
       err = e;
     }
@@ -77,9 +77,10 @@ describe("DC-05 TR-9 malformed/tampered payloads rejected", () => {
   }
 
   test("bad version -> BAD_VERSION", () => {
-    expectCode(validPayload({ v: 2 }), "BAD_VERSION");
+    expectCode(validPayload({ v: 1 }), "BAD_VERSION");
+    expectCode(validPayload({ v: 3 }), "BAD_VERSION");
     expectCode(validPayload({ v: 0 }), "BAD_VERSION");
-    expectCode(validPayload({ v: "1" }), "BAD_VERSION");
+    expectCode(validPayload({ v: "2" }), "BAD_VERSION");
   });
 
   test("short nonce (<128 bits) -> SHORT_NONCE", () => {
@@ -136,7 +137,7 @@ describe("DC-05 TR-9 malformed/tampered payloads rejected", () => {
   test("tampered value never enters trust flow: decode throws before any use", () => {
     const good = validPayload();
     const tampered = { ...good, device_id: `d-${"a".repeat(64)}`, extra: 1 };
-    expect(() => decodePairingPayload(JSON.stringify(tampered))).toThrow(PairingError);
+    expect(() => decodePairingCode(JSON.stringify(tampered))).toThrow(PairingError);
   });
 });
 
@@ -228,28 +229,28 @@ describe("DC-05 TR-10 nonce freshness", () => {
 
   test("freshNonce is valid >=128-bit base64 accepted by the decoder", () => {
     const p = validPayload({ nonce: freshNonce() });
-    expect(decodePairingPayload(JSON.stringify(p)).nonce).toBe(p.nonce);
+    expect(decodePairingCode(JSON.stringify(p)).nonce).toBe(p.nonce);
   });
 });
 
 describe("DC-05 §6.1 pairing session state machine", () => {
   function makeSession(local: ReturnType<typeof generateIdentity>, remotePayload: string) {
     const s = new PairingSession();
-    const localPayload = decodePairingPayload(
-      encodePairingPayload({
-        v: 1,
+    const localPayload = cp(
+      JSON.stringify({
+        v: 2,
         device_id: local.deviceId,
         public_key: Buffer.from(local.publicKey).toString("base64"),
         nonce: freshNonce(),
       }),
     );
-    s.exchangePayloads(localPayload, decodePairingPayload(remotePayload));
+    s.exchangePayloads(localPayload, cp(remotePayload));
     return s;
   }
 
   function qrFor(id: ReturnType<typeof generateIdentity>): string {
-    return encodePairingPayload({
-      v: 1,
+    return JSON.stringify({
+      v: 2,
       device_id: id.deviceId,
       public_key: Buffer.from(id.publicKey).toString("base64"),
       nonce: freshNonce(),
@@ -382,13 +383,13 @@ describe("DC-05 §6.1 pairing session state machine", () => {
       const s = new PairingSession();
       s.exchangePayloads(
         {
-          v: 1,
+          v: 2,
           device_id: local.deviceId,
           public_key: announcedPk(local),
           nonce: freshNonce(),
         },
         {
-          v: 1,
+          v: 2,
           device_id: `d-${createHash("sha256").update(attacker.publicKey).digest("hex")}`,
           public_key: announcedPk(attacker),
           nonce: freshNonce(),
@@ -423,8 +424,8 @@ describe("Review-3 H-1: REAL Noise_XX handshake bound to Ed25519 identities", ()
   // therefore pass for the TRUE peer's handshake static (converted) and fail
   // for a MITM-substituted key.
   function qrPayloadFor(id: ReturnType<typeof generateIdentity>): string {
-    return encodePairingPayload({
-      v: 1,
+    return JSON.stringify({
+      v: 2,
       device_id: id.deviceId,
       public_key: Buffer.from(id.publicKey).toString("base64"),
       nonce: freshNonce(),
@@ -443,8 +444,8 @@ describe("Review-3 H-1: REAL Noise_XX handshake bound to Ed25519 identities", ()
 
     // Scanner side (Bob): scanned ALICE's QR, verifies what his transport learned.
     const sessionAtBob = new PairingSession();
-    const localAtBob = decodePairingPayload(qrPayloadFor(bob));
-    const scannedQr = decodePairingPayload(qrPayloadFor(alice));
+    const localAtBob = cp(qrPayloadFor(bob));
+    const scannedQr = cp(qrPayloadFor(alice));
     sessionAtBob.exchangePayloads(localAtBob, scannedQr);
     sessionAtBob.bindTranscript(bobTransport.handshakeHash());
     // V1/V2 in the SAME key space: convert the QR's Ed25519 key, compare to
@@ -477,8 +478,8 @@ describe("Review-3 H-1: REAL Noise_XX handshake bound to Ed25519 identities", ()
 
     const sessionAtBob = new PairingSession();
     sessionAtBob.exchangePayloads(
-      decodePairingPayload(qrPayloadFor(bob)),
-      decodePairingPayload(qrPayloadFor(alice)), // Bob scanned ALICE's QR...
+      cp(qrPayloadFor(bob)),
+      cp(qrPayloadFor(alice)), // Bob scanned ALICE's QR...
     );
     sessionAtBob.bindTranscript(bobTransport.handshakeHash());
 
@@ -502,8 +503,8 @@ describe("Review-3 H-1: REAL Noise_XX handshake bound to Ed25519 identities", ()
 
 describe("Review-3 M-4 / TR-10 second clause: session-layer nonce-reuse memory", () => {
   function payloadWith(nonce: string, id = generateIdentity()): string {
-    return encodePairingPayload({
-      v: 1,
+    return JSON.stringify({
+      v: 2,
       device_id: id.deviceId,
       public_key: Buffer.from(id.publicKey).toString("base64"),
       nonce,
@@ -514,21 +515,26 @@ describe("Review-3 M-4 / TR-10 second clause: session-layer nonce-reuse memory",
     const local = generateIdentity();
     const remote = generateIdentity();
 
-    // Ceremony #1: fresh payload accepted; its nonce enters the memory.
+    // Ceremony #1: fresh payload accepted; its nonce enters the memory
+    // once the binding check passed (Appendix B.7: recorded after V2).
     const s1 = new PairingSession();
-    const first = decodePairingPayload(payloadWith(freshNonce(), remote));
-    s1.exchangePayloads(decodePairingPayload(payloadWith(freshNonce(), local)), first);
+    const first = cp(payloadWith(freshNonce(), remote));
+    s1.exchangePayloads(cp(payloadWith(freshNonce(), local)), first);
     expect(s1.state).toBe("payload_exchanged");
+    expect(isKnownNonce(first.nonce, PairingSession.recentNonces)).toBe(false);
+    s1.bindTranscript(new Uint8Array(32).fill(5));
+    s1.verifyRemoteStatic(ed25519ToX25519PublicKey(remote.publicKey));
+    expect(isKnownNonce(first.nonce, PairingSession.recentNonces)).toBe(true);
 
     // Ceremony #2: crafted replay of the SAME nonce (fresh everything else).
     const s2 = new PairingSession();
-    const reused = decodePairingPayload(payloadWith(first.nonce, generateIdentity()));
+    const reused = cp(payloadWith(first.nonce, generateIdentity()));
     expect(() =>
-      s2.exchangePayloads(decodePairingPayload(payloadWith(freshNonce(), local)), reused),
+      s2.exchangePayloads(cp(payloadWith(freshNonce(), local)), reused),
     ).toThrow(PairingError);
     try {
       new PairingSession().exchangePayloads(
-        decodePairingPayload(payloadWith(freshNonce(), local)),
+        cp(payloadWith(freshNonce(), local)),
         reused,
       );
     } catch (e) {

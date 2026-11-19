@@ -18,6 +18,16 @@ import { createHash } from "node:crypto";
 
 let runCounter = 0;
 
+/**
+ * Snapshots are off by default in the engine. A test file whose subject is
+ * snapshot / offer traffic calls useSnapshots() once so the engines this
+ * helper builds opt in (`snapshots: true`). The default stays off.
+ */
+let snapshotsOptIn = false;
+export function useSnapshots(on = true): void {
+  snapshotsOptIn = on;
+}
+
 export interface Device {
   tag: string;
   dir: string;
@@ -120,11 +130,13 @@ export async function sessionOnce(
     db: from.db,
     selfDeviceId: from.identity.deviceId,
     mutateEntity: makeEntityMutator(),
+    snapshots: snapshotsOptIn,
   });
   const engTo = createSyncEngine({
     db: to.db,
     selfDeviceId: to.identity.deviceId,
     mutateEntity: makeEntityMutator(),
+    snapshots: snapshotsOptIn,
   });
   let fromStats: Record<string, number> = {};
   let toStats: Record<string, number> = {};

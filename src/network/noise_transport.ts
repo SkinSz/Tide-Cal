@@ -213,6 +213,17 @@ export function noiseStaticsFromIdentity(
  */
 class FrameQueue {
   private queue: Uint8Array[] = [];
+  /**
+   * TD-019 F4, deliberately ONE slot ("newest receive wins"). The sync engine
+   * builds a fresh nextMessage() cache per protocol phase and its poll
+   * helpers race receive() against short timers, so a phase can end with an
+   * ABANDONED pending receive. The next phase's receive() replaces that
+   * waiter here, so the next frame goes to the live caller. A FIFO of
+   * waiters would hand that frame to the abandoned promise instead: it would
+   * be decrypted (advancing the nonce) and silently dropped. Do not turn
+   * this into a queue unless the engine first guarantees a single receive
+   * per session (pinned by tests/td007_td019_hygiene.test.ts).
+   */
   private waiter: ((frame: Uint8Array | null) => void) | null = null;
   private closed = false;
 
@@ -554,7 +565,8 @@ export type XxRole = "initiator" | "responder";
  * (e.g. length-prefix-framed TCP from sync_runtime) and return the encrypted
  * session transport bound to that carrier.
  *
- * DC-05 §5.3 roles: QR displayer = INITIATOR, scanner = RESPONDER; for
+ * DC-05 §5.3 roles as amended by Appendix B.11 (P11): the displayer listens
+ * and is the RESPONDER, the scanner connects and is the INITIATOR; for
  * post-pairing sync sessions either role assignment is valid (XX symmetry).
  *
  * Same fail-closed semantics as makeLocalDuplexPair: any handshake error
@@ -587,6 +599,13 @@ export async function handshakeOverTransport(
       outQ.push(frame);
     }
   };
+  // TD-019 F4 (pump), documented, not changed: this loop never returns on
+  // its own; after the session it stays parked on `waiting`. That is NOT an
+  // unbounded leak: the parked promise is reachable only through this
+  // session's handle (fakeQueue/pushOut), so it is garbage-collected with
+  // the handle. Ending it early (e.g. when the inbound feed ends) would
+  // change behavior for half-closed carriers whose send side still works,
+  // which is a protocol change, not hygiene.
   const pump = (async () => {
     for (;;) {
       const frame =

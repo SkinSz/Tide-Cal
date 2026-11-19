@@ -1,6 +1,13 @@
 /* Tide DC-20 options window — Outlook-style: left nav pane + right content.
    Owned by the options window only; does not touch calendar styles. */
 
+/* Same viewport-bound root scaling as style.css (owner request 2026-11-12):
+   the options window is smaller (fixed inner size), so use a slightly higher
+   coefficient to land in the same visual range as the main window. */
+html {
+  font-size: clamp(12px, 1.2vw + 5px, 20px);
+}
+
 .options-body {
   margin: 0;
   background: var(--bg);
