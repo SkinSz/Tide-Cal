@@ -14,6 +14,7 @@ stable, independent final verification PASS WITH CONCERNS with zero new issues).
 This file is the single register of known defects, risks and accepted limitations. Every item has one TD number and appears once; related items are cross-referenced, not duplicated.
 
 Rule: no finding may live only in a branch or worktree. Before a branch or worktree is frozen or abandoned, its findings are moved into this register.
+Rule: a claim about catch-up, transport or sync between devices counts as PROVEN only when a test on real instances over the real transport (built sidecars, TCP + Noise) shows it. A result from in-process tests alone is recorded as in-process only, not as PROVEN.
 
 Status vocabulary used in the overview (each entry's own Status line below keeps its original wording and history):
 - FIXED: done.
@@ -133,20 +134,25 @@ Operating constraint: full-state snapshots and change-log truncation are off (DC
 | TD-101 | Change-log truncation was found unwired and is kept off | CLOSED BY DECISION | TD-046 |
 | TD-102 | Conflict contents depend on the order in which changes arrive | CONFLICT ENGINE | TD-088, TD-094 |
 | TD-103 | The value shown under an open conflict differs between devices | CLOSED BY DECISION | TD-102 |
+| TD-104 | A running build does not show which source commit it was built from | OPEN | TD-082 |
+| TD-105 | Some sync and connection errors reach the user in technical wording | OPEN | TD-064 |
+| TD-106 | A sync can still report success while changes are missing (unmerged TD-064 fix) | OPEN | TD-064, TD-065 |
+| TD-107 | Any endpoint can trigger or read the protocol version signal (unmerged TD-064 fix) | OPEN | TD-064 |
+| TD-108 | Sync connections stay half-open after a normal end until the peer closes | OPEN | TD-068 |
 
 Count per status:
 
 | Status | Count |
 |---|---|
 | FIXED | 33 |
-| OPEN | 41 |
-| CONFLICT ENGINE | 10 |
+| OPEN | 46 |
+| CONFLICT ENGINE | 11 |
 | NEEDS DECISION | 2 |
 | DORMANT WHILE SNAPSHOTS ARE OFF | 6 |
 | ACCEPTED LIMITATION | 2 |
-| CLOSED BY DECISION | 5 |
+| CLOSED BY DECISION | 6 |
 | MERGED | 1 |
-| **Total** | **100** |
+| **Total** | **107** |
 
 ---
 
@@ -1011,3 +1017,33 @@ Count per status:
 - **Title:** While a conflict is unresolved, each device keeps showing its own local value (DC-03 §3.3/§3.4), so devices with the same changes can show different values until the conflict is resolved. Decided as intended behaviour: values must converge after resolution, not while a conflict is open; the conflict record itself must converge (TD-102).
 - **Priority:** n/a
 - **Status:** CLOSED BY DECISION
+
+## TD-104 — A running build does not show which source commit it was built from
+- **ID:** TD-104
+- **Title:** Neither the shell nor the sidecar records the source commit it was built from, and the app has no About or Info screen. A dev instance started from an old binary and an old copy of the sidecar ran for days unnoticed while its UI came from current source. Required: log the git commit hash (marked when built from a modified tree) at startup and show it, for the shell and the sidecar separately, in an About/Info screen, so a stale build is visible immediately. Related: TD-082.
+- **Priority:** 8/10 — HIGH (every test on real devices depends on knowing which build is running)
+- **Status:** OPEN. An implementation exists unmerged. Known limit of that implementation: the shell's build script re-runs only when listed paths change, so the shell's "modified tree" mark can lag for edits outside them; the sidecar's mark is computed at every sidecar build.
+
+## TD-105 — Some sync and connection errors reach the user in technical wording
+- **ID:** TD-105
+- **Title:** Several failure paths show internal wording instead of plain language: "initiator/responder: decryption failed" when a peer is killed or resets during a session; "protocol violation: expected HELLO, got closed" when the peer closes before its HELLO (this is also what a refused device sees); "peer closed in the middle of a message"; "connect ECONNREFUSED <host>:<port>"; and a handshake timeout that names the Noise handshake. With the unmerged TD-064 fix, an oversized header during setup is worded as "the connection was closed during setup" where "did not answer as expected" fits. The failure itself is reported as a failure on these paths; only the wording is technical.
+- **Priority:** 2/10 — LOW (wording only)
+- **Status:** OPEN
+
+## TD-106 — A sync can still report success while changes are missing (unmerged TD-064 fix)
+- **ID:** TD-106
+- **Title:** Found by review of the unmerged TD-064 fix, PROVEN on real built instances over TCP + Noise. The serving device answers one request with many batches (TD-065); the pulling device reads one batch per round and stops after 10 rounds. If the server's acknowledgement has already arrived (for example because the devices were in sync before a large import on the server) and the server's connection then ends cleanly after its 10th or 11th batch, the pull is reported as a success: with 3,001 new events, the receiver held 2,560 or 2,816 and sync reported OK. After the 9th batch the same cut is correctly reported as a failure. A clean connection end is not proof that every change arrived. Until this is fixed, TD-064 is not fixed. The direction agreed for the fix: a sync counts as complete only when the receiver holds every change the server announced for the session; an incomplete sync is shown as progress, not as success or failure, and the next session resumes. Related: TD-064, TD-065.
+- **Priority:** 8/10 — HIGH (reports success for data the receiver does not have)
+- **Status:** OPEN
+
+## TD-107 — Any endpoint can trigger or read the protocol version signal (unmerged TD-064 fix)
+- **ID:** TD-107
+- **Title:** With the unmerged TD-064 fix, a dialing device reports "incompatible version" when it receives the explicit version refusal or a complete second handshake message that fails authentication. A hostile endpoint the user dials (a manual host:port or a spoofed address) can produce either and make the user see "update Tide". The version tag travels in plain text, and a responder that receives an empty first message answers with a refusal naming its version, so any host on the network can identify Tide and its protocol version. No downgrade is possible: only the current tag is accepted.
+- **Priority:** 2/10 — LOW (misleading message, no data effect; needs an active attacker on the network)
+- **Status:** OPEN
+
+## TD-108 — Sync connections stay half-open after a normal end until the peer closes
+- **ID:** TD-108
+- **Title:** After a normal end of a sync or pairing session the local side sends its close but does not destroy the socket; the connection and its file descriptor stay open until the peer closes. With the unmerged TD-064/TD-068 fixes intake is stopped after the close, so memory is bounded, but the descriptor is held for as long as a paired or pairing peer keeps the connection open.
+- **Priority:** 2/10 — LOW (resource held per connection; requires a paired or pairing peer)
+- **Status:** OPEN
