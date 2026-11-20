@@ -179,13 +179,15 @@ function installDom(): void {
 
 
 let events: CalendarEvent[] = [];
+// When set, updateEvent stays pending until the gate resolves (save in flight).
+let gate: Promise<void> | null = null;
 const updates: Array<{ id: string; input: EventInput }> = [];
 
 function installBridge(): void {
   const bridge = {
     listEvents: () => events.slice(),
     createEvent(input: EventInput) { return { id: "evt-new", ...input }; },
-    updateEvent(id: string, input: EventInput) { updates.push({ id, input }); return { id, ...input }; },
+    updateEvent(id: string, input: EventInput) { updates.push({ id, input }); return gate ? gate.then(() => ({ id, ...input })) : { id, ...input }; },
     deleteEvent() {},
     listSeries: () => [],
   } as unknown as EventStoreBridge;
@@ -204,6 +206,7 @@ beforeEach(() => {
   rem.all.length = 0;
   rem.sets.length = 0;
   rem.clears.length = 0;
+  gate = null;
   initDialog();
   vi.spyOn(console, "warn").mockImplementation(() => {});
 });
@@ -277,4 +280,28 @@ describe("TD-087: a save made before the reminder lookup returned", () => {
     await settle();
     expect(note.hidden).toBe(true);
   });
+
+  // Race: Save is clicked while the lookup is loading; the lookup answers while
+  // the save is still waiting for the event update. The decision to write a
+  // reminder is taken at click time, so no reminder write may follow.
+  for (const [name, answer] of [
+    ["a stored enabled reminder", { minutesBefore: 30, enabled: true, count: 1 }],
+    ["several stored reminders", { minutesBefore: 30, enabled: true, count: 2 }],
+    ["a stored disabled reminder", { minutesBefore: 30, enabled: false, count: 1 }],
+  ] as const) {
+    test(`lookup answers while the save is in flight (${name}): no reminder write (no set, no clear)`, async () => {
+      let release!: () => void;
+      gate = new Promise<void>((r) => { release = r; });
+      await openOn(evt());
+      byId.get("ev-save")!.dispatch("click"); // Save while loading
+      await settle();
+      rem.pending!.resolve(answer); // the lookup answers during the save
+      await settle();
+      release(); // the event update answers
+      await settle();
+      await settle();
+      expect(rem.sets, "setReminder() ran from a lookup answer that arrived mid-save").toEqual([]);
+      expect(rem.clears, "clearReminder() ran from a lookup answer that arrived mid-save").toEqual([]);
+    });
+  }
 });

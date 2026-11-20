@@ -117,7 +117,7 @@ Operating constraint: full-state snapshots and change-log truncation are off (DC
 | TD-084 | Recurring event that cannot be expanded for the alarm is only logged | OPEN | - |
 | TD-085 | A resolution on the conflict screen does not restore a deleted event | CONFLICT ENGINE | TD-070, TD-096 |
 | TD-086 | Reminder replay cost grows quadratically with edits of one reminder | OPEN | - |
-| TD-087 | Saving the event dialog before its reminder lookup finishes can clear reminders | OPEN | - |
+| TD-087 | Saving the event dialog before its reminder lookup finishes can clear reminders | FIXED | - |
 | TD-088 | Conflict resolution status does not travel between devices | CONFLICT ENGINE | TD-094 |
 | TD-089 | Unpairing warning: show which devices have not confirmed an unpairing | OPEN | TD-071 |
 | TD-090 | Relay of advertised-but-unservable changes was never tested | OPEN | TD-072 |
@@ -134,17 +134,19 @@ Operating constraint: full-state snapshots and change-log truncation are off (DC
 | TD-101 | Change-log truncation was found unwired and is kept off | CLOSED BY DECISION | TD-046 |
 | TD-102 | Conflict contents depend on the order in which changes arrive | CONFLICT ENGINE | TD-088, TD-094 |
 | TD-103 | The value shown under an open conflict differs between devices | CLOSED BY DECISION | TD-102 |
-| TD-104 | A running build does not show which source commit it was built from | OPEN | TD-082 |
+| TD-104 | A running build does not show which source commit it was built from | FIXED | TD-082 |
 | TD-105 | Some sync and connection errors reach the user in technical wording | OPEN | TD-064 |
 | TD-106 | A sync can still report success while changes are missing (unmerged TD-064 fix) | OPEN | TD-064, TD-065 |
 | TD-107 | Any endpoint can trigger or read the protocol version signal (unmerged TD-064 fix) | OPEN | TD-064 |
 | TD-108 | Sync connections stay half-open after a normal end until the peer closes | OPEN | TD-068 |
+| TD-109 | Tests leave temporary folders behind and use a hard-coded /tmp path | OPEN | - |
+| TD-110 | Test suite inventory: levels, stand-ins, duplicates, transport coverage | OPEN | TD-109 |
 
 Count per status:
 
 | Status | Count |
 |---|---|
-| FIXED | 33 |
+| FIXED | 35 |
 | OPEN | 46 |
 | CONFLICT ENGINE | 11 |
 | NEEDS DECISION | 2 |
@@ -152,7 +154,7 @@ Count per status:
 | ACCEPTED LIMITATION | 2 |
 | CLOSED BY DECISION | 6 |
 | MERGED | 1 |
-| **Total** | **107** |
+| **Total** | **109** |
 
 ---
 
@@ -920,7 +922,7 @@ Count per status:
 - **ID:** TD-087
 - **Title:** The dialog loads the event's reminder asynchronously; until the lookup returns (or if it fails), the "Remind me" checkbox shows the no-reminder state. Saving a timed event in that window clears the event's reminders without the several-reminders notice. Over local IPC the window is in the millisecond range. Fix: disable saving until the lookup has returned, or skip reminder changes when the lookup did not complete.
 - **Priority:** 2/10 — LOW (narrow timing window)
-- **Status:** OPEN.
+- **Status:** RESOLVED (2026-11-20). The dialog keeps a per-open lookup state (loading, loaded, failed). A late answer from an earlier open is ignored. Saving writes no reminder change unless the lookup for that open returned; while it loads or after it fails, a notice says that saving leaves the event's reminders unchanged. Tests: `tests/td087_dialog_lookup.test.ts`.
 
 ## TD-088 — Conflict resolution status does not travel between devices
 - **ID:** TD-088
@@ -1022,7 +1024,7 @@ Count per status:
 - **ID:** TD-104
 - **Title:** Neither the shell nor the sidecar records the source commit it was built from, and the app has no About or Info screen. A dev instance started from an old binary and an old copy of the sidecar ran for days unnoticed while its UI came from current source. Required: log the git commit hash (marked when built from a modified tree) at startup and show it, for the shell and the sidecar separately, in an About/Info screen, so a stale build is visible immediately. Related: TD-082.
 - **Priority:** 8/10 — HIGH (every test on real devices depends on knowing which build is running)
-- **Status:** OPEN. An implementation exists unmerged. Known limit of that implementation: the shell's build script re-runs only when listed paths change, so the shell's "modified tree" mark can lag for edits outside them; the sidecar's mark is computed at every sidecar build.
+- **Status:** RESOLVED (2026-11-20). The sidecar and the shell each log `build <12-digit commit>` at startup (suffix `-dirty` for a modified tree, `unknown` without git), and Options → About shows both labels separately. Tests: `tests/td104_build_hash.test.ts`. Known limits: the shell's build script does not re-run when only the commit message changes (amend, empty commit, soft reset), which gives a falsely older label; a change to `Cargo.lock` alone is not marked as modified; the excluded resources folder also holds shipped dependency files, so edits there are not marked; a committed sidecar bundle carries its parent commit's label until it is rebuilt. Also, the shell's build script re-runs only when listed paths change, so the shell's "modified tree" mark can lag for edits outside them; the sidecar's mark is computed at every sidecar build. Also: a source tree unpacked inside another git repository reports that repository's commit (marked as modified); a sidecar too old to know the build-info request shows its label as "unavailable".
 
 ## TD-105 — Some sync and connection errors reach the user in technical wording
 - **ID:** TD-105
@@ -1046,4 +1048,16 @@ Count per status:
 - **ID:** TD-108
 - **Title:** After a normal end of a sync or pairing session the local side sends its close but does not destroy the socket; the connection and its file descriptor stay open until the peer closes. With the unmerged TD-064/TD-068 fixes intake is stopped after the close, so memory is bounded, but the descriptor is held for as long as a paired or pairing peer keeps the connection open.
 - **Priority:** 2/10 — LOW (resource held per connection; requires a paired or pairing peer)
+- **Status:** OPEN
+
+## TD-109 — Tests leave temporary folders behind and use a hard-coded /tmp path
+- **ID:** TD-109
+- **Title:** Several test helpers create temporary database folders (`/tmp/tide-pkg1-*`) and do not remove them, and `tests/probes/sync_probe_helpers.ts` writes to a fixed `/tmp/tide-probe-qa` path that ignores TMPDIR. On a machine with a size-limited /tmp, leftovers from earlier runs (13,424 folders and about 3 GB observed) filled /tmp until tests failed with "database or disk is full"; two full runs add roughly 160 MB. Fix: remove each temporary folder after the test, and derive all test paths from the operating system's temp directory.
+- **Priority:** 4/10 — MEDIUM (makes the test suite fail on its own leftovers)
+- **Status:** OPEN
+
+## TD-110 — Test suite inventory: levels, stand-ins, duplicates, transport coverage
+- **ID:** TD-110
+- **Title:** The suite has about 1,300 tests and has never been inventoried. Analysis only, nothing deleted or changed: group the tests by level (single function / in-process engine / real instances over the real transport); list tests that exercise a copy, mock or scripted stand-in instead of the production code path, and whether that hides real behaviour; list likely duplicates (same setup, same assertion); and, most important, list the sync guarantees (no loss, no false success, convergence, catch-up) that are covered only in-process and never over the real transport. Report as a table; changes are decided afterwards.
+- **Priority:** 5/10 — MEDIUM (unknown overlap and gaps in transport coverage)
 - **Status:** OPEN

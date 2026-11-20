@@ -20,6 +20,7 @@
 //   update_series_rule {series_id, rule}      -> {seriesId, recurrenceRule}
 //   update_occurrence {series_id, recurrence_id, patch} -> {seriesId, recurrenceId, changed}
 
+import { getBuildInfo } from "../../application/build_info.ts";
 import { createInterface } from "node:readline";
 import {
   EventCore,
@@ -1297,6 +1298,9 @@ export function makeSyncDispatcher(
   };
   return (op, args) => {
     switch (op) {
+      // TD-104: which commit this backend was built from (About screen).
+      case "build_info":
+        return getBuildInfo();
       case "device_info": {
         const peers = listTrustedPeers(core.db);
         return {
@@ -1602,6 +1606,7 @@ function main(): void {
     process.env.TIDE_DATA_DIR ??
       dbPath.replace(/[/\\][^/\\]+$/, "") ?? ".",
   );
+  console.error(`[tide] build ${getBuildInfo().label}`);
   const core = new EventCore(dbPath, syncIdentity.deviceId);
   // DC-22 / TD-073: rebuild reminder rows from reminder changes already in
   // history (idempotent; every start, before the first alarm check).
@@ -1654,7 +1659,7 @@ function main(): void {
           schedulerHandle.updateSchedulerSettings(partial);
           return { applied: true, next_start_only: "max_incremental_backlog" };
         })()
-      : op.startsWith("sync_") || op === "device_info" ||
+      : op.startsWith("sync_") || op === "device_info" || op === "build_info" ||
     op === "pairing_offer" || op === "pairing_accept" ||
     op === "cancel_pairing_offer" || op === "pairing_offer_status" ||
     op === "list_quarantine" || op === "quarantine_stats" ||

@@ -14,6 +14,7 @@
         <h1 class="options-title">Tide Options</h1>
         <button class="options-nav-item active" data-category="sync" type="button">Sync</button>
         <button class="options-nav-item" data-category="general" type="button">General</button>
+        <button class="options-nav-item" data-category="about" type="button">About</button>
       </nav>
       <main class="options-content" id="options-content">
         <section class="options-category" data-category-content="sync">
@@ -92,6 +93,27 @@
             </label>
             <span class="opt-hint">How dates and numbers appear in the event dialog and calendar headings — shown as day·month·year. Fixes mixed-locale systems where the desktop shows one style but Tide shows another. Takes effect the next time Tide starts.</span>
           </fieldset>
+        </section>
+        <section class="options-category" data-category-content="about" hidden>
+          <h2>About</h2>
+          <p class="muted">
+            Which build of Tide this is. If two of your devices show different
+            build codes, one of them is running an older or modified copy.
+          </p>
+          <div class="opt-field">
+            <span class="opt-label">Version</span>
+            <span id="about-version">…</span>
+          </div>
+          <div class="opt-field">
+            <span class="opt-label">Build</span>
+            <span id="about-build">…</span>
+            <span class="opt-hint">The data and sync part of Tide. A code ending in “-dirty” was built from changes that were not saved to the project history.</span>
+          </div>
+          <div class="opt-field">
+            <span class="opt-label">App build</span>
+            <span id="about-shell-build">…</span>
+            <span class="opt-hint">The window and tray part of Tide. It should match the build above.</span>
+          </div>
         </section>
         <div class="options-footer">
           <span class="dialog-error" id="options-error" role="alert" hidden></span>

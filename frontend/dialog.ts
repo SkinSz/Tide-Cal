@@ -337,6 +337,13 @@ function occurrenceScope(): boolean {
 
 /** Reminders held by the event being edited (0 for a new event); drives the notice. */
 let reminderCount = 0;
+// TD-087: whether the dialog knows the event's reminders. Until the lookup has
+// returned (or after it failed) the checkbox shows an unloaded default, so Save
+// must not write any reminder change from it.
+let reminderLookup: "loading" | "loaded" | "failed" = "loaded";
+// Per-open guard: a lookup that returns after the dialog was opened for another
+// event (or reopened) must not touch the current dialog.
+let reminderLookupToken = 0;
 
 /**
  * Shown whenever the event holds more than one reminder and the reminder
@@ -346,7 +353,15 @@ let reminderCount = 0;
  */
 function syncReminderNote(): void {
   const note = field<HTMLParagraphElement>("ev-remind-note");
-  if (reminderCount > 1 && !wholeDay()) {
+  if (reminderLookup === "loading" && !wholeDay()) {
+    note.textContent =
+      "Loading this event's reminders. Until they have loaded, saving leaves them as they are.";
+    note.hidden = false;
+  } else if (reminderLookup === "failed" && !wholeDay()) {
+    note.textContent =
+      "This event's reminders could not be loaded. Saving leaves them as they are.";
+    note.hidden = false;
+  } else if (reminderCount > 1 && !wholeDay()) {
     note.textContent = field<HTMLInputElement>("ev-remind-on").checked
       ? `This event has ${reminderCount} reminders. Saving keeps only this one.`
       : `Saving removes all ${reminderCount} reminders.`;
@@ -565,10 +580,14 @@ function openFor(date: Date, existing?: CalendarEvent): void {
   field<HTMLInputElement>("ev-remind-on").checked = false;
   field<HTMLSelectElement>("ev-remind-minutes").value = "15";
   reminderCount = 0;
+  reminderLookup = existing ? "loading" : "loaded";
+  const lookupToken = ++reminderLookupToken;
   syncReminderNote();
   if (existing) {
     void getReminder(existing.id)
       .then((rem) => {
+        if (lookupToken !== reminderLookupToken) return; // another open superseded this one
+        reminderLookup = "loaded";
         if (rem && rem.enabled) {
           field<HTMLInputElement>("ev-remind-on").checked = true;
           field<HTMLSelectElement>("ev-remind-minutes").value = String(rem.minutesBefore);
@@ -578,7 +597,12 @@ function openFor(date: Date, existing?: CalendarEvent): void {
         reminderCount = rem?.count ?? (rem ? 1 : 0);
         syncReminderNote();
       })
-      .catch((e) => console.warn("[tide] reminder lookup unavailable:", e));
+      .catch((e) => {
+        console.warn("[tide] reminder lookup unavailable:", e);
+        if (lookupToken !== reminderLookupToken) return;
+        reminderLookup = "failed";
+        syncReminderNote();
+      });
   }
   dlg().showModal();
 }
@@ -756,6 +780,16 @@ export function initDialog(): void {
       if (!input) return;
       const id = field<HTMLInputElement>("ev-id").value;
       const existing = dialogEvent;
+      // TD-087: decide the reminder write NOW, before any await. Only this
+      // snapshot (lookup state of THIS open plus the checkbox values at click
+      // time) is used after the awaits, so a lookup answer that arrives while
+      // the save is running cannot cause a reminder write.
+      const reminderWrite: { on: true; minutes: number } | { on: false } | null =
+        !wholeDay() && reminderLookup === "loaded"
+          ? field<HTMLInputElement>("ev-remind-on").checked
+            ? { on: true, minutes: Number(field<HTMLSelectElement>("ev-remind-minutes").value) }
+            : { on: false }
+          : null;
       // Mandatory end date (owner decision, 2026-08-31): every built rule
       // carries UNTIL. Friendly inline validation before any write; the
       // picked date is INCLUSIVE (last occurrence) and must be on or after
@@ -903,12 +937,11 @@ export function initDialog(): void {
           // DC-22: reminder member follows the checkbox (update path). The option
           // is hidden for whole-day events; saving one leaves any existing
           // reminder untouched and writes no reminder change.
-          if (!wholeDay()) {
-            if (field<HTMLInputElement>("ev-remind-on").checked) {
-              await setReminder(
-                id,
-                Number(field<HTMLSelectElement>("ev-remind-minutes").value),
-              );
+          // TD-087: and only once the lookup has returned; otherwise the
+          // checkbox is an unloaded default and the reminders are left alone.
+          if (reminderWrite) {
+            if (reminderWrite.on) {
+              await setReminder(id, reminderWrite.minutes);
             } else {
               await clearReminder(id);
             }
@@ -920,11 +953,8 @@ export function initDialog(): void {
             rule ? { ...input, recurrenceRule: rule } : input,
           );
           // DC-22: reminder member follows the checkbox (create path).
-          if (!wholeDay() && field<HTMLInputElement>("ev-remind-on").checked) {
-            await setReminder(
-              saved.id,
-              Number(field<HTMLSelectElement>("ev-remind-minutes").value),
-            );
+          if (reminderWrite?.on) {
+            await setReminder(saved.id, reminderWrite.minutes);
           }
         }
         dlg().close();

@@ -1,3 +1,13 @@
+// src/application/build_info.ts
+function getBuildInfo() {
+  return {
+    version: true ? "0.1.1" : "unknown",
+    commit: true ? "82880abd6d64c130c87e7e9a18271273b431c285" : "unknown",
+    dirty: true ? true : false,
+    label: true ? "82880abd6d64-dirty" : "unknown"
+  };
+}
+
 // src/persistence/bridges/sidecar_server.ts
 import { createInterface } from "node:readline";
 
@@ -409,7 +419,7 @@ function deviceNameViews(rows, selfDeviceId) {
 // src/security/identity.ts
 import { randomBytes as randomBytes2 } from "node:crypto";
 
-// node_modules/@noble/ed25519/index.js
+// ../../../node_modules/@noble/ed25519/index.js
 var ed25519_CURVE = Object.freeze({
   p: 0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffedn,
   n: 0x1000000000000000000000000000000014def9dea2f79cd65812631a5cf5d3edn,
@@ -914,7 +924,7 @@ var wNAF = (n) => {
   return { p, f };
 };
 
-// node_modules/@noble/hashes/_u64.js
+// ../../../node_modules/@noble/hashes/_u64.js
 var U32_MASK64 = /* @__PURE__ */ (() => BigInt(2 ** 32 - 1))();
 var _32n = /* @__PURE__ */ BigInt(32);
 function fromBig(n, le = false) {
@@ -957,7 +967,7 @@ var add4H = (low, Ah, Bh, Ch, Dh) => Ah + Bh + Ch + Dh + (low / 2 ** 32 | 0) | 0
 var add5L = (Al, Bl, Cl, Dl, El) => (Al >>> 0) + (Bl >>> 0) + (Cl >>> 0) + (Dl >>> 0) + (El >>> 0);
 var add5H = (low, Ah, Bh, Ch, Dh, Eh) => Ah + Bh + Ch + Dh + Eh + (low / 2 ** 32 | 0) | 0;
 
-// node_modules/@noble/hashes/utils.js
+// ../../../node_modules/@noble/hashes/utils.js
 function isBytes2(a) {
   return a instanceof Uint8Array || ArrayBuffer.isView(a) && a.constructor.name === "Uint8Array" && "BYTES_PER_ELEMENT" in a && a.BYTES_PER_ELEMENT === 1;
 }
@@ -1106,7 +1116,7 @@ var oidNist = (suffix) => ({
   oid: Uint8Array.from([6, 9, 96, 134, 72, 1, 101, 3, 4, 2, suffix])
 });
 
-// node_modules/@noble/hashes/_md.js
+// ../../../node_modules/@noble/hashes/_md.js
 function Chi(a, b, c) {
   return a & b ^ ~a & c;
 }
@@ -1237,7 +1247,7 @@ var SHA512_IV = /* @__PURE__ */ Uint32Array.from([
   327033209
 ]);
 
-// node_modules/@noble/hashes/sha2.js
+// ../../../node_modules/@noble/hashes/sha2.js
 var SHA256_K = /* @__PURE__ */ Uint32Array.from([
   1116352408,
   1899447441,
@@ -4276,7 +4286,7 @@ import { networkInterfaces } from "node:os";
 // src/network/noise_transport.ts
 import { createRequire } from "node:module";
 
-// node_modules/@noble/curves/utils.js
+// ../../../node_modules/@noble/curves/utils.js
 function aarray(item, title, inner = () => {
 }) {
   if (!Array.isArray(item))
@@ -4396,7 +4406,7 @@ function validateObject(object, fields = {}, optFields = {}, title = "object") {
   iter(optFields, true);
 }
 
-// node_modules/@noble/curves/abstract/modular.js
+// ../../../node_modules/@noble/curves/abstract/modular.js
 var _0n2 = /* @__PURE__ */ BigInt(0);
 var _1n2 = /* @__PURE__ */ BigInt(1);
 var _2n = /* @__PURE__ */ BigInt(2);
@@ -4825,7 +4835,7 @@ function Field(ORDER, opts = {}) {
   return new _Field(ORDER, opts);
 }
 
-// node_modules/@noble/curves/abstract/curve.js
+// ../../../node_modules/@noble/curves/abstract/curve.js
 var _0n3 = /* @__PURE__ */ BigInt(0);
 var _1n3 = /* @__PURE__ */ BigInt(1);
 var _4n2 = /* @__PURE__ */ BigInt(4);
@@ -5212,7 +5222,7 @@ function createKeygen(randomSecretKey, getPublicKey2) {
   };
 }
 
-// node_modules/@noble/curves/abstract/edwards.js
+// ../../../node_modules/@noble/curves/abstract/edwards.js
 var _0n4 = /* @__PURE__ */ BigInt(0);
 var _1n4 = /* @__PURE__ */ BigInt(1);
 var _2n2 = /* @__PURE__ */ BigInt(2);
@@ -5663,7 +5673,7 @@ function eddsa(Point2, cHash, eddsaOpts = {}) {
   });
 }
 
-// node_modules/@noble/curves/abstract/montgomery.js
+// ../../../node_modules/@noble/curves/abstract/montgomery.js
 var _0n5 = /* @__PURE__ */ BigInt(0);
 var _1n5 = /* @__PURE__ */ BigInt(1);
 var _2n3 = /* @__PURE__ */ BigInt(2);
@@ -5810,7 +5820,7 @@ function montgomery(curveDef) {
   });
 }
 
-// node_modules/@noble/curves/ed25519.js
+// ../../../node_modules/@noble/curves/ed25519.js
 var _0n6 = /* @__PURE__ */ BigInt(0);
 var _1n6 = /* @__PURE__ */ BigInt(1);
 var _2n4 = /* @__PURE__ */ BigInt(2);
@@ -12407,6 +12417,9 @@ function makeSyncDispatcher(sync, core, endpoints) {
   };
   return (op, args) => {
     switch (op) {
+      // TD-104: which commit this backend was built from (About screen).
+      case "build_info":
+        return getBuildInfo();
       case "device_info": {
         const peers = listTrustedPeers(core.db);
         return {
@@ -12647,6 +12660,7 @@ function main() {
   const syncIdentity = loadOrCreateIdentity(
     process.env.TIDE_DATA_DIR ?? dbPath.replace(/[/\\][^/\\]+$/, "") ?? "."
   );
+  console.error(`[tide] build ${getBuildInfo().label}`);
   const core = new EventCore(dbPath, syncIdentity.deviceId);
   try {
     const rr = replayReminderHistory(core.db);
@@ -12683,7 +12697,7 @@ function main() {
     }
     schedulerHandle.updateSchedulerSettings(partial);
     return { applied: true, next_start_only: "max_incremental_backlog" };
-  })() : op.startsWith("sync_") || op === "device_info" || op === "pairing_offer" || op === "pairing_accept" || op === "cancel_pairing_offer" || op === "pairing_offer_status" || op === "list_quarantine" || op === "quarantine_stats" || op === "retry_quarantine" || op === "delete_quarantine" || op === "dismiss_quarantine_warning" || op === "peer_state" || op === "list_paired_devices" || op === "reset_peer_state" || op === "unblock_peer" || op === "unpair_device" || op === "list_removed_devices" || // DC-28: own name (shell-only) + local nickname
+  })() : op.startsWith("sync_") || op === "device_info" || op === "build_info" || op === "pairing_offer" || op === "pairing_accept" || op === "cancel_pairing_offer" || op === "pairing_offer_status" || op === "list_quarantine" || op === "quarantine_stats" || op === "retry_quarantine" || op === "delete_quarantine" || op === "dismiss_quarantine_warning" || op === "peer_state" || op === "list_paired_devices" || op === "reset_peer_state" || op === "unblock_peer" || op === "unpair_device" || op === "list_removed_devices" || // DC-28: own name (shell-only) + local nickname
   op === "set_device_name" || op === "set_peer_nickname" ? syncDispatch(op, args) : dispatch(op, args);
   const pairedDeviceIds = () => listTrustedPeers(core.db).map((p) => p.device_id);
   const expectedPrefixes = () => {

@@ -533,6 +533,13 @@ async fn set_device_name(
     .map_err(|e| format!("join sidecar task: {e}"))?
 }
 
+/// TD-104: the commit this desktop shell was built from (see build.rs); the
+/// About screen shows it next to the backend's own label.
+#[tauri::command]
+fn shell_build_info() -> String {
+    env!("TIDE_BUILD_COMMIT").to_string()
+}
+
 /// DC-20 §4.2: read the effective settings (env > file > default).
 #[tauri::command]
 fn get_settings(app: tauri::AppHandle) -> Result<TideSettings, String> {
@@ -882,8 +889,10 @@ async fn sync_op(
     op: String,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    const ALLOWED: [&str; 29] = [
+    const ALLOWED: [&str; 30] = [
         "device_info",
+        // TD-104: which commit the backend was built from (About screen).
+        "build_info",
         "pairing_offer",
         "pairing_accept",
         "cancel_pairing_offer",
@@ -1580,6 +1589,9 @@ pub fn run() {
             ) {
                 eprintln!("tide: logging unavailable ({e}); continuing without a log file");
             }
+            // TD-104: the shell's own build label, next to the sidecar's. Goes
+            // to the persistent log (and stdout in a debug build).
+            log::info!("shell build {}", env!("TIDE_BUILD_COMMIT"));
 
             // DC-19 §2.3: tray-less desktop (no StatusNotifier support) —
             // degrade to a normal windowed app, never make the app
@@ -1886,7 +1898,8 @@ pub fn run() {
             update_occurrence,
             export_ics,
             import_ics,
-            open_options
+            open_options,
+            shell_build_info
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

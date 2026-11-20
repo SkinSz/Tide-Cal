@@ -319,8 +319,40 @@ function initNav(): void {
   });
 }
 
+/** TD-104: fill the About section (sidecar build + shell build). */
+async function loadAbout(): Promise<void> {
+  const set = (id: string, text: string): void => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = text;
+  };
+  if (!(await hasTauri())) {
+    set("about-version", "unknown");
+    set("about-build", "unknown");
+    set("about-shell-build", "unknown");
+    return;
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  try {
+    const info = await invoke<{ version: string; label: string }>("sync_op", {
+      op: "build_info",
+      args: {},
+    });
+    set("about-version", info.version);
+    set("about-build", info.label);
+  } catch {
+    set("about-version", "unavailable");
+    set("about-build", "unavailable");
+  }
+  try {
+    set("about-shell-build", await invoke<string>("shell_build_info"));
+  } catch {
+    set("about-shell-build", "unavailable");
+  }
+}
+
 async function init(): Promise<void> {
   initNav();
+  void loadAbout();
   await loadSettings();
   await refreshSavedMarker();
   document.getElementById("options-save")?.addEventListener("click", () => void saveSettings());

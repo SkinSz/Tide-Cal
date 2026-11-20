@@ -9,7 +9,7 @@
     "ui:dev": "vite --config vite.ui.config.ts",
     "ui:build": "vite build --config vite.ui.config.ts",
     "test": "vitest run",
-    "sidecar:build": "esbuild src/persistence/bridges/sidecar_server.ts --bundle --platform=node --format=esm --external:better-sqlite3 --outfile=dist/sidecar.mjs",
+    "sidecar:build": "node scripts/build_sidecar.mjs",
     "harness:three-device": "node tests/probes/three_device_harness.mjs --scenario=all"
   },
   "devDependencies": {

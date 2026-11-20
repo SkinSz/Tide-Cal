@@ -105,7 +105,7 @@ jobs:
       # tees the full build output to a log file and uploads it as an
       # artifact ON FAILURE for diagnosis. --verbose for compile errors.
       - name: Build NSIS installer (tauri)
-        run: npx tauri build --bundles nsis --verbose 2>&1 | Tee-Object -FilePath build-log.txt
+        run: npx tauri build --bundles nsis --verbose 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\build-log.txt"
         shell: pwsh
         env:
           # Release build; no signing (DC-24 §3.2 — unsigned by design).
@@ -116,7 +116,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-log
-          path: build-log.txt
+          path: ${{ runner.temp }}/build-log.txt
           if-no-files-found: warn
 
       - name: Locate artifacts
