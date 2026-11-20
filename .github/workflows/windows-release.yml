@@ -104,6 +104,16 @@ jobs:
       # compile); the runner log is admin-only via API, so this step now
       # tees the full build output to a log file and uploads it as an
       # artifact ON FAILURE for diagnosis. --verbose for compile errors.
+      # TD-104 diagnosis: show what git considers modified right before the
+      # shell build computes its build label (the label must be clean on a
+      # CI build of a committed tree). Read-only; never fails the job.
+      - name: Show working tree state before the build (diagnosis)
+        run: |
+          git config --show-origin --get core.autocrlf
+          git status --porcelain -- ':/' ':(exclude,top)src-tauri/resources'
+          Write-Output "end of working tree state"
+        continue-on-error: true
+
       - name: Build NSIS installer (tauri)
         run: npx tauri build --bundles nsis --verbose 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\build-log.txt"
         shell: pwsh

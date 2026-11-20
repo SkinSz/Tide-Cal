@@ -18,9 +18,15 @@ fn build_label() -> String {
         Some(c) if c.len() >= 40 && c.chars().all(|ch| ch.is_ascii_hexdigit()) => c,
         _ => return "unknown".to_string(),
     };
-    let dirty = git(&["status", "--porcelain", "--", ":/", ":(exclude,top)src-tauri/resources"])
-        .map(|s| !s.is_empty())
-        .unwrap_or(false);
+    let status = git(&["status", "--porcelain", "--", ":/", ":(exclude,top)src-tauri/resources"]);
+    let dirty = status.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
+    if dirty {
+        // TD-104 diagnosis: name the paths that make the label "-dirty", so a
+        // build log (CI included) shows the cause. At most 20 lines.
+        for line in status.as_deref().unwrap_or("").lines().take(20) {
+            println!("cargo:warning=build label is -dirty because of: {line}");
+        }
+    }
     format!("{}{}", &commit[..12], if dirty { "-dirty" } else { "" })
 }
 
