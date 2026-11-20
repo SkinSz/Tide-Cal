@@ -134,27 +134,29 @@ Operating constraint: full-state snapshots and change-log truncation are off (DC
 | TD-101 | Change-log truncation was found unwired and is kept off | CLOSED BY DECISION | TD-046 |
 | TD-102 | Conflict contents depend on the order in which changes arrive | CONFLICT ENGINE | TD-088, TD-094 |
 | TD-103 | The value shown under an open conflict differs between devices | CLOSED BY DECISION | TD-102 |
-| TD-104 | A running build does not show which source commit it was built from | FIXED | TD-082 |
+| TD-104 | A running build does not show which source commit it was built from | OPEN | TD-082 |
 | TD-105 | Some sync and connection errors reach the user in technical wording | OPEN | TD-064 |
 | TD-106 | A sync can still report success while changes are missing (unmerged TD-064 fix) | OPEN | TD-064, TD-065 |
 | TD-107 | Any endpoint can trigger or read the protocol version signal (unmerged TD-064 fix) | OPEN | TD-064 |
 | TD-108 | Sync connections stay half-open after a normal end until the peer closes | OPEN | TD-068 |
 | TD-109 | Tests leave temporary folders behind and use a hard-coded /tmp path | OPEN | - |
 | TD-110 | Test suite inventory: levels, stand-ins, duplicates, transport coverage | OPEN | TD-109 |
+| TD-111 | Windows dials a paired device at an unreachable IPv6 link-local address first; sync fails silently | OPEN | TD-105 |
+| TD-112 | Reminder notification text should read "<event> starts in <time>" | OPEN | - |
 
 Count per status:
 
 | Status | Count |
 |---|---|
-| FIXED | 35 |
-| OPEN | 46 |
+| FIXED | 34 |
+| OPEN | 49 |
 | CONFLICT ENGINE | 11 |
 | NEEDS DECISION | 2 |
 | DORMANT WHILE SNAPSHOTS ARE OFF | 6 |
 | ACCEPTED LIMITATION | 2 |
 | CLOSED BY DECISION | 6 |
 | MERGED | 1 |
-| **Total** | **109** |
+| **Total** | **111** |
 
 ---
 
@@ -1024,7 +1026,7 @@ Count per status:
 - **ID:** TD-104
 - **Title:** Neither the shell nor the sidecar records the source commit it was built from, and the app has no About or Info screen. A dev instance started from an old binary and an old copy of the sidecar ran for days unnoticed while its UI came from current source. Required: log the git commit hash (marked when built from a modified tree) at startup and show it, for the shell and the sidecar separately, in an About/Info screen, so a stale build is visible immediately. Related: TD-082.
 - **Priority:** 8/10 — HIGH (every test on real devices depends on knowing which build is running)
-- **Status:** RESOLVED (2026-11-20). The sidecar and the shell each log `build <12-digit commit>` at startup (suffix `-dirty` for a modified tree, `unknown` without git), and Options → About shows both labels separately. Tests: `tests/td104_build_hash.test.ts`. Known limits: the shell's build script does not re-run when only the commit message changes (amend, empty commit, soft reset), which gives a falsely older label; a change to `Cargo.lock` alone is not marked as modified; the excluded resources folder also holds shipped dependency files, so edits there are not marked; a committed sidecar bundle carries its parent commit's label until it is rebuilt. Also, the shell's build script re-runs only when listed paths change, so the shell's "modified tree" mark can lag for edits outside them; the sidecar's mark is computed at every sidecar build. Also: a source tree unpacked inside another git repository reports that repository's commit (marked as modified); a sidecar too old to know the build-info request shows its label as "unavailable".
+- **Status:** REOPENED 2026-11-20: on the Windows release build the shell label reads "<hash>-dirty" while the sidecar label is clean (observed in the Windows log: "shell build 3e54e6ce26b9-dirty", "build 3e54e6ce26b9"); every pre-build step of the Windows workflow writes only into excluded or ignored folders, so a Windows-only cause is suspected (line endings or links in the Windows checkout); not yet diagnosed. Earlier status: RESOLVED (2026-11-20). The sidecar and the shell each log `build <12-digit commit>` at startup (suffix `-dirty` for a modified tree, `unknown` without git), and Options → About shows both labels separately. Tests: `tests/td104_build_hash.test.ts`. Known limits: the shell's build script does not re-run when only the commit message changes (amend, empty commit, soft reset), which gives a falsely older label; a change to `Cargo.lock` alone is not marked as modified; the excluded resources folder also holds shipped dependency files, so edits there are not marked; a committed sidecar bundle carries its parent commit's label until it is rebuilt. Also, the shell's build script re-runs only when listed paths change, so the shell's "modified tree" mark can lag for edits outside them; the sidecar's mark is computed at every sidecar build. Also: a source tree unpacked inside another git repository reports that repository's commit (marked as modified); a sidecar too old to know the build-info request shows its label as "unavailable".
 
 ## TD-105 — Some sync and connection errors reach the user in technical wording
 - **ID:** TD-105
@@ -1061,3 +1063,15 @@ Count per status:
 - **Title:** The suite has about 1,300 tests and has never been inventoried. Analysis only, nothing deleted or changed: group the tests by level (single function / in-process engine / real instances over the real transport); list tests that exercise a copy, mock or scripted stand-in instead of the production code path, and whether that hides real behaviour; list likely duplicates (same setup, same assertion); and, most important, list the sync guarantees (no loss, no false success, convergence, catch-up) that are covered only in-process and never over the real transport. Report as a table; changes are decided afterwards.
 - **Priority:** 5/10 — MEDIUM (unknown overlap and gaps in transport coverage)
 - **Status:** OPEN
+
+## TD-111 — Windows dials a paired device at an unreachable IPv6 link-local address first; sync fails silently
+- **ID:** TD-111
+- **Title:** On Windows, "Sync now" dialed the paired Linux device at a stored IPv6 link-local address with a zone suffix (fe80::…%7) and failed with "connect ENETUNREACH". It retries another address only when a new endpoint happens to be discovered during that attempt; otherwise the sync fails and nothing is shown to the user. Observed on 2026-11-20: three manual syncs from Windows, two failed this way, the third succeeded after a retry at the device's IPv4 address. Changes made on Windows then reached Linux only when Linux started the sync. Related: TD-105 (sync results are not shown); DC-11 / DC-21 (endpoint discovery and plumbing).
+- **Priority:** 7/10 — HIGH (sync from one side silently does nothing)
+- **Status:** OPEN (OBSERVED in the Windows log; not yet reproduced in a test)
+
+## TD-112 — Reminder notification text should read "<event> starts in <time>"
+- **ID:** TD-112
+- **Title:** A reminder notification currently shows the event title and "Starts YYYY-MM-DD HH:MM". Requested: "<event name> starts in <reminder time>" (e.g. "Dentist starts in 10 minutes"), with minute precision.
+- **Priority:** 3/10 — LOW (wording)
+- **Status:** OPEN (requested change)
